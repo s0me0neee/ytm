@@ -34,3 +34,6 @@ hotpath = "0.23.2"
 hotpath = ["hotpath/hotpath", "ytm-core/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "ytm-core/hotpath-alloc"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "ytm-core/hotpath-cpu"]
+
+[lints]
+workspace = true

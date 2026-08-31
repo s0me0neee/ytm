@@ -14,6 +14,16 @@
 //! `ai` is empty on every line when no key is set, which is also a fair way to
 //! check that the free path still works on its own.
 
+/* A dev tool rather than shipped code: not built into either binary, run by
+   hand against a live session. `clippy.toml` grants the same latitude to
+   tests, which cargo has no equivalent of for examples -- so it is spelled
+   out here instead. `large_futures` is the exception to that description:
+   it ICEs the toolchain rather than reporting anything, on this crate's
+   async fns. See the note in `ytm-core/src/lib.rs`. */
+#![allow(clippy::large_futures)]
+#![allow(clippy::indexing_slicing)]
+#![allow(clippy::single_match_else)]
+
 use ytm_core::translate::{Ai, Backend, Provider, translate_lines};
 
 /// The first key set, and whose it is.

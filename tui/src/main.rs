@@ -1,3 +1,36 @@
+/* The workspace's clippy table reaches this crate for the first time — a
+   member only inherits `[workspace.lints]` by saying `[lints] workspace =
+   true`, and only `gui/src-tauri` ever did, so the three crates the table was
+   written for were held to nothing. See the longer note in `ytm-core`'s
+   `lib.rs`.
+
+   158 findings here, listed rather than quietly dropped: each line is a
+   category still to burn down, with what it costs, and deleting a line is the
+   unit of that work. Everything not named stays denied, so the gate is real
+   for new code while the backlog is open. The one `expect` this surfaced is
+   gone rather than exempted — it is now an ordinary mutable borrow. */
+#![allow(clippy::arithmetic_side_effects)] // 58 — overflow
+#![allow(clippy::indexing_slicing)] // 8 — panics on a bad index
+#![allow(clippy::as_conversions)] // 45 — silent truncation
+#![allow(clippy::cast_possible_truncation)] // 10
+#![allow(clippy::cast_possible_wrap)] // 1
+#![allow(clippy::cast_sign_loss)] // 7
+#![allow(clippy::missing_const_for_fn)] // 4
+#![allow(clippy::needless_pass_by_value)] // 1
+#![allow(clippy::needless_pass_by_ref_mut)] // 3
+#![allow(clippy::doc_markdown)] // 7 — backticks in prose
+#![allow(clippy::option_if_let_else)] // 2
+#![allow(clippy::items_after_statements)] // 1
+#![allow(clippy::format_push_string)] // 1
+#![allow(clippy::assigning_clones)] // 1
+#![allow(clippy::useless_let_if_seq)] // 1
+#![allow(clippy::struct_excessive_bools)] // 1
+#![allow(clippy::too_many_lines)] // 2
+#![allow(clippy::unused_self)] // 4
+#![allow(clippy::assert_is_empty)] // 1 — in tests
+#![allow(clippy::redundant_closure_for_method_calls)] // 1
+#![allow(clippy::unnested_or_patterns)] // 1
+
 mod app;
 mod kitty;
 
