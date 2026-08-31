@@ -2,19 +2,20 @@
 //! queue orchestration, and persistence — extracted from the ratatui TUI so
 //! it can be driven by something else too (e.g. a headless daemon).
 
-/* The workspace's clippy table (`[workspace.lints.clippy]`) reaches this crate
-   for the first time. It was written for `ytm-core`, `tui` and `lrclib` ahead
-   of a planned split into separate repos — but a member only inherits it by
-   saying `[lints] workspace = true`, and only `gui/src-tauri` ever did. The
-   three crates it was aimed at were held to nothing, which is how a
+/* This crate is held to a `deny`-level `nursery`/`pedantic` plus a list of
+   panic-shaped lints, and it has never actually passed them. In the monorepo
+   the table was `[workspace.lints.clippy]`, which a member only inherits by
+   saying `[lints] workspace = true` — and only `gui/src-tauri` ever did, so a
    `#[deny]`-level `indexing_slicing` sat next to `self.queue[pos]` in
-   `player.rs` and a clean `cargo clippy --workspace` reported it.
+   `player.rs` while `cargo clippy --workspace` reported a clean tree. In the
+   standalone split the table is inline and was always in force, so that repo
+   has simply been red since it was created. Either way the backlog is the
+   same 395 findings.
 
-   Turning it on surfaced 395 findings here. They are listed rather than
-   quietly dropped: each line is a category still to burn down, with what it
-   costs, and removing a line is the unit of that work. Everything *not* named
-   here is denied from now on, which is the part that matters — the gate is
-   real for new code even while the backlog is open.
+   They are listed rather than quietly dropped: each line is a category still
+   to burn down, with what it costs, and removing a line is the unit of that
+   work. Everything *not* named here is denied, which is the part that matters
+   — the gate is real for new code even while the backlog is open.
 
    Ordered by how much they are worth fixing rather than by count. The first
    group can hide a panic and should go first; the second is API polish; the
@@ -25,8 +26,8 @@
    normalization" against this crate's own async fns (`cover::fetch`,
    `library::get_songs`, `lyrics::with_retry`, …) on rustc 1.100.0-nightly
    (fb6531d55). `lrclib` needs the same line for the same reason; see the note
-   in its `lib.rs`. It only became visible once the errors below stopped
-   aborting the run first. Revisit on a newer toolchain. */
+   in its `lib.rs`. The crash aborts the run, so it only became visible once
+   the errors below stopped stopping it first. Revisit on a newer toolchain. */
 #![allow(clippy::large_futures)]
 
 #![allow(clippy::arithmetic_side_effects)] // 61 — overflow; the ones that could bite are fixed
