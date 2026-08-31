@@ -1,0 +1,33 @@
+{
+  "name": "ytm-gui",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "devtools": "react-devtools",
+    "dev:profile": "YTM_PROFILE=1 tauri dev --config src-tauri/tauri.dev.conf.json"
+  },
+  "dependencies": {
+    "@radix-ui/react-slider": "^1.4.7",
+    "@tailwindcss/vite": "^4.3.3",
+    "@tauri-apps/api": "^2",
+    "lucide-react": "^1.35.0",
+    "motion": "^13.1.1",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "tailwindcss": "^4.3.3"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "react-devtools": "^7.0.1",
+    "typescript": "~5.8.3",
+    "vite": "^7.0.4"
+  }
+}

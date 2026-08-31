@@ -21,7 +21,7 @@ use mpris_server::{
     Server, Signal, Time, TrackId, Volume,
 };
 
-use super::{MediaCmd, NowPlaying, PlayState, is_seek};
+use super::{Host, MediaCmd, NowPlaying, PlayState, is_seek};
 use crate::player::PlayMode;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -143,8 +143,7 @@ impl Iface {
     /// callers expect — none of them waits for the effect, they watch
     /// `PropertiesChanged` for it.
     fn send(&self, cmd: MediaCmd) -> fdo::Result<()> {
-        self.tx
-            .send(cmd)
+        super::queue(&self.tx, cmd)
             .map_err(|_| fdo::Error::Failed("player has shut down".into()))
     }
 }
@@ -379,7 +378,7 @@ impl MediaControls {
     /// when there is no session bus to talk to, which is the normal case
     /// over ssh or in a bare tmux; everything else about the app is
     /// unaffected.
-    pub fn new(rt: &tokio::runtime::Handle) -> Option<Self> {
+    pub fn new(rt: &tokio::runtime::Handle, _host: Host) -> Option<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
         let state = Arc::new(Mutex::new(NowPlaying::default()));
         let iface = Iface {
@@ -522,6 +521,77 @@ mod tests {
             ..a.clone()
         };
         assert!(matches!(changed(&b, &a)[..], [Property::Metadata(_)]));
+    }
+
+    /// `Iface` needs no D-Bus to build — just the shared snapshot and the
+    /// plain `mpsc` channel it posts commands to. Its methods are `async fn`
+    /// only because the trait requires it; none of them actually awaits
+    /// anything, so a bare current-thread runtime is enough to drive them.
+    fn iface(mode: PlayMode) -> (Iface, Receiver<MediaCmd>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let iface = Iface {
+            state: Arc::new(Mutex::new(NowPlaying {
+                mode,
+                ..NowPlaying::default()
+            })),
+            tx,
+        };
+        (iface, rx)
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    #[test]
+    fn set_loop_status_none_wraps_the_playlist_rather_than_stopping() {
+        // MPRIS's LoopStatus::None has no equivalent here -- this player
+        // always wraps -- so it must land on Cycle, not be refused or ignored.
+        let (iface, rx) = iface(PlayMode::Cycle);
+        block_on(iface.set_loop_status(LoopStatus::None)).unwrap();
+        assert_eq!(rx.try_recv(), Ok(MediaCmd::Mode(PlayMode::Cycle)));
+    }
+
+    #[test]
+    fn set_loop_status_none_while_shuffled_leaves_shuffle_alone() {
+        // Shuffle is a separate MPRIS property; a client turning off Loop
+        // must not silently turn off Shuffle too.
+        let (iface, rx) = iface(PlayMode::Shuffle);
+        block_on(iface.set_loop_status(LoopStatus::None)).unwrap();
+        assert_eq!(rx.try_recv(), Ok(MediaCmd::Mode(PlayMode::Shuffle)));
+    }
+
+    #[test]
+    fn set_loop_status_track_always_selects_single() {
+        let (iface, rx) = iface(PlayMode::Shuffle);
+        block_on(iface.set_loop_status(LoopStatus::Track)).unwrap();
+        assert_eq!(rx.try_recv(), Ok(MediaCmd::Mode(PlayMode::Single)));
+    }
+
+    #[test]
+    fn set_shuffle_off_from_shuffle_lands_on_cycle() {
+        let (iface, rx) = iface(PlayMode::Shuffle);
+        block_on(iface.set_shuffle(false)).unwrap();
+        assert_eq!(rx.try_recv(), Ok(MediaCmd::Mode(PlayMode::Cycle)));
+    }
+
+    #[test]
+    fn set_shuffle_off_from_single_preserves_it() {
+        // Turning shuffle off when it wasn't the active mode must not
+        // clobber whatever in-order mode was already selected.
+        let (iface, rx) = iface(PlayMode::Single);
+        block_on(iface.set_shuffle(false)).unwrap();
+        assert_eq!(rx.try_recv(), Ok(MediaCmd::Mode(PlayMode::Single)));
+    }
+
+    #[test]
+    fn set_shuffle_on_always_selects_shuffle() {
+        let (iface, rx) = iface(PlayMode::Single);
+        block_on(iface.set_shuffle(true)).unwrap();
+        assert_eq!(rx.try_recv(), Ok(MediaCmd::Mode(PlayMode::Shuffle)));
     }
 
     /// The only test that touches D-Bus: claims a real bus name, reads the

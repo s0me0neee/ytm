@@ -28,6 +28,17 @@
 //! cargo run -p ytm-core --example search_verify
 //! ```
 
+/* A dev tool rather than shipped code: not built into either binary, run by
+   hand against a live session. `clippy.toml` grants the same latitude to
+   tests, which cargo has no equivalent of for examples -- so it is spelled
+   out here instead. `large_futures` is the exception to that description:
+   it ICEs the toolchain rather than reporting anything, on this crate's
+   async fns. See the note in `ytm-core/src/lib.rs`. */
+#![allow(clippy::large_futures)]
+#![allow(clippy::arithmetic_side_effects)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::option_if_let_else)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};

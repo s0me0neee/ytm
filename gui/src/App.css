@@ -1,0 +1,546 @@
+@import "tailwindcss";
+
+/* Premium dark: a neutral near-black canvas, one static accent, and depth
+   carried by translucent "glass" surfaces rather than by filled panels.
+   Replaces the earlier amber/brown palette, whose tinted surfaces read as
+   flat because every layer was an opaque fill of a slightly different brown
+   -- nothing looked like it was *above* anything else. */
+@theme {
+  --color-bg: #0b0b0d;
+  --color-bg-2: #121215;
+
+  /* Surfaces are white at low alpha, never opaque fills, so a surface always
+     reads as the canvas plus light rather than as a different-coloured slab.
+     Stacking two of them (row inside a panel) therefore reads as depth. */
+  --color-surface: rgba(255, 255, 255, 0.05);
+  --color-surface-2: rgba(255, 255, 255, 0.08);
+  --color-surface-3: rgba(255, 255, 255, 0.12);
+
+  /* Text is one colour at four opacities, the way Apple's label ladder works:
+     contrast then adapts to whatever it sits on instead of being a fixed hex
+     tuned for exactly one background. */
+  --color-ink: rgba(255, 255, 255, 0.95);
+  --color-ink-dim: rgba(255, 255, 255, 0.64);
+  --color-ink-faint: rgba(255, 255, 255, 0.4);
+  --color-ink-ghost: rgba(255, 255, 255, 0.22);
+
+  --color-accent: #ff4d5e;
+  --color-accent-2: #ff7684;
+
+  --color-hairline: rgba(255, 255, 255, 0.12);
+
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+}
+
+:root {
+  color-scheme: dark;
+
+  /* The glass recipe, one place. Values follow what Apple Music's web player
+     actually computes -- a translucent fill, a heavy blur with saturation
+     pushed well past 1 (that boost is what tints the glass with whatever is
+     behind it, and is most of why the effect reads as a material rather than
+     as a grey box), and a hairline inner stroke standing in for a lit edge.
+     Ours is white-tinted rather than Apple's rgba(38,38,40,.6): on a near-black
+     canvas a darker glass would sink into the background instead of floating
+     above it.
+
+     Tuned toward *glass* rather than toward frosted plastic, which is what a
+     heavy white fill turns it into. The three moves are all the same move:
+     take fill away, and give back what the fill was doing. Less fill means
+     more of what is behind actually comes through; more blur and more
+     saturation mean that what comes through is a diffuse wash of its colour
+     rather than a legible picture; and a brighter stroke gives the pane an
+     edge to catch the light on, which is what says "there is a surface here"
+     once the fill is too faint to say it. Drop the stroke instead and the
+     result reads as a smudge in the backdrop, not a panel. */
+  --glass-bg: rgba(255, 255, 255, 0.045);
+  --glass-bg-strong: rgba(255, 255, 255, 0.075);
+  --glass-blur: blur(36px) saturate(2.2);
+  --glass-blur-heavy: blur(72px) saturate(2.4);
+  --glass-stroke: rgba(255, 255, 255, 0.22);
+
+  /* The player is an *island*: a pill lying over the content rather than a bar
+     ruled off across the foot of the window, which is what Apple Music's own
+     player became. Three numbers describe it, and `--player-bar-h` -- the
+     space every column above has to reserve -- is derived from them rather
+     than written out a second time.
+
+     Apple's pill is 56px tall inside a 668px maximum. Ours is a size up from
+     that, because this window is not a browser tab with a toolbar and a URL
+     bar over it: the island is the only chrome on screen, so it can afford
+     the room, and the cover it carries is worth seeing at 40px rather than
+     32. The proportions are Apple's either way -- the cover is 62% of the
+     pill's height there and here.
+
+     That reservation is by hand because the island is `fixed` and so out of
+     flow: it cannot push anything. The moment the number is written twice it
+     is a number that goes stale, and it already did once -- the bar was made
+     shorter and the padding above it was not, and then it was made shorter
+     again and the padding overshot the other way. */
+  --player-island-h: 4rem;
+  --player-island-gap: 0.75rem;
+  --player-island-w: 48rem;
+  --player-bar-h: calc(var(--player-island-h) + var(--player-island-gap) * 2);
+
+  /* What each side panel takes out of the row, its margin included --
+     `PlaylistNav` is `m-3 w-60`, `QueuePanel` is `m-3 ml-0 w-72`. The island
+     centres over the content *between* them rather than over the window, so
+     it is the one piece of chrome that has to know their widths. */
+  --nav-w: 16.5rem;
+  --queue-w: 18.75rem;
+}
+
+/* The document does not scroll. Every scrollable region in this app is an
+   inner panel with its own `overflow-y-auto` -- the sidebar, the track list,
+   the queue, the lyric sheet -- and the page around them is a fixed frame.
+   Three separate things had to be said for that to be true:
+
+   - `height: 100%` down the chain, so nothing is sized against a viewport it
+     can exceed;
+   - `overflow: hidden`, since a single element overhanging by a pixel
+     otherwise gives the whole document a scrollbar and lets the fixed player
+     bar drift over content that has moved underneath it;
+   - `overscroll-behavior: none`, which is the one that was actually visible.
+     WebKit rubber-bands the document on a two-finger drag *even when nothing
+     overflows*, and in a desktop window with no browser chrome around it that
+     reads as the entire interface coming loose from its frame. */
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+body {
+  margin: 0;
+  background-color: var(--color-bg);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: #fff;
+}
+
+/* Floating chrome. Deliberately *not* applied to full-width backgrounds or
+   list rows: glass earns its keep on things that overlap other content, and
+   spending it everywhere is what makes a UI look like a demo of the effect. */
+/* No elevation shadow on any of the three. Depth here comes from the material
+   -- what the pane does to the light behind it, and the stroke around its
+   edge -- rather than from a shadow cast onto the page. A drop shadow under a
+   transparent surface is the tell that it is a card pretending to be glass:
+   real glass held against a wall does not darken the wall around it. The one
+   thing still allowed to cast one is the artwork, which is opaque and is the
+   only object on the page that is genuinely sitting above the backdrop.
+
+   The island is the second exception, and it is the same rule rather than a
+   break from it: these three are panes let into the layout, flush with what
+   surrounds them, while the island is an object lying on top of one. It
+   really is above the backdrop and it really does occlude what passes under
+   it -- and a pane that floats with nothing under it reads as a decal. Apple's
+   own pill casts `0 10px 40px rgba(0, 0, 0, 0.2)`, which is what
+   `.player-island` uses. */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 0.5px solid var(--glass-stroke);
+}
+
+.glass-heavy {
+  background: var(--glass-bg-strong);
+  backdrop-filter: var(--glass-blur-heavy);
+  -webkit-backdrop-filter: var(--glass-blur-heavy);
+  border: 0.5px solid var(--glass-stroke);
+}
+
+/* The island: the player as a pill lying over the content, not a bar ruled
+   off across the foot of the window.
+
+   Two elements, and the split between them is the whole trick. `.player-rail`
+   spans the window and never draws anything -- it exists to hold the pill's
+   *centre*, and it is the padding on this rail, not any property of the pill,
+   that moves the pill when a side panel opens. Apple Music does exactly this,
+   transitioning `padding-inline-end` as its queue slides in, and the reason to
+   copy it is that the pill then needs no animation of its own: it is centred
+   in whatever space it is given, so it stays centred while the space changes
+   and arrives with no transform to unwind. Animating the pill instead would
+   mean two things moving against each other and a fight over which is right
+   when the window is resized mid-transition.
+
+   `pointer-events: none` because the rail is as wide as the window and would
+   otherwise swallow every click on the last row of every list behind it. */
+.player-rail {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 30;
+  display: flex;
+  justify-content: center;
+  padding: 0 1.25rem var(--player-island-gap);
+  pointer-events: none;
+  transition: padding 0.3s cubic-bezier(0.215, 0.61, 0.355, 1);
+}
+
+.player-rail > * {
+  pointer-events: auto;
+}
+
+.player-rail.has-nav {
+  padding-inline-start: calc(1.25rem + var(--nav-w));
+}
+
+.player-rail.has-queue {
+  padding-inline-end: calc(1.25rem + var(--queue-w));
+}
+
+/* `width: min()` rather than `max-width`, so that below the island's own
+   width the whole pill narrows together and the LCD's `minmax(0, 1fr)` is
+   what actually gives -- the transport and the volume keep their sizes, which
+   is the point of pinning them with `auto` instead of fractions. */
+.player-island {
+  position: relative;
+  width: min(var(--player-island-w), 100%);
+  height: var(--player-island-h);
+  border-radius: 1000px;
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+}
+
+/* The rim, as four corner-anchored inset shadows rather than as a border.
+   A `0.5px` border is a subpixel the rasteriser has to round, and it rounds
+   each side on its own -- around a 1000px radius that shows as an edge which
+   is crisp along the top and gone along one shoulder. Each inset shadow is
+   drawn from a corner instead, so the same half-pixel lands the same way on
+   all four. Apple's construction exactly, down to the offsets; ours differs
+   only in taking its colour from `--glass-stroke` through `currentColor`,
+   where Apple hardcodes white and dials it back with `opacity` -- so the
+   pill's edge and the panels' `border` version cannot drift apart. */
+.player-island::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  color: var(--glass-stroke);
+  box-shadow:
+    inset 0.5px 0.5px 0 0 currentColor,
+    inset 0.5px -0.5px 0 0 currentColor,
+    inset -0.5px 0.5px 0 0 currentColor,
+    inset -0.5px -0.5px 0 0 currentColor;
+}
+
+/* The middle column, and the only part of the pill the seek line spans.
+   Full bleed was right on a bar that crossed the window: the line was the one
+   figure in the chrome that is a quantity, and it had the whole width to be
+   one in. On a pill it cannot be -- a 1000px radius leaves the outer 28px of
+   each end as curve, so a line drawn edge to edge either meets that curve or
+   stops short of it for no reason the eye can see. Held to the LCD it is
+   underlining the thing it describes, which is also what makes the hover swap
+   below honest: the line and the words it replaces now occupy the same
+   column, so pointing at one is unambiguously asking about the other.
+
+   `relative` so the line and the clock can both hang off it, and both of them
+   do hang rather than sit in flow -- which is what lets each of the pill's
+   three columns be plainly centred. A 2px line given a row of its own costs
+   14px of the pill's height, and everything above it then sits a visible 7px
+   high with the room it was making left empty underneath. */
+.player-island-lcd {
+  position: relative;
+}
+
+@keyframes thumbnail-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* The now-playing equaliser bars. `scaleY` rather than `height` so the whole
+   thing is a compositor animation -- see `PlayingIndicator`. */
+@keyframes eq-bounce {
+  0%,
+  100% {
+    transform: scaleY(0.3);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+
+.eq-bar {
+  transform-origin: bottom;
+  animation-name: eq-bounce;
+  animation-timing-function: ease-in-out;
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+
+.eq-bar-idle {
+  transform-origin: bottom;
+  transform: scaleY(0.3);
+  transition: transform 0.2s ease;
+}
+
+/* Now Playing text sits over the blurred artwork rather than over a panel, so
+   its legibility depends on a cover the app doesn't choose. A soft shadow is
+   invisible against a dark cover and is what keeps a light one readable --
+   which matters more now that the backdrop is no longer dimmed towards black.
+   Deliberately *not* on the lyric sheet: at that size the shadow reads as a
+   blur on the glyphs rather than as depth, and the lines carry their own
+   contrast through weight and opacity. */
+.on-artwork {
+  text-shadow: 0 1px 12px rgba(0, 0, 0, 0.5);
+}
+
+/* The lyric sheet. Measured off Apple Music's own web player, where three
+   states carry the whole effect and the differences between them are small
+   but none of them optional:
+
+     - the line being sung is near-opaque white, unblurred, and 5% larger;
+     - lines still to come sit at 40% white behind a 1px blur;
+     - lines already sung fade out completely.
+
+   The blur is the part that is easy to leave out and does most of the work.
+   Without it an inactive line is merely dimmer, and dimmer text is still text
+   the eye tries to read -- which is why a plain opacity ramp reads as a list
+   of words rather than as one line held in focus. Blurring puts the rest of
+   the sheet behind the plane the current line is on.
+
+   Fading a sung line to nothing is the other half, and is what keeps the
+   panel from silting up: past the first chorus, everything above the current
+   line is text nobody is going to read again. */
+.lyric-line {
+  transform: scale(1);
+  color: rgba(255, 255, 255, 0.4);
+  filter: blur(1px);
+  transition-property: color, opacity, transform, filter;
+  transition-timing-function: linear, linear, ease-in-out, linear;
+  transition-duration: 0.1s, 0.25s, 0.1s, 0.25s;
+}
+
+.lyric-line.is-active {
+  color: rgba(255, 255, 255, 0.92);
+  filter: blur(0);
+  transform: scale(1.05);
+}
+
+.lyric-line.is-past {
+  opacity: 0;
+  /* The one asymmetric duration. A full second is slow enough that a sung
+     line reads as receding rather than as being switched off -- but the same
+     second spent fading back *in* after a backward seek would be a second of
+     blank panel. A transition's duration is read off the state being moved
+     to, so putting the slow one only here gets the fade-out without paying
+     for it in the other direction. */
+  transition-duration: 0.1s, 1s, 0.1s, 0.25s;
+  /* A sung line is transparent, and a transparent thing that can still be
+     clicked is a trap: the sheet would carry a stack of invisible seek
+     targets over the words being read. Restored while browsing, which is the
+     state that brings those lines back to be clicked. */
+  pointer-events: none;
+}
+
+/* While the user is scrolling by hand the sheet is being read rather than
+   followed, so the blur comes off everything. It is there to hold one line in
+   focus against the rest, and the rest is precisely what someone scrolled up
+   to look at. The current line keeps its colour and its scale, so the place
+   in the song stays findable while they browse. */
+.lyrics-browsing .lyric-line {
+  filter: blur(0);
+}
+
+/* Each line is a seek target -- Apple's are `<button>`s too, and jumping to a
+   line is the one thing anyone wants from a lyric sheet that the scrubber
+   cannot give them, being calibrated in seconds rather than in words.
+   Unblurring on hover is the affordance, and it is deliberately the same move
+   the active line makes: the sheet's whole grammar is that the sharp line is
+   the live one, so bringing a line into focus under the pointer says "this
+   one next" in the language the panel already speaks. */
+.lyric-line:not(.is-active):not(:disabled):hover {
+  color: rgba(255, 255, 255, 0.62);
+  filter: blur(0);
+}
+
+/* An unsynced sheet has no current line for the other three states to be
+   relative to, so it gets none of them: plain, readable, all at once. And
+   nothing to seek to either -- the lines carry no timings -- which is why the
+   buttons are `disabled` rather than merely inert. */
+.lyric-line.is-plain {
+  color: rgba(255, 255, 255, 0.92);
+  filter: blur(0);
+}
+
+/* Rows are uniform and there are often hundreds of them, so let the engine
+   skip the ones scrolled out of view. `contain-intrinsic-size` keeps the
+   scrollbar honest for the skipped ones. */
+.row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 60px;
+}
+
+/* Lyrics auto-scroll: no scrollbar, ever -- it's driven entirely by playback
+   position, never dragged by hand, so a scroll thumb flashing in on every
+   auto-scroll is just noise. */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Scrollable content keeps a scrollbar, but a thin unobtrusive one -- the
+   default WebKit bar is a wide light slab that breaks the dark chrome. */
+.thin-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.thin-scrollbar::-webkit-scrollbar-thumb {
+  background: var(--color-ink-ghost);
+  border-radius: 9999px;
+}
+
+.thin-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Radix Slider: the track/range/thumb are separate primitives Radix
+   positions for us, so the thumb and fill can never drift apart the way a
+   hand-styled native <input type=range> did. */
+/* No `width` here, deliberately. This block is declared after the Tailwind
+   `@import` at the top of the file, so any property it sets beats the matching
+   utility on the same element -- both are single-class selectors and source
+   order decides. A `width: 100%` here therefore silently overrode the `w-20`
+   on the volume slider, and every caller has to say its own width instead. */
+.slider-root {
+  position: relative;
+  display: flex;
+  align-items: center;
+  user-select: none;
+  touch-action: none;
+}
+
+.slider-track {
+  position: relative;
+  flex-grow: 1;
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--color-surface-2);
+}
+
+.slider-range {
+  position: absolute;
+  height: 100%;
+  border-radius: 9999px;
+  background: var(--color-ink);
+}
+
+/* The seek line: under the LCD's words rather than in a row of its own, which
+   is where most of the old bar's height went.
+
+   Out of flow, and that is the point rather than an implementation detail. A
+   2px line does not need a band of layout reserved for it, and reserving one
+   costs 14px of the pill -- everything above sits 7px high and the room it
+   was making is left visibly empty, which reads as three columns that failed
+   to centre rather than as space made for a line. Absolute against the LCD,
+   the line lives in the pill's bottom margin instead and every column is
+   simply centred. Apple's is a 12px band at y 43-55 of its 56px pill, with
+   the 2px track at 49 and the artwork centred above it; this is that band
+   pinned to the bottom instead of to a height, so the track sits the same 7px
+   in whatever `--player-island-h` says.
+
+   The root is deliberately much taller than the line it draws: a 2px target
+   is one nobody can hit. Growing the *track* on hover rather than the root is
+   what keeps the pill from nudging itself as the pointer approaches -- the
+   root's height is what the layout sees, and it never changes.
+
+   Anything overriding a `.slider-*` property has to be said in this file and
+   not as a utility on the element. `Slider` composes its class as
+   `slider-root <className>`, and both are single-class selectors, so the one
+   declared later -- always this file, which is after the Tailwind `@import`
+   at the top of it -- wins. That is how the previous, full-bleed version of
+   this line spent a while drawing itself across the *top* of the bar: its
+   `absolute` was a utility and `.slider-root`'s `relative` beat it. */
+.slider-seekbar {
+  position: absolute;
+  right: 0;
+  bottom: 1px;
+  left: 0;
+  z-index: 20;
+  height: 12px;
+}
+
+/* Rounded, unlike the full-bleed line this replaces. Square ends were there
+   so the line met the window's bottom corners cleanly, and inside a pill
+   there is no corner for it to meet. */
+.slider-seekbar .slider-track,
+.slider-seekbar .slider-range {
+  height: 2px;
+  transition: height 0.14s ease;
+}
+
+.slider-seekbar:hover .slider-track,
+.slider-seekbar:hover .slider-range {
+  height: 6px;
+}
+
+/* Hovering the seek line swaps the LCD from the track to the clock.
+
+   Still `:has()` rather than a `peer` sibling selector, even though the three
+   are siblings now that the line lives in the LCD instead of spanning the
+   window. A sibling combinator only reaches forward, and the line has to come
+   *after* the labels it stands in for -- it is the last row of the column,
+   and reordering it to suit the selector would put the labels where the scrub
+   target belongs. CSS rather than React state because this component already
+   redraws four times a second for the scrubber, and a hover has no business
+   adding to that. */
+.player-bar-info,
+.player-bar-clock {
+  transition: opacity 0.15s ease;
+}
+
+.player-bar-clock {
+  opacity: 0;
+}
+
+.player-island-lcd:has(.slider-seekbar:hover) .player-bar-info {
+  opacity: 0;
+}
+
+.player-island-lcd:has(.slider-seekbar:hover) .player-bar-clock {
+  opacity: 1;
+}
+
+.slider-thumb {
+  display: block;
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  background: #fff;
+  opacity: 0;
+  transition:
+    opacity 0.15s ease,
+    transform 0.1s ease;
+}
+
+.slider-root:hover .slider-thumb,
+.slider-thumb:focus-visible {
+  opacity: 1;
+}
+
+.slider-thumb:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--color-accent) 45%, transparent);
+}

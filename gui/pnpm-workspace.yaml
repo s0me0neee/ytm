@@ -1,0 +1,8 @@
+allowBuilds:
+  # Electron arrives under `react-devtools`, which is the standalone React
+  # profiler -- the browser extension cannot load in a WKWebView, so this is
+  # the only way to get a React profiler into the Tauri app (see `pnpm
+  # profile`). Its postinstall downloads a ~100MB binary, which is what this
+  # flag is really approving. Dev-only: nothing here reaches a build.
+  electron: true
+  esbuild: true

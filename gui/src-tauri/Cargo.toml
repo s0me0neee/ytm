@@ -1,0 +1,31 @@
+[package]
+name = "ytm-gui"
+version = "0.1.0"
+description = "ytm — Tauri desktop player for YouTube Music"
+edition = "2024"
+
+[lib]
+name = "ytm_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+ytm-core = { path = "../../ytm-core" }
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The playback-state ticker's sleep loop. Same version as ytm-core/tui so only
+# one tokio is compiled into the workspace.
+tokio = { version = "1.53.1", features = ["time"] }
+# `app.log`, in the same config directory and the same format the TUI writes it
+# in. Without a logger installed here, every `log::` line in `ytm-core` -- auth,
+# playback, the media backends, lyrics -- is discarded, and a GUI has no
+# terminal to have printed them to instead.
+log = "0.4.33"
+simplelog = "0.12.2"
+
+[lints]
+workspace = true
+

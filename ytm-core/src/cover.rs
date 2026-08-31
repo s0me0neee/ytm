@@ -84,24 +84,53 @@ pub fn at_size(url: &str, px: u32) -> String {
 /// answered 404. That is why this returns a candidate rather than a
 /// replacement — a missed guess costs one small request, and getting it costs
 /// three times the detail on every screen that can show it.
-fn hd_variant(url: &str) -> Option<String> {
+/// `pub` because it is half the answer to "how good a copy can this track
+/// have" — `examples/cover_audit` asks that of the whole library, and the
+/// GUI already carries a copy of this rule in TypeScript.
+///
+/// Returns a *ladder*, largest first, not a single guess. Asking only for
+/// `maxresdefault` and falling straight back to the advertised crop on a 404
+/// left the 4.9% of tracks that have no HD frame at 400×225, when
+/// `sddefault` (640×480) or `hq720` (1280×720) was sitting there for most of
+/// them — measured over the library, that one omission was the whole of the
+/// gap between the videos and the art tracks' clean 100%.
+///
+/// Empty for anything that isn't one of the named frames, `maxresdefault`
+/// included: there is nothing above it to try.
+pub fn hd_ladder(url: &str) -> Vec<String> {
     let base = url.split_once('?').map_or(url, |(base, _)| base);
-    let (prefix, name) = base.rsplit_once('/')?;
+    let Some((prefix, name)) = base.rsplit_once('/') else {
+        return Vec::new();
+    };
     if !prefix.contains("i.ytimg.com/vi") {
-        return None;
+        return Vec::new();
     }
-    // The named sizes YouTube serves, smallest up. Anything else — including
-    // `maxresdefault` itself — is left alone rather than guessed at.
-    const SMALLER: &[&str] = &[
+    // The named sizes YouTube serves, smallest first. Only the ones *above*
+    // whatever was advertised are worth asking for, so an URL that already
+    // names the biggest yields nothing rather than re-requesting itself.
+    //
+    // `hq720.jpg` is deliberately not among them despite existing, because it
+    // is the same 1280×720 as `maxresdefault` and is generated under the same
+    // condition — the upload being HD. Measured over the library, every one
+    // of the six videos that fell past `maxresdefault` fell past `hq720` too,
+    // so it never once answered where the rung above had not; all it did was
+    // add a third request to the slow path, taking the p99 from 1.1s to 2.2s.
+    const SIZES: &[&str] = &[
         "default.jpg",
         "mqdefault.jpg",
         "hqdefault.jpg",
         "sddefault.jpg",
-        "hq720.jpg",
+        "maxresdefault.jpg",
     ];
-    SMALLER
-        .contains(&name)
-        .then(|| format!("{prefix}/maxresdefault.jpg"))
+    let Some(at) = SIZES.iter().position(|s| *s == name) else {
+        return Vec::new();
+    };
+    SIZES
+        .iter()
+        .skip(at.saturating_add(1))
+        .rev()
+        .map(|s| format!("{prefix}/{s}"))
+        .collect()
 }
 
 /// The most a cover response may weigh, and the largest image it may claim to
@@ -284,17 +313,25 @@ pub fn spawn_fetch(
 ) {
     let url = at_size(&url, fetch_px(draw_px));
     handle.spawn(async move {
-        let mut got = match hd_variant(&url) {
-            Some(hd) => match fetch(&hd).await {
-                Ok(cover) => Ok(cover),
-                // No HD frame for this one, which is ordinary — the advertised
-                // thumbnail is what the row promised in the first place.
-                Err(e) => {
-                    log::debug!("cover: {video_id} has no maxres frame ({e})");
-                    fetch(&url).await
+        // Down the ladder, largest first, one attempt each: a 404 here is the
+        // ordinary answer for a frame the upload never had, and the rung
+        // below is a real picture rather than a retry of a missing one.
+        let mut got = None;
+        for hd in hd_ladder(&url) {
+            match fetch(&hd).await {
+                Ok(cover) => {
+                    got = Some(Ok(cover));
+                    break;
                 }
-            },
-            None => fetch(&url).await,
+                Err(e) => log::debug!("cover: {video_id} has no {hd} ({e})"),
+            }
+        }
+        // Nothing above it existed, or it was never a video thumbnail at all.
+        // This one is the picture the row actually promised, so it is worth
+        // insisting on.
+        let mut got = match got {
+            Some(got) => got,
+            None => fetch_insisting(&url).await,
         };
         got = got.map(|c| c.scaled(draw_px, draw_px));
         if let Err(e) = &got {
@@ -326,8 +363,40 @@ fn client() -> Option<&'static reqwest::Client> {
         .as_ref()
 }
 
-async fn fetch(url: &str) -> Result<Cover, String> {
+/// One attempt at one URL. `pub` for `examples/cover_audit`, which needs to
+/// ask about a single URL rather than drive the whole `spawn_fetch` path.
+pub async fn fetch(url: &str) -> Result<Cover, String> {
     decode(&fetch_bytes(url).await?)
+}
+
+/// How long to wait before each re-ask, and — by its length — how many there
+/// are. Short, because a cover is wanted while the track it belongs to is on
+/// screen and a picture that arrives after the song has changed is of no use
+/// to anyone.
+const RETRY_BACKOFF_MS: &[u64] = &[300, 900];
+
+/// [`fetch`], asked again when the answer wasn't an image.
+///
+/// Only for a URL that is *known* to name one: the advertised thumbnail, or a
+/// size rewrite of it, which the CDN serves at any size up to 1400. A failure
+/// there says something went wrong on the way — a reset, a 5xx, a truncated
+/// body under load — rather than that the picture doesn't exist, and giving
+/// up on the first one is what leaves a track showing the placeholder note
+/// (or, in the GUI, a 120px thumbnail blown up to fill a 352px box) for the
+/// rest of the session.
+///
+/// Deliberately *not* used for [`hd_variant`]'s guess, where 404 is the
+/// ordinary answer for anything not uploaded in HD — two of five measured —
+/// and re-asking would only delay the fallback that was always coming.
+async fn fetch_insisting(url: &str) -> Result<Cover, String> {
+    let mut last = fetch(url).await;
+    for wait in RETRY_BACKOFF_MS {
+        let Err(e) = &last else { return last };
+        log::debug!("cover: {url} failed ({e}) — retrying in {wait}ms");
+        tokio::time::sleep(std::time::Duration::from_millis(*wait)).await;
+        last = fetch(url).await;
+    }
+    last
 }
 
 /// The bytes behind a cover URL, read against [`MAX_BYTES`].
@@ -392,35 +461,45 @@ mod tests {
     #[test]
     fn a_videos_thumbnail_is_asked_for_at_full_resolution() {
         // What a search row advertises: a signed crop with no size to rewrite,
-        // which arrives 400×225.
+        // which arrives 400×225. Every larger frame is offered, biggest first
+        // — asking only for `maxresdefault` and giving up on a 404 is what
+        // left a twentieth of the library at 400px when `sddefault` was
+        // there.
         assert_eq!(
-            hd_variant("https://i.ytimg.com/vi/3UJZ8CndI8Y/hqdefault.jpg?sqp=-oaymwEW&rs=AMzJ")
-                .as_deref(),
-            Some("https://i.ytimg.com/vi/3UJZ8CndI8Y/maxresdefault.jpg")
+            hd_ladder("https://i.ytimg.com/vi/3UJZ8CndI8Y/hqdefault.jpg?sqp=-oaymwEW&rs=AMzJ"),
+            [
+                "https://i.ytimg.com/vi/3UJZ8CndI8Y/maxresdefault.jpg",
+                "https://i.ytimg.com/vi/3UJZ8CndI8Y/sddefault.jpg",
+            ]
         );
-        assert!(hd_variant("https://i.ytimg.com/vi/abc/sddefault.jpg").is_some());
+    }
+
+    #[test]
+    fn only_frames_larger_than_the_one_advertised_are_offered() {
+        // Nothing below `sddefault`, since asking for a smaller picture than
+        // the one already in hand is worse than not asking.
+        assert_eq!(
+            hd_ladder("https://i.ytimg.com/vi/abc/sddefault.jpg"),
+            ["https://i.ytimg.com/vi/abc/maxresdefault.jpg"]
+        );
     }
 
     #[test]
     fn nothing_else_is_guessed_at() {
-        // Album art, which `at_size` already handles and which has no
-        // `maxresdefault` to ask for.
+        let none: [String; 0] = [];
+        // Album art, which `at_size` already handles and which has no named
+        // frames to ask for.
         assert_eq!(
-            hd_variant("https://yt3.googleusercontent.com/abc=w480-h480-l90-rj"),
-            None
+            hd_ladder("https://yt3.googleusercontent.com/abc=w480-h480-l90-rj"),
+            none
         );
-        // Already the biggest.
-        assert_eq!(
-            hd_variant("https://i.ytimg.com/vi/abc/maxresdefault.jpg"),
-            None
-        );
+        // Already the biggest — nothing above it to try, so it must not
+        // re-request itself.
+        assert_eq!(hd_ladder("https://i.ytimg.com/vi/abc/maxresdefault.jpg"), none);
         // A name we don't know is not one to replace.
-        assert_eq!(
-            hd_variant("https://i.ytimg.com/vi/abc/oardefault.jpg"),
-            None
-        );
-        assert_eq!(hd_variant("https://example.com/hqdefault.jpg"), None);
-        assert_eq!(hd_variant("nonsense"), None);
+        assert_eq!(hd_ladder("https://i.ytimg.com/vi/abc/oardefault.jpg"), none);
+        assert_eq!(hd_ladder("https://example.com/hqdefault.jpg"), none);
+        assert_eq!(hd_ladder("nonsense"), none);
     }
 
     #[test]

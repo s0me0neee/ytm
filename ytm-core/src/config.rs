@@ -15,6 +15,14 @@ use crate::session::config_toml_path;
 /// leave the panel showing lyrics from a different part of the song entirely.
 const MAX_LYRICS_OFFSET: f64 = 30.0;
 
+/// How far below full scale [`Audio::headroom_db`] may be asked to sit.
+///
+/// The floor is libavfilter's, not a taste judgement: `alimiter`'s `limit`
+/// bottoms out at 0.0625, which is −24 dBFS, and a value past it is rejected
+/// by the filter rather than clamped by it — leaving mpv with no filter at
+/// all, which is the one outcome this setting exists to prevent.
+const MIN_HEADROOM_DB: f64 = -24.0;
+
 /// Written on a fresh install, and in place of the bare header that older
 /// versions left behind. Every setting is commented out at its default, so the
 /// file doubles as the documentation for what can be set.
@@ -107,6 +115,7 @@ const KNOWN: &[(&str, &[&str])] = &[
     ),
     ("ui", &["covers"]),
     ("auth", &["auto-reauth", "cookie-browser"]),
+    ("audio", &["limiter", "headroom-db"]),
 ];
 
 #[derive(Debug, Clone, Default)]
@@ -114,6 +123,54 @@ pub struct Config {
     pub lyrics: Lyrics,
     pub ui: Ui,
     pub auth: Auth,
+    pub audio: Audio,
+}
+
+/// What the engine does to the signal between the decoder and the sound card.
+///
+/// `Copy`, because it is handed to [`crate::Player::new`] and travels from
+/// there to the audio thread, which outlives the `Config` the frontend read
+/// it out of.
+#[derive(Debug, Clone, Copy)]
+pub struct Audio {
+    /// Hold the signal below full scale so a loud master cannot clip the
+    /// output.
+    ///
+    /// On by default, because what it prevents is not a matter of taste.
+    /// Measured over five tracks resolved from YouTube's own CDN, four
+    /// decoded to peaks *above* 0 dBFS — up to +2.0 dBTP — which the sound
+    /// card can only render by flattening them. This is not the codec's
+    /// doing: modern masters are cut that hot deliberately, on the
+    /// assumption the player has headroom, and mpv is given none. The cost
+    /// on the measured material was 0.5 LU of loudness, so it earns its
+    /// place by never being audible except where it replaces clipping.
+    pub limiter: bool,
+    /// Where the ceiling sits, in dB below full scale. Negative.
+    ///
+    /// −1 dBFS is the usual mastering allowance, and enough here: through
+    /// mpv's own pipeline it measured −0.2 dBTP on a track that arrived at
+    /// +1.8, so the inter-sample peaks the sample-domain limiter cannot see
+    /// still land under the line. Deeper trades loudness for margin.
+    pub headroom_db: f64,
+}
+
+impl Default for Audio {
+    fn default() -> Self {
+        Self {
+            limiter: true,
+            headroom_db: -1.0,
+        }
+    }
+}
+
+impl Audio {
+    /// The ceiling as libavfilter's `alimiter` wants it: a linear amplitude
+    /// rather than dB. `None` when the limiter is off, which is what the
+    /// engine reads as "add no filter at all".
+    #[must_use]
+    pub fn limit_amplitude(&self) -> Option<f64> {
+        self.limiter.then(|| 10.0_f64.powf(self.headroom_db / 20.0))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +387,7 @@ impl Config {
         let lyrics = table.get("lyrics").and_then(toml::Value::as_table);
         let ui = table.get("ui").and_then(toml::Value::as_table);
         let auth = table.get("auth").and_then(toml::Value::as_table);
+        let audio = table.get("audio").and_then(toml::Value::as_table);
         let d = Self::default();
         Self {
             lyrics: Lyrics {
@@ -345,6 +403,14 @@ impl Config {
             auth: Auth {
                 auto_reauth: field(auth, "auto-reauth", d.auth.auto_reauth),
                 cookie_browser: field(auth, "cookie-browser", d.auth.cookie_browser),
+            },
+            audio: Audio {
+                limiter: field(audio, "limiter", d.audio.limiter),
+                // Through `Seconds` for the same reason `lyrics.offset` is:
+                // `headroom-db = -1` is the spelling a person writes, and
+                // serde would reject the integer and take the whole file
+                // down to defaults over the missing `.0`.
+                headroom_db: field(audio, "headroom-db", Seconds(d.audio.headroom_db)).0,
             },
         }
     }
@@ -363,6 +429,40 @@ impl Config {
 
         if self.lyrics.offset != 0.0 {
             log::info!("config: lyrics.offset {}s", self.lyrics.offset);
+        }
+
+        // A positive headroom is the sign error this setting invites — asking
+        // for room *above* full scale, which is the clipping it exists to
+        // stop. Taken as the magnitude the user meant rather than refused,
+        // since there is only one thing `headroom-db = 1` can mean.
+        let db = self.audio.headroom_db;
+        let mut fixed = if db.is_finite() {
+            db
+        } else {
+            log::warn!("config: audio.headroom-db is not a number — using the default");
+            Self::default().audio.headroom_db
+        };
+        if fixed > 0.0 {
+            log::warn!("config: audio.headroom-db {db} is above full scale — reading it as {}", -fixed);
+            fixed = -fixed;
+        }
+        // After the flip, never as a branch beside it: `headroom-db = 40` is
+        // both wrongly signed *and* far out of range, and a chain that took
+        // only the first of those left −40 dB standing — 0.01 linear, under
+        // `alimiter`'s floor, so the filter is rejected and there is no
+        // limiter at all.
+        if fixed < MIN_HEADROOM_DB {
+            log::warn!(
+                "config: audio.headroom-db {fixed} is out of range — clamping to {MIN_HEADROOM_DB}"
+            );
+            fixed = MIN_HEADROOM_DB;
+        }
+        self.audio.headroom_db = fixed;
+
+        if self.audio.limiter {
+            log::info!("config: audio limiter on at {} dBFS", self.audio.headroom_db);
+        } else {
+            log::info!("config: audio limiter off — a loud master can clip the output");
         }
 
         // Checked here rather than at the point of use, because an unknown
@@ -656,6 +756,66 @@ mod tests {
         assert_eq!(parse("[lyrics]\noffset = 1000.0\n").lyrics.offset, 30.0);
         assert_eq!(parse("[lyrics]\noffset = nan\n").lyrics.offset, 0.0);
         assert_eq!(parse("[lyrics]\noffset = inf\n").lyrics.offset, 0.0);
+    }
+
+    // ── audio ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_limiter_is_on_by_default_at_one_db() {
+        let d = parse("").audio;
+        assert!(d.limiter);
+        assert_eq!(d.headroom_db, -1.0);
+        // 10^(-1/20). What libavfilter is handed, and the reason the default
+        // has to stay inside `alimiter`'s own 0.0625..=1 range.
+        let limit = d.limit_amplitude().expect("on by default");
+        assert!((limit - 0.891_251).abs() < 1e-6, "{limit}");
+    }
+
+    #[test]
+    fn turning_the_limiter_off_removes_the_filter_rather_than_flattening_it() {
+        // Not "a ceiling at 0 dBFS" -- `None` is what the engine reads as
+        // "set no `af` at all", so the signal path is byte-identical to what
+        // it was before this setting existed.
+        assert!(
+            parse("[audio]\nlimiter = false\n")
+                .audio
+                .limit_amplitude()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn headroom_is_read_as_a_depth_however_it_is_signed() {
+        // `headroom-db = 3` means three dB of headroom, not a ceiling three
+        // dB above full scale -- there is nothing else it could mean, and
+        // obeying it literally would cause the clipping it exists to stop.
+        assert_eq!(parse("[audio]\nheadroom-db = 3\n").audio.headroom_db, -3.0);
+        assert_eq!(parse("[audio]\nheadroom-db = -3\n").audio.headroom_db, -3.0);
+        // Integer as well as float, via `Seconds` -- `-2` is how a person
+        // writes it and serde would otherwise reject it.
+        assert_eq!(parse("[audio]\nheadroom-db = -2.5\n").audio.headroom_db, -2.5);
+    }
+
+    #[test]
+    fn headroom_stays_inside_what_the_filter_will_accept() {
+        // Past `alimiter`'s floor the filter is *rejected*, which would leave
+        // mpv with no limiter at all -- the one outcome worse than a badly
+        // chosen one.
+        assert_eq!(parse("[audio]\nheadroom-db = -90\n").audio.headroom_db, -24.0);
+        // Not clamped: a value that is not a number names no depth at all, so
+        // the default is a better answer than the floor.
+        assert_eq!(parse("[audio]\nheadroom-db = nan\n").audio.headroom_db, -1.0);
+        assert_eq!(parse("[audio]\nheadroom-db = -inf\n").audio.headroom_db, -1.0);
+        assert_eq!(parse("[audio]\nheadroom-db = inf\n").audio.headroom_db, -1.0);
+        for src in [
+            "",
+            "[audio]\nheadroom-db = -90\n",
+            "[audio]\nheadroom-db = 40\n",
+            "[audio]\nheadroom-db = nan\n",
+        ] {
+            let limit = parse(src).audio.limit_amplitude().expect("on");
+            assert!((0.0625..=1.0).contains(&limit), "{src:?} gave {limit}");
+        }
     }
 
     // ── translation ───────────────────────────────────────────────────────

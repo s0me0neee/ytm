@@ -16,6 +16,19 @@
 //! Needs a set-up session — it reads the library to recover each track's real
 //! title, artist and duration — and hits lrclib once per ladder rung per track.
 
+/* A dev tool rather than shipped code: not built into either binary, run by
+   hand against a live session. `clippy.toml` grants the same latitude to
+   tests, which cargo has no equivalent of for examples -- so it is spelled
+   out here instead. `large_futures` is the exception to that description:
+   it ICEs the toolchain rather than reporting anything, on this crate's
+   async fns. See the note in `ytm-core/src/lib.rs`. */
+#![allow(clippy::large_futures)]
+#![allow(clippy::indexing_slicing)]
+#![allow(clippy::map_unwrap_or)]
+#![allow(clippy::missing_const_for_fn)]
+#![allow(clippy::unwrap_used)]
+#![allow(clippy::useless_let_if_seq)]
+
 use std::collections::HashMap;
 
 use ytm_core::{LyricsKind, LyricsQuery, LyricsService, Session, TrackLyrics, library};

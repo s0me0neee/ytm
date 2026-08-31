@@ -35,6 +35,7 @@
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ytmusicapi::YTMusicClient;
 
@@ -51,7 +52,7 @@ const PER_FILTER: usize = 20;
 
 /// What a result *is*, reduced from `musicVideoType` to the distinction that
 /// matters when choosing one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResultKind {
     /// An art track: catalogue audio with an album and a release duration.
     Song,
@@ -85,7 +86,7 @@ impl ResultKind {
 }
 
 /// One search hit.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub video_id: String,
     pub title: String,

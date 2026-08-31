@@ -4,13 +4,13 @@
 //! anything else that builds. A player without media keys is a smaller thing,
 //! not a broken one, so this says so once in the log and then costs nothing.
 
-use super::{MediaCmd, NowPlaying};
+use super::{Host, MediaCmd, NowPlaying};
 
 #[derive(Debug)]
 pub struct MediaControls(());
 
 impl MediaControls {
-    pub fn new(_rt: &tokio::runtime::Handle) -> Option<Self> {
+    pub fn new(_rt: &tokio::runtime::Handle, _host: Host) -> Option<Self> {
         log::info!("[media] no OS media controls on this platform");
         None
     }

@@ -39,10 +39,11 @@ impl LrcError {
     /// every other 4xx means the request itself was wrong — repeating those
     /// only costs the user time and lrclib bandwidth. Decode failures are
     /// likewise not repeated: a response we can't parse won't parse next time.
+    #[must_use]
     pub fn is_transient(&self) -> bool {
         match self {
-            LrcError::Api { status_code, .. } => *status_code == 429 || *status_code >= 500,
-            LrcError::Http(e) => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
+            Self::Api { status_code, .. } => *status_code == 429 || *status_code >= 500,
+            Self::Http(e) => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
         }
     }
 }
@@ -88,7 +89,7 @@ struct ApiErrorBody {
 
 impl From<ApiErrorBody> for LrcError {
     fn from(b: ApiErrorBody) -> Self {
-        LrcError::Api {
+        Self::Api {
             message: b.message,
             name: b.name,
             status_code: b.status_code,
@@ -103,6 +104,14 @@ impl From<ApiErrorBody> for LrcError {
 /// a captive portal arrives as HTML, which used to fail `ApiErrorBody` parsing
 /// and surface as an opaque [`LrcError::Http`] — burying the very status that
 /// says whether the request is worth repeating.
+// The lint wants `resp.text().await.map_or_else(...)` for the match below,
+// and taking that suggestion makes *clippy itself* ICE on this crate under
+// the workspace's feature unification: "unexpected rigid alias in layout_of
+// after normalization" against this function's own opaque future
+// (rustc 1.100.0-nightly, fb6531d55). The `let ... else` spelling ICEs the
+// same way, so this is the shape rather than a preference. The inner
+// `map_or_else` is unaffected and is applied.
+#[allow(clippy::option_if_let_else)]
 async fn api_error(resp: reqwest::Response) -> LrcError {
     let status = resp.status();
     let status_code = status.as_u16();
@@ -116,9 +125,7 @@ async fn api_error(resp: reqwest::Response) -> LrcError {
     };
 
     match resp.text().await {
-        Ok(body) => serde_json::from_str::<ApiErrorBody>(&body)
-            .map(Into::into)
-            .unwrap_or_else(|_| opaque()),
+        Ok(body) => serde_json::from_str::<ApiErrorBody>(&body).map_or_else(|_| opaque(), Into::into),
         Err(_) => opaque(),
     }
 }
@@ -162,6 +169,12 @@ impl LrcLib {
     /// # Panics
     /// If the TLS backend fails to initialise. Construct this once, eagerly,
     /// before taking over the terminal.
+    #[must_use]
+    // Deliberate, and documented above: this fails only when the process
+    // cannot do TLS at all, which no caller could act on. Threading a
+    // `Result` out of it would put that impossible case in the signature of
+    // every constructor in both frontends.
+    #[allow(clippy::expect_used)]
     pub fn new() -> Self {
         Self {
             client: Client::builder()
@@ -178,7 +191,10 @@ impl LrcLib {
 
     /// Look up lyrics by track metadata. `duration` is in seconds.
     ///
-    /// Returns `LrcError::Api` with `status_code = 404` when no match is found.
+    /// # Errors
+    /// [`LrcError::Api`] with `status_code = 404` when no match is found, any
+    /// other status lrclib answers with, or [`LrcError::Http`] if the request
+    /// could not be made or the body could not be decoded.
     pub async fn get(
         &self,
         track_name: &str,
@@ -209,6 +225,9 @@ impl LrcLib {
     // ── GET /api/get/:id ─────────────────────────────────────────────────────
 
     /// Look up lyrics by lrclib numeric ID.
+    ///
+    /// # Errors
+    /// As [`Self::get`] — 404 for an id lrclib does not hold.
     pub async fn get_by_id(&self, id: u64) -> Result<Lyrics, LrcError> {
         let resp = self
             .client
@@ -225,6 +244,10 @@ impl LrcLib {
     // ── GET /api/search ──────────────────────────────────────────────────────
 
     /// Full-text search across track name, artist, and album.
+    ///
+    /// # Errors
+    /// As [`Self::get`]. A query that matches nothing is an empty `Vec`, not
+    /// an error — unlike `/get`, which 404s.
     pub async fn search(&self, query: &str) -> Result<Vec<Lyrics>, LrcError> {
         let resp = self
             .client
@@ -240,6 +263,9 @@ impl LrcLib {
     }
 
     /// Metadata search — filter by individual fields instead of a free-text query.
+    ///
+    /// # Errors
+    /// As [`Self::search`].
     pub async fn search_by_meta(
         &self,
         track_name: &str,

@@ -16,7 +16,7 @@ use ratatui::{
 };
 use throbber_widgets_tui::{Throbber, ThrobberState};
 
-use ytm_core::library::{LibraryFetcher, SongBatch};
+use ytm_core::library::{LibraryFetcher, SongBatch, moved_indices};
 use ytm_core::lyrics::{self, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 use ytm_core::persistence::{self, LyricsOverrides, QueueState, RestoreOutcome};
 use ytm_core::search::{self, ResultKind, SearchMsg, SearchResult};
@@ -233,8 +233,9 @@ fn hint(key: &str, desc: &str) -> Vec<Span<'static>> {
 /// Lays out as many hints as fit in `width`, dropping whole hints from the end
 /// rather than letting the line be clipped mid-word.
 ///
-/// The full hint list needs ~143 columns; this is what keeps an 80-column
-/// terminal readable. `?` opens the complete keymap.
+/// Every context's full hint list runs well past 80 columns, so dropping is
+/// the normal case, not an edge one; `?` opens the complete keymap for
+/// whatever got cut.
 fn fit_hints(items: &[(&str, &str)], width: usize) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let mut used = 0;
@@ -296,39 +297,6 @@ fn select_prev_bounded(state: &mut TableState, len: usize) {
     };
     let current = state.selected().unwrap_or(0).min(last);
     state.select(Some(current.saturating_sub(1)));
-}
-
-/// Where each of `before`'s tracks ended up in `now`, matched by video id, or
-/// `None` when every one of them is exactly where it was.
-///
-/// The `None` is the common answer and the reason this is worth a function: a
-/// track added to an ordinary playlist is *appended*, so a refetch moves
-/// nothing and there is no reason to rebuild a queue. Adding to Liked Music
-/// puts it at the top, and then everything has moved. A track that has left the
-/// playlist gets `Some(None)` — its own entry, saying it is gone.
-fn moved_indices(before: &[Option<String>], now: &[Track]) -> Option<Vec<Option<usize>>> {
-    let places: std::collections::HashMap<&str, usize> = now
-        .iter()
-        .enumerate()
-        .filter_map(|(i, t)| Some((t.video_id.as_deref()?, i)))
-        .collect();
-    let moved: Vec<Option<usize>> = before
-        .iter()
-        .enumerate()
-        .map(|(i, id)| match id.as_deref() {
-            Some(id) => places.get(id).copied(),
-            // A track with no video id is unplayable and unmatchable, so it is
-            // left exactly where it was rather than counted as having moved —
-            // otherwise one such track means every refetch of that playlist
-            // reads as a reorder and drops it out of the queue.
-            None => Some(i),
-        })
-        .collect();
-    moved
-        .iter()
-        .enumerate()
-        .any(|(i, m)| *m != Some(i))
-        .then_some(moved)
 }
 
 /// Word-wraps `text` to `width` **display cells**, at most `max_lines` of them,
@@ -639,10 +607,6 @@ const MAX_TRANSLATIONS: usize = 64;
 /// what stops a `Missing` or `Failed` result being re-fetched once a tick, and
 /// getting one back costs a walk up the lrclib ladder.
 const MAX_LYRICS: usize = 256;
-
-/// Tracks the synthetic search playlist holds before it is emptied — and only
-/// then when nothing points into it. See [`App::prune_search_history`].
-const MAX_SEARCH_TRACKS: usize = 128;
 
 /// How big a cover to ask the CDN for on the OS's own media panel. Fixed,
 /// unlike the terminal's, because that panel is not the terminal: Windows'
@@ -1033,7 +997,7 @@ impl App {
         let selected = (n > 0).then_some(0);
 
         // Restore the volume saved on the previous exit.
-        let mut player = Player::new(rt.clone());
+        let mut player = Player::new(rt.clone(), config.audio);
         player.set_volume(persistence::load_settings().volume);
 
         let (lyrics_tx, lyrics_rx) = std::sync::mpsc::channel();
@@ -1046,7 +1010,10 @@ impl App {
         let covers_enabled = config.ui.covers && kitty::supported();
         log::info!("covers: {}", if covers_enabled { "on" } else { "off" });
 
-        let media = MediaControls::new(&rt);
+        // `Console`: no window, and a main thread this loop comes back to every
+        // tick — which on macOS is what decides both whether AppKit is asked to
+        // make this an app and who turns the run loop. See `media::Host`.
+        let media = MediaControls::new(&rt, ytm_core::Host::Console);
 
         Self {
             library,
@@ -1655,36 +1622,19 @@ impl App {
     const DURATION_WAIT: Duration = Duration::from_secs(4);
 
     /// Empties the search playlist once it has grown past
-    /// [`MAX_SEARCH_TRACKS`] — but only while nothing points into it.
+    /// `MAX_SEARCH_TRACKS` — but only while nothing points into it.
     ///
-    /// Every track played from search is filed there and nothing ever took one
-    /// out again, so a long session searching around accumulated all of them.
-    /// Dropping any *one* of them is not possible: a `TrackRef` is a position,
-    /// so removing a track renumbers the ones after it and the queue would
-    /// quietly change what it means. Emptying the lot when no reference points
-    /// there at all has no such problem, and that state comes round often —
-    /// playing anything from the library is enough.
+    /// The rule itself is `Player::prune_search_history`, in `ytm-core`, since
+    /// it is policy over a library and a player and the GUI needs the same
+    /// one. What is left here is the part that is this frontend's own: the two
+    /// memoised filters are keyed by a length that just became zero, and the
+    /// songs one also names the playlist — a stale answer there indexes tracks
+    /// that no longer exist.
     fn prune_search_history(&mut self) {
-        let Some(pl) = self
-            .library
-            .find_playlist_index(Library::SEARCH_PLAYLIST_ID)
-        else {
-            return;
-        };
-        if self.library.songs(pl).len() <= MAX_SEARCH_TRACKS {
-            return;
+        if self.player.prune_search_history(&mut self.library) {
+            self.songs_filter = None;
+            self.queue_filter = None;
         }
-        let referenced = self.player.playing().is_some_and(|(p, _)| p == pl)
-            || self.player.queue().iter().any(|&(p, _)| p == pl);
-        if referenced {
-            return;
-        }
-        self.library.clear_search_playlist();
-        // Both filters are keyed by a length this just changed to zero, but the
-        // songs one also names the playlist — and a stale answer here indexes
-        // tracks that are gone.
-        self.songs_filter = None;
-        self.queue_filter = None;
     }
 
     /// Stores one track's lyrics state, dropping the oldest once the cache is
@@ -1838,7 +1788,15 @@ impl App {
             // The +20 ms absorbs `elapsed` staleness (mpv's time-pos observer),
             // so we don't wake early and busy-spin; the 33 ms floor bounds a
             // densely-timed record to ~30 redraws/sec worst case.
-            Some(dt) => Duration::from_secs_f64(dt + 0.020).clamp(Duration::from_millis(33), IDLE),
+            //
+            // `try_from_secs_f64`, because the panicking version is a panic on
+            // the main event loop -- it rejects NaN and anything past
+            // `u64::MAX` seconds, and a lyric record is network data from a
+            // user-submitted database. `next_boundary` now guarantees neither
+            // reaches here; this is the second lock on the same door, and it
+            // costs a `map_or` on a path that already branches.
+            Some(dt) => Duration::try_from_secs_f64(dt + 0.020)
+                .map_or(IDLE, |d| d.clamp(Duration::from_millis(33), IDLE)),
             None => IDLE,
         }
     }
@@ -2996,9 +2954,11 @@ impl App {
 
     // ── help / notification bar ───────────────────────────────────────────────
 
-    /// The keys that work everywhere the picker isn't, in the order they are
-    /// worth dropping. Appended to each context's own so the bar can name every
-    /// binding that context has; `fit_hints` decides how much of it fits.
+    /// The keys appended to `browse_hints` and `lyrics_hints`, in the order
+    /// they are worth dropping; `fit_hints` decides how much of it fits.
+    /// `search_hints` builds its own list by hand instead and doesn't carry
+    /// all of these — `t` (mode) has no effect there, and `↑`/`↓` move the
+    /// result selection rather than volume.
     const TAIL: &'static [(&'static str, &'static str)] = &[
         ("←/→", "seek"),
         ("↑/↓", "volume"),
@@ -3021,7 +2981,7 @@ impl App {
         ]
     }
 
-    /// `ai` is [`Lyrics::ai_available`]: `I` is named only where it does
+    /// `ai` is [`ytm_core::config::Lyrics::ai_available`]: `I` is named only where it does
     /// something, since the paid path shouldn't look like a key you can press.
     fn lyrics_hints(ai: bool) -> Vec<(&'static str, &'static str)> {
         let mut keys = vec![("y", "close"), ("c", "source"), ("i", "translate")];
@@ -3699,6 +3659,14 @@ impl App {
             .collect();
 
         let n = rows.len();
+        // The shared borrow taken at the top of this function is dead by
+        // here -- every row above owns its own text -- so the table's state
+        // can simply be taken mutably. It used to be re-fetched with an
+        // `expect("checked above")`, which the borrow checker wanted only
+        // because that shared borrow was still notionally live.
+        let Some(state) = self.search.as_mut().map(|s| &mut s.state) else {
+            return;
+        };
         frame.render_stateful_widget(
             Table::new(
                 rows,
@@ -3719,7 +3687,7 @@ impl App {
             .highlight_spacing(HighlightSpacing::Always)
             .column_spacing(1),
             list_body(list_area, n),
-            &mut self.search.as_mut().expect("checked above").state,
+            state,
         );
         render_scrollbar(
             frame,
@@ -4733,6 +4701,22 @@ mod tests {
             select_next_bounded(&mut state, 3);
             assert_eq!(state.selected(), Some(0));
         }
+
+        #[test]
+        fn a_single_item_list_always_collapses_to_row_zero() {
+            // The boundary between "empty, select nothing" and "one row,
+            // select it": `last` is 0 here, not absent, so this must not be
+            // confused with the empty-list case above.
+            let mut state = at(None);
+            select_next_bounded(&mut state, 1);
+            assert_eq!(state.selected(), Some(0));
+            select_next_bounded(&mut state, 1);
+            assert_eq!(state.selected(), Some(0));
+
+            let mut state = at(Some(40));
+            select_prev_bounded(&mut state, 1);
+            assert_eq!(state.selected(), Some(0));
+        }
     }
 
     /// Following a queue across a playlist that was fetched again — what makes
@@ -5476,6 +5460,20 @@ mod tests {
     }
 
     #[test]
+    fn zero_budget_drops_every_field_without_underflowing() {
+        // `used` and the per-field `left` are built with `saturating_sub`
+        // deliberately -- a budget of 0 must not panic on underflow.
+        let spans = fit_meta(
+            "Echo",
+            theme::PRIMARY,
+            &[("Crusher-P".into(), theme::META)],
+            0,
+        );
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "");
+    }
+
+    #[test]
     fn a_total_is_rounded_and_an_elapsed_is_not() {
         // mpv reports the real length; the track list shows YouTube's whole
         // seconds. Truncating printed 3:11 under a list that said 3:12.
@@ -5693,6 +5691,16 @@ mod tests {
     fn a_character_wider_than_the_column_still_makes_progress() {
         let out = wrap_n_lines("君の名", 1, usize::MAX);
         assert_eq!(out, ["君", "の", "名"]);
+    }
+
+    #[test]
+    fn a_degenerate_layout_returns_the_text_unwrapped_rather_than_looping() {
+        // width/max_lines of 0 is what a collapsed panel hands these; the
+        // escape hatch has to fire before the cell-counting loop ever starts.
+        assert_eq!(wrap_n_lines("hello", 0, 5), ["hello"]);
+        assert_eq!(wrap_n_lines("hello", 5, 0), ["hello"]);
+        assert_eq!(wrap_words("hello world", 0, 5), ["hello world"]);
+        assert_eq!(wrap_words("hello world", 5, 0), ["hello world"]);
     }
 
     // ── the search panel's detail card, which wraps rather than cuts ───────

@@ -8,9 +8,12 @@
 //! ## Being an app at all
 //!
 //! Neither works for a process the system does not consider an application, so
-//! [`MediaControls::new`] makes this one: `NSApplication::sharedApplication`
-//! with an **accessory** activation policy, which is a real app with no Dock
-//! icon, no menu bar and no window. That is all AppKit is used for.
+//! [`MediaControls::new`] makes this one when asked for [`Host::Console`]:
+//! `NSApplication::sharedApplication` with an **accessory** activation policy,
+//! which is a real app with no Dock icon, no menu bar and no window. That is
+//! all AppKit is used for. Under [`Host::Windowed`] it is not used at all —
+//! `gui/` is already an application, and the policy that buys a terminal its
+//! registration would cost a windowed app its Dock icon and its menu bar.
 //!
 //! ## The run loop, without giving up the main thread
 //!
@@ -18,15 +21,18 @@
 //! and a TUI's main thread is busy being a TUI. The usual answer is to give
 //! Cocoa the main thread and move the interface onto another one — which this
 //! app does not need, because its event loop already comes back here on every
-//! tick: [`MediaControls::update`] drains the main run loop with a zero
-//! timeout before it returns. A media key therefore costs at most one tick of
-//! latency (200 ms, and much less while lyrics are following playback), and
-//! nothing about `App::run` has to move.
+//! tick: under [`Host::Console`], [`MediaControls::update`] drains the main run
+//! loop with a zero timeout before it returns. A media key therefore costs at
+//! most one tick of latency (200 ms, and much less while lyrics are following
+//! playback), and nothing about `App::run` has to move. A windowed host is
+//! already turning that loop, so `update` leaves it alone there — turning it
+//! from inside a block the toolkit dispatched would re-enter our own work.
 //!
 //! Everything here runs on the main thread, so — unlike the other two backends
 //! — there is no channel between threads and no lock. The `mpsc` is still how
 //! commands travel, because the handler blocks are called *between* our own
-//! stack frames and cannot be handed `&mut App`.
+//! stack frames and cannot be handed `&mut App`; [`super::queue`] is what wakes
+//! a frontend that has no tick to notice them on.
 
 use std::cell::RefCell;
 use std::ptr::NonNull;
@@ -54,7 +60,7 @@ use objc2_media_player::{
     MPRemoteCommandHandlerStatus, MPRepeatType, MPShuffleType, MPSkipIntervalCommandEvent,
 };
 
-use super::{MediaCmd, NowPlaying, PlayState, TrackInfo, is_seek};
+use super::{Host, MediaCmd, NowPlaying, PlayState, TrackInfo, is_seek, queue};
 use crate::player::PlayMode;
 
 /// How often the elapsed time is refreshed while nothing else changes. The
@@ -160,6 +166,10 @@ pub struct MediaControls {
     art_pending: Option<String>,
     art_rx: Receiver<(String, Vec<u8>)>,
     art_tx: Sender<(String, Vec<u8>)>,
+    /// Whether this process owns the main run loop, and so has to turn it.
+    /// See [`Host`] — under `Windowed` the toolkit is already turning it, and
+    /// [`MediaControls::pump`] would be a nested loop rather than a spare one.
+    host: Host,
     /// Held for what it *proves* rather than what it does: a
     /// [`MainThreadMarker`] is neither `Send` nor `Sync`, so a handle carrying
     /// one cannot be moved to another thread — which is exactly the rule
@@ -179,7 +189,7 @@ impl MediaControls {
     /// Registers with the Now Playing centre. `None` — logged, never fatal —
     /// when this is not the main thread, which is the one thing AppKit will
     /// not forgive; everything else about the app is unaffected.
-    pub fn new(rt: &tokio::runtime::Handle) -> Option<Self> {
+    pub fn new(rt: &tokio::runtime::Handle, host: Host) -> Option<Self> {
         let Some(mtm) = MainThreadMarker::new() else {
             log::warn!("[nowplaying] not the main thread, media keys will not work");
             return None;
@@ -188,8 +198,15 @@ impl MediaControls {
         // An accessory app: real enough for the system to route media keys to,
         // with no Dock icon, no menu bar and no window. This does not start a
         // run loop — `update` turns it by hand.
-        let app = NSApplication::sharedApplication(mtm);
-        app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        //
+        // Only for a process that is not already an application. A windowed one
+        // is one, and giving it this policy would take away its Dock icon and
+        // its menu bar — the registration this exists to obtain, bought by
+        // dismantling the app that wanted it.
+        if host == Host::Console {
+            let app = NSApplication::sharedApplication(mtm);
+            app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+        }
 
         let (tx, rx) = std::sync::mpsc::channel();
         let (art_tx, art_rx) = std::sync::mpsc::channel();
@@ -205,11 +222,17 @@ impl MediaControls {
             repeat_command: commands.repeat,
             published: None,
             // Far enough back that the first update carries an elapsed time.
-            last_elapsed: Instant::now() - ELAPSED_INTERVAL,
+            // `checked_sub`, since `Instant` is measured from boot and a
+            // machine up for less than the interval would otherwise panic
+            // here; `now` just means the first update waits one interval.
+            last_elapsed: Instant::now()
+                .checked_sub(ELAPSED_INTERVAL)
+                .unwrap_or_else(Instant::now),
             art: Rc::new(RefCell::new(None)),
             art_pending: None,
             art_rx,
             art_tx,
+            host,
             _mtm: mtm,
         })
     }
@@ -265,7 +288,13 @@ impl MediaControls {
             self.published = Some(want);
         }
 
-        self.pump();
+        // A windowed app's toolkit is already turning the main loop, so the
+        // handlers arrive without help — and turning it again from inside a
+        // block the toolkit dispatched to us would run our own queued work
+        // re-entrantly, underneath ourselves.
+        if self.host == Host::Console {
+            self.pump();
+        }
     }
 
     /// Next queued command from the system, if any.
@@ -435,7 +464,7 @@ impl Drop for MediaControls {
 fn on(command: &MPRemoteCommand, tx: &Sender<MediaCmd>, cmd: MediaCmd) -> Retained<AnyObject> {
     let tx = tx.clone();
     let handler = RcBlock::new(move |_: NonNull<MPRemoteCommandEvent>| {
-        let _ = tx.send(cmd);
+        let _ = queue(&tx, cmd);
         MPRemoteCommandHandlerStatus::Success
     });
     unsafe {
@@ -488,7 +517,7 @@ fn register_commands(tx: &Sender<MediaCmd>) -> Commands {
                 .as_ptr()
                 .cast::<MPChangePlaybackPositionCommandEvent>()
         };
-        let _ = seek_tx.send(MediaCmd::SeekTo(unsafe { event.positionTime() }));
+        let _ = queue(&seek_tx, MediaCmd::SeekTo(unsafe { event.positionTime() }));
         MPRemoteCommandHandlerStatus::Success
     });
     let seek_target = unsafe {
@@ -512,7 +541,7 @@ fn register_commands(tx: &Sender<MediaCmd>) -> Commands {
             // it is not obliged to, so the event is what counts.
             let interval = unsafe { event.interval() };
             let secs = if interval > 0.0 { interval } else { SKIP_SECS };
-            let _ = skip_tx.send(MediaCmd::Seek(sign * secs));
+            let _ = queue(&skip_tx, MediaCmd::Seek(sign * secs));
             MPRemoteCommandHandlerStatus::Success
         });
         let target = unsafe {
@@ -537,7 +566,7 @@ fn register_commands(tx: &Sender<MediaCmd>) -> Commands {
             unsafe { &*event.as_ptr().cast::<MPChangeShuffleModeCommandEvent>() };
         let shuffling = unsafe { event.shuffleType() } != MPShuffleType::Off;
         let repeat = unsafe { shuffle_repeat.currentRepeatType() };
-        let _ = shuffle_tx.send(MediaCmd::Mode(mode_from(repeat, shuffling)));
+        let _ = queue(&shuffle_tx, MediaCmd::Mode(mode_from(repeat, shuffling)));
         MPRemoteCommandHandlerStatus::Success
     });
     let shuffle_target = unsafe {
@@ -552,7 +581,7 @@ fn register_commands(tx: &Sender<MediaCmd>) -> Commands {
             unsafe { &*event.as_ptr().cast::<MPChangeRepeatModeCommandEvent>() };
         let repeat = unsafe { event.repeatType() };
         let shuffling = unsafe { repeat_shuffle.currentShuffleType() } != MPShuffleType::Off;
-        let _ = repeat_tx.send(MediaCmd::Mode(mode_from(repeat, shuffling)));
+        let _ = queue(&repeat_tx, MediaCmd::Mode(mode_from(repeat, shuffling)));
         MPRemoteCommandHandlerStatus::Success
     });
     let repeat_target = unsafe {

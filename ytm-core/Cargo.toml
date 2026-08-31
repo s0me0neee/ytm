@@ -18,9 +18,11 @@ reqwest = { version = "0.13.4", features = ["gzip"] }
 # `lyrics.translate-to` against. Its `translate` function is unused: it reads
 # just the first segment of a reply and silently drops the rest.
 rust-translate = "0.1.3"
-# "sync" is not needed: concurrency in `translate.rs` is bounded by spawning in
+# "sync" for `Notify` alone — `AudioEngine::changed()`, which lets a frontend
+# wait for playback news instead of asking for it on a timer. Concurrency in
+# `translate.rs` still needs nothing from it: that is bounded by spawning in
 # rounds rather than with a semaphore.
-tokio = { version = "1.53.1", features = ["rt", "time"] }
+tokio = { version = "1.53.1", features = ["rt", "time", "sync"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # config.toml parsing. Read-only, so no "display" feature — but "serde" is
@@ -48,6 +50,10 @@ inquire = "0.9.4"
 # Same version as the `tui` binary's, so one hotpath is compiled rather than
 # two side by side.
 hotpath = "0.23.1"
+# Reads cookies straight out of a browser's own profile on disk (session.rs's
+# "Auto" setup path), in-process — no yt-dlp subprocess, and per its own docs
+# it handles Chrome's App-Bound Encryption that yt-dlp cannot decrypt.
+rookie = "0.5.6"
 
 # MPRIS2 — the desktop's media-player protocol. This is what makes the
 # keyboard's media keys work and what lists the app as a player in GNOME/KDE.
@@ -138,3 +144,6 @@ pkg-config = "0.3.33"
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
+[lints]
+workspace = true

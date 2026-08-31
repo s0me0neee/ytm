@@ -26,3 +26,6 @@ thiserror = "2.0.20"
 [dev-dependencies]
 # Only the tests need a runtime — the library itself never touches tokio.
 tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true

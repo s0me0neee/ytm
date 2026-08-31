@@ -19,6 +19,14 @@
 //! live, the seek bar tracks a position we never actually play, and the media
 //! keys reach us with the terminal unfocused. It prints every button press.
 
+/* A dev tool rather than shipped code: not built into either binary, run by
+   hand against a live session. `clippy.toml` grants the same latitude to
+   tests, which cargo has no equivalent of for examples -- so it is spelled
+   out here instead. `large_futures` is the exception to that description:
+   it ICEs the toolchain rather than reporting anything, on this crate's
+   async fns. See the note in `ytm-core/src/lib.rs`. */
+#![allow(clippy::large_futures)]
+
 #[cfg(not(target_os = "windows"))]
 fn main() {
     eprintln!("smtc_probe is Windows-only.");
