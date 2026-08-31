@@ -45,7 +45,7 @@ use windows::Storage::Streams::RandomAccessStreamReference;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::core::HSTRING;
 
-use super::{MediaCmd, NowPlaying, PlayState, TrackInfo, is_seek};
+use super::{Host, MediaCmd, NowPlaying, PlayState, TrackInfo, is_seek};
 use crate::player::PlayMode;
 
 /// How long to wait for the worker thread to say whether it has controls.
@@ -184,7 +184,7 @@ impl Controls {
                     return Ok(());
                 }
             };
-            let _ = button_tx.send(cmd);
+            let _ = super::queue(&button_tx, cmd);
             Ok(())
         }))?;
 
@@ -197,7 +197,7 @@ impl Controls {
             PlaybackPositionChangeRequestedEventArgs,
         >::new(move |_, args| {
             let secs = args.ok()?.RequestedPlaybackPosition()?.Duration as f64 / 1e7;
-            let _ = seek_tx.send(MediaCmd::SeekTo(secs));
+            let _ = super::queue(&seek_tx, MediaCmd::SeekTo(secs));
             Ok(())
         }))?;
 
@@ -212,7 +212,7 @@ impl Controls {
         >::new(move |_, args| {
             let on = args.ok()?.RequestedShuffleEnabled()?;
             let mode = mode_from(shuffle_smtc.AutoRepeatMode()?, on);
-            let _ = shuffle_tx.send(MediaCmd::Mode(mode));
+            let _ = super::queue(&shuffle_tx, MediaCmd::Mode(mode));
             Ok(())
         }))?;
 
@@ -224,7 +224,7 @@ impl Controls {
         >::new(move |_, args| {
             let repeat = args.ok()?.RequestedAutoRepeatMode()?;
             let mode = mode_from(repeat, repeat_smtc.ShuffleEnabled()?);
-            let _ = repeat_tx.send(MediaCmd::Mode(mode));
+            let _ = super::queue(&repeat_tx, MediaCmd::Mode(mode));
             Ok(())
         }))?;
 
@@ -368,7 +368,7 @@ impl MediaControls {
     /// they are unavailable, which is what a Windows build stripped of the
     /// media stack (Server core, an N edition without the Media Feature Pack)
     /// looks like. Everything else about the app is unaffected.
-    pub fn new(_rt: &tokio::runtime::Handle) -> Option<Self> {
+    pub fn new(_rt: &tokio::runtime::Handle, _host: Host) -> Option<Self> {
         let (cmd_tx, rx) = std::sync::mpsc::channel();
         let (changes, changes_rx) = std::sync::mpsc::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();

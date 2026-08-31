@@ -18,6 +18,10 @@
 //! backend cannot express (there is no volume on Windows, no quit anywhere but
 //! MPRIS) simply never arrives, which costs the caller nothing.
 
+use std::sync::{Arc, LazyLock};
+
+use tokio::sync::Notify;
+
 use crate::player::PlayMode;
 
 // The backend is chosen by target rather than by `cfg` inside one file, so each
@@ -35,6 +39,76 @@ use crate::player::PlayMode;
 mod backend;
 
 pub use backend::MediaControls;
+
+// ── what kind of process is asking ───────────────────────────────────────────
+
+/// Whether the process already is an application, in the sense the desktop
+/// means by it.
+///
+/// Only macOS reads this, and it is the whole difference between the two
+/// frontends there. The Now Playing centre ignores a process the system does
+/// not consider an app, so a terminal has to make itself one — and the way to
+/// do that without a Dock icon is an *accessory* activation policy, which is
+/// precisely what a real windowed app must not adopt. The same split decides
+/// the run loop: a TUI owns its main thread and turns the loop by hand once a
+/// tick, while a windowed app's toolkit is already running it, and turning it
+/// again from inside would be a nested loop delivering our own queued work
+/// re-entrantly.
+///
+/// Linux and Windows have no equivalent question — MPRIS answers to any process
+/// on the bus, and the SMTC route taken here was chosen for working without a
+/// window — so both backends take this and ignore it, rather than the caller
+/// having to know which platforms care.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Host {
+    /// No window, no toolkit, and a main thread the caller returns to every
+    /// tick — `tui/`.
+    Console,
+    /// A windowing toolkit is already running the main loop — `gui/`.
+    Windowed,
+}
+
+// ── being told a command arrived ─────────────────────────────────────────────
+
+/// Signalled by every backend the moment it queues a [`MediaCmd`].
+///
+/// The channel alone is enough for a frontend that already wakes on a clock:
+/// the TUI drains it once a tick and a media key costs at most one tick. The
+/// GUI has no such clock left — it waits on notifications and sleeps for five
+/// seconds at a time when nothing is playing — so a press would sit in the
+/// channel for as long as that. This is what wakes it instead.
+///
+/// A process-wide singleton rather than a handle per [`MediaControls`], because
+/// there is exactly one of those by construction: every backend registers with
+/// something the operating system keeps one of.
+static QUEUED: LazyLock<Arc<Notify>> = LazyLock::new(|| Arc::new(Notify::new()));
+
+/// A handle to wait on for "the desktop has asked for something".
+///
+/// `Notify` stores a permit when nothing is waiting, so a command queued
+/// before the waiter arrives still wakes it. One wake can cover several
+/// commands, which is why callers drain in a loop rather than taking one.
+#[must_use]
+pub fn queued() -> Arc<Notify> {
+    Arc::clone(&QUEUED)
+}
+
+/// Queues a command and wakes whoever is waiting for one.
+///
+/// Every backend sends through this rather than through the `Sender` directly,
+/// so the wake cannot be forgotten at one of the dozen or so places a protocol
+/// turns an event into a [`MediaCmd`].
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+pub(crate) fn queue(
+    tx: &std::sync::mpsc::Sender<MediaCmd>,
+    cmd: MediaCmd,
+) -> Result<(), std::sync::mpsc::SendError<MediaCmd>> {
+    let queued = tx.send(cmd);
+    if queued.is_ok() {
+        QUEUED.notify_one();
+    }
+    queued
+}
 
 // ── what the desktop asks of us ──────────────────────────────────────────────
 
