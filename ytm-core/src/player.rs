@@ -15,6 +15,10 @@ pub type TrackRef = (usize, usize);
 /// rather than "restart this one". See [`Player::restart_or_previous`].
 const RESTART_WINDOW_SECS: f64 = 3.0;
 
+/// How many tracks the synthetic search playlist may hold before
+/// [`Player::prune_search_history`] empties it.
+pub const MAX_SEARCH_TRACKS: usize = 128;
+
 /// Whether a `previous` press should step back a track rather than restart the
 /// one playing.
 ///
@@ -146,9 +150,13 @@ pub struct Player {
 }
 
 impl Player {
-    /// `rt` is the app's runtime, borrowed by [`AudioEngine`]'s resolve threads.
-    pub fn new(rt: tokio::runtime::Handle) -> Self {
-        let audio = AudioEngine::new(rt);
+    /// `rt` is the app's runtime, borrowed by [`AudioEngine`]'s resolve
+    /// threads. `cfg` is the frontend's [`crate::config::Audio`], which is
+    /// read once at startup and describes the output stage — so both
+    /// frontends get the same signal path from the same file rather than each
+    /// configuring mpv for itself.
+    pub fn new(rt: tokio::runtime::Handle, cfg: crate::config::Audio) -> Self {
+        let audio = AudioEngine::new(rt, cfg);
         audio.send(Cmd::Volume(80));
         Self {
             audio,
@@ -169,6 +177,13 @@ impl Player {
 
     pub fn audio_state(&self) -> AudioState {
         self.audio.state()
+    }
+
+    /// Signalled when playback changes in a way worth redrawing for. See
+    /// [`AudioEngine::changed`] for what that does and does not include.
+    #[must_use]
+    pub fn changed(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        self.audio.changed()
     }
 
     pub fn queue(&self) -> &[TrackRef] {
@@ -330,6 +345,46 @@ impl Player {
         self.audio.send(Cmd::Volume(self.volume));
     }
 
+    /// Empties the synthetic search playlist once it has grown past
+    /// [`MAX_SEARCH_TRACKS`], and only while nothing points into it. Answers
+    /// whether it actually cleared, since a caller with derived state keyed on
+    /// that playlist has to drop it.
+    ///
+    /// Every track played from search is filed there and nothing ever takes
+    /// one out again, so a long session searching around accumulates all of
+    /// them. Dropping any *one* is not possible: a [`TrackRef`] is a position,
+    /// so removing a track renumbers the ones after it and the queue quietly
+    /// changes meaning. Emptying the lot when no reference points there at all
+    /// has no such problem, and that state comes round often — playing
+    /// anything from the library is enough.
+    ///
+    /// Lives here rather than in either frontend because it is policy over a
+    /// `Library` and a `Player` and nothing else, and there are two frontends
+    /// now. It was the TUI's alone, which is why the GUI grew the search
+    /// playlist for the life of the process — in the frontend more likely to
+    /// be left open all day.
+    pub fn prune_search_history(&self, library: &mut Library) -> bool {
+        let Some(pl) = library.find_playlist_index(Library::SEARCH_PLAYLIST_ID) else {
+            return false;
+        };
+        if library.songs(pl).len() <= MAX_SEARCH_TRACKS {
+            return false;
+        }
+        let referenced = self.playing.is_some_and(|(p, _)| p == pl)
+            || self.queue.iter().any(|&(p, _)| p == pl)
+            // The order Shuffle is holding is a set of positions too, and it
+            // outlives the queue's current contents.
+            || self
+                .unshuffled
+                .as_ref()
+                .is_some_and(|u| u.iter().any(|&(p, _)| p == pl));
+        if referenced {
+            return false;
+        }
+        library.clear_search_playlist();
+        true
+    }
+
     pub fn cycle_mode(&mut self) {
         self.set_mode(self.mode.next());
     }
@@ -450,6 +505,53 @@ impl Player {
         }
     }
 
+    /// Inserts `(pl_idx, song_idx)` directly after whatever is playing, so it
+    /// is the next thing heard rather than the last — "Play Next" against
+    /// [`Player::append_to_queue`]'s "Play Last".
+    ///
+    /// Inserting *before* `queue_pos` would shift the playing entry's own
+    /// index out from under it, so the insertion point is always one past it;
+    /// with nothing playing there is no "next" to be ahead of and this is an
+    /// append.
+    pub fn insert_next(
+        &mut self,
+        library: &Library,
+        pl_idx: usize,
+        song_idx: usize,
+    ) -> AppendOutcome {
+        let Some(pos) = self.queue_pos else {
+            return self.append_to_queue(library, pl_idx, song_idx);
+        };
+        let at = (pos + 1).min(self.queue.len());
+        self.queue.insert(at, (pl_idx, song_idx));
+        self.revision += 1;
+        let queue_len = self.queue.len();
+        log::info!("insert_next: pl={pl_idx} song={song_idx} at={at} queue_len={queue_len}");
+
+        if self.playing.is_none() {
+            self.queue_pos = Some(at);
+            self.do_play(library, pl_idx, song_idx);
+            AppendOutcome::StartedPlaying {
+                track: (pl_idx, song_idx),
+                queue_len,
+            }
+        } else {
+            AppendOutcome::Queued { queue_len }
+        }
+    }
+
+    /// Empties the queue and stops playback. The queue is the only thing that
+    /// says what to play next, so clearing it and carrying on playing would
+    /// leave the player with a track it could not advance from.
+    pub fn clear_queue(&mut self) {
+        self.stop();
+        self.queue.clear();
+        self.queue_pos = None;
+        self.unshuffled = None;
+        self.revision += 1;
+        log::info!("clear_queue: queue emptied");
+    }
+
     /// Removes the entry at `q_pos` and fixes up `queue_pos`. If the removed
     /// entry was currently playing, immediately switches to whatever
     /// `queue_pos` now points at (or stops if the queue became empty).
@@ -467,11 +569,17 @@ impl Player {
             self.queue.len()
         );
 
+        // `checked_sub` rather than `- 1`, which also folds in what used to be
+        // a separate arm for emptying the last entry: with the queue empty
+        // `p >= len` is true for every `p`, and `0.checked_sub(1)` is the
+        // `None` that arm returned. The invariants say a `queue_pos` past the
+        // end cannot happen otherwise -- but "the invariant holds" is the
+        // reasoning that turns an underflow into a wrapping index rather than
+        // a compile error, and `None` is the right answer either way.
         self.queue_pos = match self.queue_pos {
             None => None,
-            Some(p) if p == q_pos && self.queue.is_empty() => None,
-            Some(p) if p >= self.queue.len() => Some(self.queue.len() - 1),
-            Some(p) if p > q_pos => Some(p - 1),
+            Some(p) if p >= self.queue.len() => self.queue.len().checked_sub(1),
+            Some(p) if p > q_pos => p.checked_sub(1),
             Some(p) => Some(p),
         };
 
@@ -487,7 +595,9 @@ impl Player {
                 RemoveOutcome::Stopped
             }
             Some(pos) => {
-                let (pl, song) = self.queue[pos];
+                let Some(&(pl, song)) = self.queue.get(pos) else {
+                    return RemoveOutcome::Unaffected;
+                };
                 log::info!("remove_from_queue: switching to pl={pl} song={song}");
                 self.do_play(library, pl, song);
                 RemoveOutcome::Switched { track: (pl, song) }
@@ -720,6 +830,13 @@ mod tests {
     #[test]
     fn a_track_still_loading_counts_as_the_start() {
         assert!(should_step_back(203.0, true));
+    }
+
+    #[test]
+    fn play_mode_cycles_through_all_three_and_back() {
+        assert_eq!(PlayMode::Cycle.next(), PlayMode::Single);
+        assert_eq!(PlayMode::Single.next(), PlayMode::Shuffle);
+        assert_eq!(PlayMode::Shuffle.next(), PlayMode::Cycle);
     }
 
     // ── leaving shuffle ───────────────────────────────────────────────────
