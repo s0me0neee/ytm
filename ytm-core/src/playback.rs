@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -50,6 +50,7 @@ pub struct AudioEngine {
     cmd_tx: Option<std::sync::mpsc::Sender<Cmd>>,
     state: Arc<Mutex<AudioState>>,
     audio_thread: Option<thread::JoinHandle<()>>,
+    changed: Arc<tokio::sync::Notify>,
 }
 
 impl AudioEngine {
@@ -57,19 +58,50 @@ impl AudioEngine {
     /// a URL before mpv is handed it (see [`serves_whole_file`]). Taking a handle
     /// rather than building a client of our own is what keeps this to one
     /// reactor for the process.
-    pub fn new(rt: tokio::runtime::Handle) -> Self {
+    ///
+    /// # Panics
+    /// If the OS refuses to start the audio thread. Called once, at startup,
+    /// before either frontend has a UI to report a failure into — and there is
+    /// no playback at all without that thread, so there is nothing a caller
+    /// could do with a `Result` here but exit.
+    #[allow(clippy::expect_used)] // see `# Panics`
+    pub fn new(rt: tokio::runtime::Handle, audio: crate::config::Audio) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let state = Arc::new(Mutex::new(AudioState::default()));
         let state2 = Arc::clone(&state);
+        let changed = Arc::new(tokio::sync::Notify::new());
+        let changed2 = Arc::clone(&changed);
         let handle = thread::Builder::new()
             .name("audio".into())
-            .spawn(move || run(rx, state2, rt))
+            .spawn(move || run(rx, state2, rt, audio, changed2))
+            // The OS refusing a thread at startup is not a condition any
+            // caller could act on -- there is no audio without this thread,
+            // and both frontends build the engine before they have a UI to
+            // report into. Documented under `# Panics` above.
             .expect("spawn audio thread");
         Self {
             cmd_tx: Some(tx),
             state,
             audio_thread: Some(handle),
+            changed,
         }
+    }
+
+    /// Waits until something happens to playback that a listener would want to
+    /// redraw for — a track ending, a load finishing, an error arriving.
+    ///
+    /// The alternative is asking on a timer, and a timer has to be set for the
+    /// worst case: a frontend that wants to know within 50ms that a song ended
+    /// has to ask twenty times a second forever, and is told "nothing" almost
+    /// every time. This is told once, when there is something to tell.
+    ///
+    /// Deliberately *not* signalled for the clock. `elapsed` moves constantly
+    /// and by itself means only that time is passing, so waking a listener for
+    /// it would put the timer back with extra steps. A progress bar is a clock
+    /// and is entitled to one of its own; nothing else here is.
+    #[must_use]
+    pub fn changed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.changed)
     }
 
     pub fn send(&self, cmd: Cmd) {
@@ -202,6 +234,34 @@ fn serves_whole_file(rt: &tokio::runtime::Handle, url: &str) -> bool {
         }
     })
 }
+
+/// How long the audio thread waits between passes while a track is running.
+///
+/// It bounds how stale `AudioState::elapsed` can be, and nothing reads that
+/// finer: the GUI's ticker samples at 250ms and the TUI's lyric scheduler at
+/// 33ms and up, against lrclib timings that are themselves only good to about
+/// a tenth of a second. Commands do not wait for it at all — they wake the
+/// thread directly.
+const ACTIVE_POLL: Duration = Duration::from_millis(50);
+
+/// And while a track is loaded but paused.
+///
+/// Half a second because nothing anyone is waiting for can arrive in this
+/// state. Playback cannot end when none is running, and every other change
+/// comes down the command channel, which this waits on rather than polls. It
+/// is a backstop, not a sample rate.
+const IDLE_POLL: Duration = Duration::from_millis(500);
+
+/// And with nothing loaded at all — a fresh start, or a queue played out.
+///
+/// This is the state the app spends whole evenings in, so it gets the longest
+/// wait: five seconds is a fifth of a wakeup per second, which rounds to
+/// nothing against everything else on the machine. It is not `recv()` with no
+/// timeout, which would be truly free, only because that would depend on mpv
+/// having *nothing* to say while idle — true as far as it is known here, and
+/// not worth a hang if it ever stops being. A timeout that long costs
+/// essentially what blocking forever costs and cannot wedge.
+const STOPPED_POLL: Duration = Duration::from_secs(5);
 
 /// One yt-dlp run. The URL it gives back still has to get past
 /// [`serves_whole_file`] before mpv is handed it.
@@ -397,7 +457,32 @@ fn spawn_resolve(
         .ok();
 }
 
-fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>, rt: tokio::runtime::Handle) {
+/// Everything about the playback state except the clock, in a form two passes
+/// of the loop can be compared by.
+///
+/// Derived once per pass rather than signalled from each of the dozen places
+/// that write to `AudioState`: a notification that has to be remembered at
+/// every call site is one that will eventually be forgotten at a new one, and
+/// the symptom — an interface that stops updating for one particular kind of
+/// event — is the sort that survives a long time unnoticed.
+fn material(s: &AudioState) -> (Option<String>, bool, bool, bool, bool, u64) {
+    (
+        s.track.clone(),
+        s.paused,
+        s.loading,
+        s.song_ended,
+        s.error.is_some(),
+        s.total.to_bits(),
+    )
+}
+
+fn run(
+    rx: Receiver<Cmd>,
+    state: Arc<Mutex<AudioState>>,
+    rt: tokio::runtime::Handle,
+    audio: crate::config::Audio,
+    changed: Arc<tokio::sync::Notify>,
+) {
     #[cfg(windows)]
     let which_cmd = "where";
     #[cfg(not(windows))]
@@ -428,6 +513,40 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>, rt: tokio::runtime::Han
         init.set_property("script-opts", "ytdl_hook-ytdl_path=yt-dlp")?;
         init.set_property("gapless-audio", "yes")?;
         init.set_property("audio-display", "no")?;
+
+        /* mpv's built-in Lua scripts, off. Each is a *thread* — a `sample` of
+           the running app found seven of them (`stats`, `console`, `select`,
+           `positioning`, `commands`, `context_menu`, plus the OSC), every one
+           an on-screen or interactive feature of the mpv *player*. This mpv
+           has no window, no video output and no keyboard: there is nothing any
+           of them could draw on or respond to, so they were pure inventory.
+
+           `load-scripts` is deliberately left alone. It would take `ytdl_hook`
+           with it, which is the fallback `Cmd::Play` drops to when a direct
+           resolve fails — the path that keeps playback working when yt-dlp
+           and mpv disagree about a URL. */
+        for script in [
+            "osc",
+            "load-stats-overlay",
+            "load-console",
+            "load-select",
+            "load-positioning",
+            "load-commands",
+            "load-context-menu",
+            "load-auto-profiles",
+        ] {
+            init.set_property(script, "no")?;
+        }
+
+        /* And mpv's terminal handling. It is a library here, not a program:
+           there is no terminal of its own to read keys from or print status
+           to, and under the TUI the terminal it would find belongs to
+           crossterm in raw mode. Same reasoning for the key bindings — every
+           command reaches this mpv through `Cmd`, never a keypress. */
+        init.set_property("terminal", "no")?;
+        init.set_property("input-terminal", "no")?;
+        init.set_property("input-default-bindings", "no")?;
+        init.set_property("input-builtin-bindings", "no")?;
         // What PipeWire/PulseAudio calls this stream, so the system mixer
         // lists the app under its own name and slider rather than "mpv".
         init.set_property("audio-client-name", "ytm")?;
@@ -441,6 +560,30 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>, rt: tokio::runtime::Han
         init.set_property("demuxer-lavf-analyzeduration", 0.1f64)?;
         init.set_property("idle", "yes")?;
         init.set_property("keep-open", "yes")?;
+
+        /* Hold the signal under full scale. Nothing upstream does: YouTube's
+           CDN hands back the master as it was cut, and four of five tracks
+           measured off it decode to peaks above 0 dBFS — the loudest at
+           +2.0 dBTP. mpv has no headroom to absorb that, so the peaks are
+           flattened by whatever converts to the sound card's format, which is
+           clipping in the one place nothing can be done about it afterwards.
+
+           `level=no` is the load-bearing half. `alimiter`'s `level` defaults
+           to *true*, which makes it an auto-gain stage that lifts quiet
+           material up to the ceiling — the opposite of what is wanted here,
+           and silent about it. Off, the filter only ever attenuates, so a
+           track that never reaches the ceiling passes through untouched.
+
+           Attack and release are libavfilter's defaults, named rather than
+           left implicit because they are what makes this transparent: 5ms is
+           short enough to catch a peak without pulling the note down with
+           it, and 50ms long enough not to modulate the bass. */
+        if let Some(limit) = audio.limit_amplitude() {
+            init.set_property(
+                "af",
+                format!("alimiter=limit={limit:.6}:level=no:attack=5:release=50").as_str(),
+            )?;
+        }
         Ok(())
     }) {
         Ok(m) => m,
@@ -471,6 +614,12 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>, rt: tokio::runtime::Han
     let mut pending_resolve: Option<String> = None;
     // Track of the song mpv is loading, so a load failure can be retried once.
     let mut current_id: Option<String> = None;
+    // A command taken by the wait at the foot of the loop, waiting for the
+    // drain at the top of the next pass to handle it.
+    let mut held: Option<Cmd> = None;
+    // What the state looked like at the end of the previous pass, so this one
+    // can tell whether anything happened worth waking a listener for.
+    let mut was = material(&lock_state(&state));
     let mut load_retried = false;
 
     // Max concurrent yt-dlp resolves (play-resolve + prefetches share `fetching`).
@@ -513,7 +662,11 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>, rt: tokio::runtime::Han
         // ── commands from UI ─────────────────────────────────────────────────
         let mut disconnected = false;
         loop {
-            match rx.try_recv() {
+            // `held` is the command the wait at the foot of the loop already
+            // took off the channel. There is no way to put one back, and it
+            // has to be handled *here* rather than there, because this is
+            // where the handling lives.
+            match held.take().map_or_else(|| rx.try_recv(), Ok) {
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     log::info!("[audio] channel disconnected — dropping mpv");
@@ -680,7 +833,47 @@ fn run(rx: Receiver<Cmd>, state: Arc<Mutex<AudioState>>, rt: tokio::runtime::Han
             }
         }
 
-        thread::sleep(Duration::from_millis(20));
+        /* Wait, rather than sleep. This used to be an unconditional
+           `sleep(20ms)`, which meant the thread woke 50 times a second for
+           the whole life of the process -- playing, paused, or sitting on an
+           empty queue overnight. Idle wakeups are what keep a laptop's SoC
+           out of its deep sleep states, and this was the largest source of
+           them in the app by some way.
+
+           Blocking on the command channel is better on *both* axes at once.
+           A command no longer waits for the current sleep to expire, so a
+           keypress is acted on the moment it arrives instead of up to 20ms
+           later; and with nothing to do, the timeout is all that is left, so
+           the cost of being idle is the cost of the timeout.
+
+           Which is why it is chosen by what is actually happening. While a
+           track runs there are mpv events worth collecting promptly -- the
+           clock the progress bar and the lyric timing read. Paused or
+           stopped, nothing arrives that anybody is waiting for: playback
+           cannot end on its own, and anything the user does comes down this
+           very channel and wakes it immediately. */
+        // Anything a listener would redraw for, told once rather than
+        // discovered by asking. See `AudioEngine::changed`.
+        let interval = {
+            let s = lock_state(&state);
+            let now = material(&s);
+            if now != was {
+                was = now;
+                changed.notify_waiters();
+            }
+            match (s.loading || (s.track.is_some() && !s.paused), s.track.is_some()) {
+                (true, _) => ACTIVE_POLL,
+                (false, true) => IDLE_POLL,
+                (false, false) => STOPPED_POLL,
+            }
+        };
+        match rx.recv_timeout(interval) {
+            Ok(cmd) => held = Some(cmd),
+            Err(RecvTimeoutError::Timeout) => {}
+            // The drain at the top of the next pass sees this too and takes
+            // the shutdown path, which is where that logic belongs.
+            Err(RecvTimeoutError::Disconnected) => {}
+        }
     }
 }
 
@@ -696,6 +889,56 @@ mod tests {
         cache
     }
 
+    /// No audio thread, no mpv — `begin_track`/`state` only ever touch the
+    /// shared `Mutex`, so this is enough to test them in isolation.
+    fn engine_without_a_thread() -> AudioEngine {
+        AudioEngine {
+            cmd_tx: None,
+            state: Arc::new(Mutex::new(AudioState::default())),
+            audio_thread: None,
+            changed: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[test]
+    fn begin_track_is_true_the_instant_it_returns() {
+        let engine = engine_without_a_thread();
+
+        engine.begin_track("abc123");
+
+        // No Cmd::Play has been sent (there is no thread to read it), and yet
+        // the snapshot already names the new track and clears the old one's
+        // figures -- that immediacy is the whole point.
+        let s = engine.state();
+        assert_eq!(s.track.as_deref(), Some("abc123"));
+        assert_eq!(s.elapsed, 0.0);
+        assert_eq!(s.total, 0.0);
+        assert!(s.loading);
+        assert!(!s.song_ended);
+        assert!(s.error.is_none());
+    }
+
+    #[test]
+    fn begin_track_clears_the_previous_tracks_leftovers() {
+        let engine = engine_without_a_thread();
+        {
+            let mut s = engine.lock_state();
+            s.track = Some("old".to_string());
+            s.elapsed = 123.0;
+            s.total = 200.0;
+            s.song_ended = true;
+            s.error = Some("previous failure".to_string());
+        }
+
+        engine.begin_track("new");
+
+        let s = engine.state();
+        assert_eq!(s.track.as_deref(), Some("new"));
+        assert_eq!(s.total, 0.0, "the old song's length must not survive");
+        assert!(!s.song_ended);
+        assert!(s.error.is_none());
+    }
+
     /// The screen, against the live CDN.
     ///
     /// Resolves one track several times and asks of each URL handed back the
@@ -709,7 +952,20 @@ mod tests {
     #[test]
     #[ignore = "hits YouTube and spends several yt-dlp runs"]
     fn resolving_gives_back_urls_that_actually_stream() {
-        let rt = tokio::runtime::Builder::new_current_thread()
+        // Deliberately multi-threaded rather than `new_current_thread`: a
+        // current-thread runtime only drives its own I/O and timer reactor
+        // while a call is inside that *specific* `Runtime`'s own `block_on` —
+        // driven instead through a cloned `Handle`, as `resolve_url` and
+        // `serves_whole_file` do (they carry a `&Handle`, matching
+        // `AudioEngine`'s real one, built by `tui/src/main.rs` as
+        // multi-threaded), it falls back to a bare `CachedParkThread` park
+        // with nothing left actively polling that reactor. `SCREEN_TIMEOUT`
+        // never fires then, so a stalled connection — which live YouTube
+        // traffic hits often enough to be the whole reason this test exists —
+        // hangs the test forever instead of failing it. One worker thread is
+        // enough to keep a real reactor running underneath the `Handle`.
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
             .enable_all()
             .build()
             .expect("runtime");
@@ -755,7 +1011,9 @@ mod tests {
         cache.entries.insert(
             "stale".to_string(),
             (
-                Instant::now() - URL_TTL - Duration::from_secs(1),
+                Instant::now()
+                    .checked_sub(URL_TTL + Duration::from_secs(1))
+                    .expect("a monotonic clock older than the TTL"),
                 "https://cdn/stale".to_string(),
             ),
         );
