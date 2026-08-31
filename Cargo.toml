@@ -1,11 +1,24 @@
 [workspace]
 resolver = "3"
-members = ["lrclib", "ytm-core", "tui"]
+members = ["lrclib", "ytm-core", "tui", "gui/src-tauri"]
 
-# The profile that 'dist' will build with
+# Cross-crate inlining is worth more here than usual: the hot paths run in
+# `ytm-core` but are *called* from `tui`/`gui`, so without LTO every tick pays
+# a real call into another crate. `codegen-units = 1` costs build time and
+# nothing else. `strip` is purely resident-size -- debug symbols in a shipped
+# binary are pages the OS still has to map.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# The profile that 'dist' will build with. Inherits `release` and overrides
+# nothing: it used to drop back to `lto = "thin"`, which meant the one profile
+# that actually ships was the one *not* getting the cross-crate inlining the
+# comment above is about. Thin is the right default for a profile you build
+# often; this one is built once per release, so the extra link time is free.
 [profile.dist]
 inherits = "release"
-lto = "thin"
 
 
 [workspace.lints.clippy]
