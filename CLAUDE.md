@@ -22,6 +22,48 @@ cargo test -p ytm-core media -- --ignored
 # Windows only — does a console process get SMTC at all? Publishes a fake track
 # for 60 s and prints every button press. The proof the backend rests on.
 cargo run -p ytm-core --example smtc_probe
+
+# Can every track in the library be shown at full resolution, and how fast?
+# Walks the real library, fetches each cover the way the app does, and reports
+# the hit rate and the latency distribution split by art track vs video.
+# Needs a live session; an empty playlist list means the cookies have expired.
+cargo run -p ytm-core --example cover_audit        # whole library
+cargo run -p ytm-core --example cover_audit 300    # first 300 tracks
+
+# gui/ — the Tauri desktop frontend, in progress (see Architecture below).
+# pnpm drives the frontend half; cargo alone builds gui/src-tauri but won't
+# produce a running app without pnpm's build having populated frontendDist.
+cd gui && pnpm install
+cd gui && pnpm tauri dev     # dev build, opens a window
+cd gui && pnpm tauri build   # release bundle
+
+# Frontend profiling. `tauri.dev.conf.json` is a dev-only overlay that widens
+# the CSP just enough for React DevTools' standalone build, which is the only
+# way to get a React profiler into a WKWebView — the browser extension cannot
+# load there. Two things block this and neither announces itself:
+#   * the shipped CSP names no `script-src`, so it inherits `default-src
+#     'self'` and a <script src="http://localhost:8097"> is refused silently;
+#   * devtools are gated on `debug_assertions`, so `tauri dev --release`
+#     produces a webview Safari's inspector cannot see at all. Profile from a
+#     debug build, or add tauri's `devtools` feature.
+cd gui && pnpm devtools       # the profiler UI, listens on 8097
+cd gui && pnpm dev:profile    # the app, with the backend script injected
+# `YTM_PROFILE=1` is what injects <script src="localhost:8097"> ahead of the
+# module script (the `reactDevtools` plugin in vite.config.ts) — React has to
+# be hooked before it loads. Never in `index.html` itself: that would ship a
+# dead request to a localhost port on every launch.
+#
+# `react-devtools` drags in Electron, and getting it to run took two fixes
+# that both fail *silently*:
+#   * pnpm 11 blocks postinstall scripts. `pnpm-workspace.yaml`'s `allowBuilds`
+#     is where electron is approved; without it the wrapper installs and the
+#     binary does not.
+#   * electron's own `install.js` then extracts the zip to 252K instead of
+#     208M and still prints "Done", leaving no `Electron Framework.framework`
+#     and no `path.txt`. The cached zip in `~/Library/Caches/electron/` is
+#     intact (88MB, `unzip -t` clean), so the repair is to unzip it by hand
+#     into the package's `dist/` and write `path.txt` containing
+#     `Electron.app/Contents/MacOS/Electron`.
 ```
 
 While the app is running, `playerctl -p ytm status|metadata|play-pause` talks to it, and
@@ -39,6 +81,12 @@ rustup target add aarch64-apple-darwin
 cd tools/macos-check && cargo clippy --target aarch64-apple-darwin --all-targets
 ```
 
+`src/media/` has to be a real directory with `mod.rs` in it, not an inline `mod media {}`.
+The `#[path]` that includes the backend is resolved against `src/media/`, and its `..`
+components are walked by the filesystem rather than normalised away — so with no such
+directory on disk the include fails with `couldn't find file` and the crate checks *nothing*,
+which is how this sat quietly broken between the commit that added it and the one that
+noticed.
 `cargo check` never links and every crate involved is pure Rust, so this needs no Xcode and
 no SDK. Checking `ytm-core` itself for that target does not work — `aws-lc-sys` and
 `libmpv2-sys` both build C. It is a compile check and nothing more: whether the Now Playing
@@ -68,7 +116,16 @@ On first run (`browser.json` absent), the app runs an interactive setup that she
 `yt-dlp --cookies-from-browser` to extract YouTube cookies from a local browser profile.
 The browser that worked is written to `config.toml` as `auth.cookie-browser`, so a later
 expiry renews itself by re-running yt-dlp rather than prompting — set `auth.auto-reauth =
-false` to always be asked. `Session::reauth` returns with a working session either way —
+false` to always be asked.
+
+The `gui/` Tauri app (below) has no local browser to borrow cookies from, so it uses
+`Session::setup_with_webview_cookies` instead — a cookie header read straight out of its own
+login webview. `.yt-tui-authmethod` records which path a session used, so refresh knows
+whether to call `wants_webview_refresh`/`refresh_with_webview_cookies` or the yt-dlp path
+above. Both write the same `browser.json` shape, so nothing downstream of auth can tell which
+frontend signed a session in.
+
+`Session::reauth` returns with a working session either way —
 silently from the browser on record, or through the prompts — so every caller carries
 straight on and nothing ever ends with "run the app again"; `Reauth` says which happened,
 for the log and the wording. `main.rs` is a loop around one `start()`: an expired session
@@ -82,7 +139,7 @@ First-run setup goes the same way: the prompts finish and the TUI opens, rather 
 with an instruction to start the app again. It counts as that one renewal, since cookies
 seconds old are not a session worth fetching afresh.
 Config lives in `~/.config/yt-music-tui/` (`browser.json`, `queue.json`, `settings.json`,
-`lyrics.json`, `translations.json`, `config.toml`, `app.log`). Everything but `config.toml`
+`lyrics.json`, `translations.json`, `history.json`, `config.toml`, `app.log`). Everything but `config.toml`
 is written by the app; `config.toml` is the hand-edited one, read once at startup by
 `config.rs`. The directory is `0700` and the files in it `0600`, re-applied by
 `ensure_config_dir` on every startup rather than only at creation — `browser.json` holds the
@@ -93,14 +150,15 @@ mid-write leaves the previous contents rather than half a file.
 
 ## Architecture
 
-A Cargo workspace with three members. `ytm-core` is UI-agnostic so the engine can be driven
-by something other than the ratatui frontend.
+A Cargo workspace with four members. `ytm-core` is UI-agnostic so the engine can be driven
+by something other than the ratatui frontend — `gui/src-tauri` is the second proof of that.
 
 ```
-lrclib/     lyrics.net API client + LRC format parser (no app knowledge)
-ytm-core/   session/auth, library, search, playback, queue, lyrics policy, persistence
-tui/        the ratatui frontend — single `ytm` binary
-tools/      not a member and not shipped — see `macos-check` above
+lrclib/          lyrics.net API client + LRC format parser (no app knowledge)
+ytm-core/        session/auth, library, search, playback, queue, lyrics policy, persistence
+tui/             the ratatui frontend — single `ytm` binary
+gui/src-tauri/   the Tauri desktop frontend, in progress — see `gui/` below
+tools/           not a member and not shipped — see `macos-check` above
 ```
 
 ### `lrclib/`
@@ -126,7 +184,31 @@ tools/      not a member and not shipped — see `macos-check` above
   own thread, plus an `Arc<Mutex<AudioState>>` snapshot. `AudioState::elapsed` is the live
   playback position, fed by an mpv `time-pos` property observer. `audio-client-name` is set
   to `ytm` so PipeWire/PulseAudio lists the app under its own name in the system mixer
-  rather than as "mpv". `pending_resolve` is the song a yt-dlp resolve is running for, and
+  rather than as "mpv".
+
+  The `af` chain is one filter, `alimiter`, holding the signal under full scale. Nothing
+  upstream does: the CDN hands back the master as it was cut, and **four of five tracks
+  measured off it decode to peaks above 0 dBFS**, the loudest at +2.0 dBTP. mpv has no
+  headroom to absorb that, so those peaks are flattened by whatever converts to the sound
+  card's format — clipping in the one place nothing can be done about it afterwards. Through
+  mpv's own pipeline the filter took a +1.8 dBTP track to −0.2, at a cost of 0.5 LU, so it is
+  inaudible except where it replaces clipping. `level=no` is the load-bearing half: the
+  option defaults to *true*, which makes `alimiter` an auto-gain stage that lifts quiet
+  material **up** to the ceiling — the opposite of what is wanted, and silent about it. Off,
+  it only ever attenuates, so a track that never reaches the ceiling is untouched. The
+  limiter works in the sample domain and true peaks live between samples, but the gap is
+  small here (+1.7 dBFS sample against +1.8 dBTP measured) and the default −1 dB allowance
+  covers it. Configured by `audio.limiter` / `audio.headroom-db`, passed from each frontend's
+  `Config` through `Player::new` — so the two frontends share one signal path rather than
+  each configuring mpv for itself.
+
+  Related but *not* solved here: loudness varies by **7.8 LU** across the same five tracks
+  (−8.6 to −16.4 LUFS), which is the more audible defect and wants normalisation rather than
+  limiting. YouTube ships a per-track figure for it, but `yt-dlp -j` does not expose it — no
+  field matching loud/volume, top level or per format — so it would have to be measured or
+  read out of the player response directly.
+
+  `pending_resolve` is the song a yt-dlp resolve is running for, and
   it is cleared only where that resolve is answered — never on an mpv event, which belongs
   to whatever mpv currently has open rather than to what the user just pressed. Clearing it
   on the `duration` property change meant a track started while the previous one was still
@@ -207,6 +289,22 @@ tools/      not a member and not shipped — see `macos-check` above
   seeked rather than the clock advancing. Position is deliberately *not* published every
   tick anywhere — MPRIS because the spec says so, the other two because each update is a
   cross-process call — so this is what says when to break that silence.
+
+  Two things exist because *two* frontends now drive this. `Host` — `Console` or `Windowed`,
+  passed to `new` — is read only by macOS, and is the whole difference there: the Now Playing
+  centre ignores a process the system does not consider an application, so a terminal makes
+  itself one with an **accessory** activation policy, which is precisely what a real windowed
+  app must not adopt (it would take away the Dock icon and the menu bar to buy a registration
+  Tauri already has). The same flag decides the run loop: `Console` turns it by hand in
+  `update`, `Windowed` leaves it alone because the toolkit is already turning it and a nested
+  turn would deliver our own queued work re-entrantly. Linux and Windows take the flag and
+  ignore it, so no caller has to know which platforms care.
+  And `queued()` is a `Notify` every backend signals through `queue()` the moment it puts a
+  command in the channel. The TUI never needed it — it drains once a tick — but the GUI's
+  loop waits on notifications and sleeps five seconds at a time when nothing is playing, so a
+  media key would have sat unread for as long as that. Sending through `queue()` rather than
+  the `Sender` is what stops the wake being forgotten at one of the dozen places a protocol
+  turns an event into a `MediaCmd`.
 
   `TrackInfo::art_url` is the cover, and each backend wants it differently: MPRIS and SMTC
   hand the URL over and let the desktop fetch it, while macOS has to fetch the bytes itself
@@ -297,9 +395,39 @@ tools/      not a member and not shipped — see `macos-check` above
   what each is drawn in is the panel's business: `kitty::fit_cells` builds a box to match.
   Getting a video's *resolution* right needs one more step, since `at_size` can do nothing
   for it — the row advertises `i.ytimg.com/…/hqdefault.jpg?sqp=…`, a signed crop with no
-  size to rewrite, which arrives 400×225. `hd_variant` asks for `maxresdefault.jpg` instead,
-  the same frame at 1280×720, and falls back to the advertised URL when it 404s: measured
-  over five videos, three had one and two didn't. `Cover::filling` is the last step before
+  size to rewrite, which arrives 400×225. `hd_ladder` answers with every larger *named* frame
+  instead, biggest first, falling back to the advertised URL when they all 404.
+  A ladder rather than the single `maxresdefault` guess it started as, because
+  `examples/cover_audit` showed what the single guess cost: over 300 tracks of the real
+  library, 7 videos have no HD frame and every one of them dropped straight back to 400×225
+  when `sddefault` (640×480) was sitting there — 6 of the 7 now come back at 640.
+  `hq720.jpg` is deliberately *not* a rung despite existing: it is the same 1280×720 as
+  `maxresdefault` under the same HD-upload condition, and it answered 0 of those 6 times
+  while adding a third request to the slow path, taking the video p99 from 1.1s to 2.2s.
+
+  That example is also the answer to "should covers be cached on disk", which is no: a cache
+  cannot make a picture better, only faster to get again. Measured, the 157 art tracks came
+  back at full size **157 times out of 157** — the size rewrite is not a guess, the CDN
+  serves whatever is asked for up to 1400 — with zero network failures across 600 fetches and
+  a median of 148ms warm, 403ms cold, ~1.4s worst. The 4.9% that fall short are videos with
+  no higher-resolution frame in existence, which is the source's ceiling and not something
+  storage can lift. So the retry ladder is the whole solution and the disk stays empty.
+
+  Which URL is a *guess* and which is a *promise* is what decides whether a failure is
+  re-asked. `fetch_insisting` retries the advertised URL (and any size rewrite of it) twice,
+  300ms then 900ms, because the CDN serves those at any size up to 1400 and a failure
+  therefore means something went wrong on the way — a reset, a 5xx, a body truncated under
+  load — rather than that the picture isn't there. `hd_variant`'s `maxresdefault.jpg` gets
+  one attempt only, since 404 is its ordinary answer and re-asking would just delay the
+  fallback that was always coming. The GUI's `Thumbnail` applies the same split, keyed on the
+  URL rather than on position (`isGuess`), and its stakes are higher: its next candidate is
+  the *raw* 120px thumbnail, so one unlucky request used to leave a track showing that
+  stretched across a 352px box for the rest of the session. It also cache-busts each retry,
+  since the failure a plain remount cannot fix is the cacheable one — a 200 whose body didn't
+  decode — and it appends the parameter only to URLs with no query string of their own, so a
+  signed `?sqp=` URL can't be disturbed by it.
+
+  `Cover::filling` is the last step before
   the terminal, giving the image the box's exact shape so the terminal's own fill has
   nothing left to stretch; it never enlarges, since the far end can do that itself and a
   clean enlargement of the right shape is all that is wanted.
@@ -334,6 +462,19 @@ tools/      not a member and not shipped — see `macos-check` above
   Under the free translator `r` does the same thing minus the disk, since there is nothing
   of `i`'s down there to replace. Capped at `MAX_SAVED_TRANSLATIONS`, oldest written evicted
   first.
+
+  `history.json` is what has been played lately — the GUI's home page, though it lives here
+  rather than in `gui/` so the rules about atomic writes and private permissions stay in one
+  place and the TUI could grow the same page without a second format to reconcile. It stores
+  whole `Track`s rather than references to them, because a `TrackRef` is a position and means
+  nothing across a restart, and a song played from search belongs to no playlist that will
+  exist next time — so a row draws with no library loaded at all, which is what a home page
+  shown while playlists are still arriving needs. Capped at
+  `MAX_HISTORY_TRACKS` (100). A replay **moves** its row to the
+  front rather than adding a second one, which is what makes the track cap describe a hundred
+  songs rather than a hundred plays — an evening of one album on repeat would otherwise fill
+  the page with the same three rows. A track with no video id is not kept, since nothing could
+  play it back or tell it from the next one like it.
 - **`config.rs`** — `config.toml`, the hand-edited settings, read once at startup. Every
   value has a working default and a missing or malformed file falls back to those with a
   log warning, so a typo can never stop playback. Because it *is* hand-edited, the reading
@@ -371,6 +512,13 @@ tools/      not a member and not shipped — see `macos-check` above
   `ui.covers` turns cover art off on a terminal that could draw it; it is never *attempted*
   on one the frontend doesn't recognise, so the default is safe everywhere.
   `auth.auto-reauth` / `auth.cookie-browser` drive silent re-authentication.
+  `audio.limiter` / `audio.headroom-db` are the output stage, described under `playback.rs`;
+  `Audio::limit_amplitude` is the whole interface, `None` meaning *add no filter*, so off is
+  byte-identical to the signal path before the setting existed. `headroom-db` is read as a
+  depth however it is signed — `40` is 40 dB of headroom, not a ceiling 40 dB above full
+  scale — and the sign flip is clamped *after* it rather than beside it, since `40` is both
+  wrongly signed and out of range and a chain that fixed only the first left −40 dB standing,
+  which `alimiter` rejects outright and so leaves no limiter at all.
   `remember_cookie_browser` writes back through `toml_edit`, so the user's comments and
   formatting survive — this is the one file the app both reads and writes.
 
@@ -520,6 +668,111 @@ tools/      not a member and not shipped — see `macos-check` above
   - **Wrapping** (`wrap_n_lines`) measures display *cells*, not `char`s: a CJK lyric is two
     cells per character and would otherwise run to twice the panel width and be clipped.
 
+### `gui/`
+
+A Tauri desktop frontend, in progress — `gui/src-tauri` is the fourth workspace member,
+`gui/src` a Vite + React shell (still close to the template; only sign-in is wired up).
+Answers the question the `ytm-core`/`tui` split set up for: `state.rs`'s `AppState` just
+holds a `ytm_core::Session`, and the one thing the GUI needed that `Session` didn't already
+have was `setup_with_webview_cookies` (see Credential Setup above).
+
+`auth.rs`'s `sign_in` opens a `WebviewWindow` at `music.youtube.com` and reads its cookies
+back on every navigation, since Google's login is multi-page and "reached
+music.youtube.com" fires more than once before the user is actually signed in — a
+`SIGNED_IN_MARKER_COOKIE` (`SAPISID=`) is what tells a finished login apart from a loaded
+page. `LOGIN_USER_AGENT` overrides the webview's default UA, since YouTube Music rejects
+WKWebView's and WebKitGTK's own strings outright before a login form even appears.
+`window.cookies()` deadlocks on Windows when called from the navigation callback, hence the
+`spawn_blocking`; the completion `oneshot` is wrapped in `Arc<Mutex<Option<_>>>` (`finish`)
+since navigation can fire more than once but only the first hit should consume it.
+
+`persist.rs` is the queue and the volume, through the same `ytm_core::persistence` functions
+`tui/src/app.rs` calls — so `queue.json` and `settings.json` are *one* saved state and not two:
+quit the TUI mid-album, open the GUI, and the queue is where it was left. (`lyrics.json` and
+`translations.json` were already shared this way, in `lyrics.rs` and `translate.rs`.) Restoring
+is driven from the song-batch loop, since a saved entry names a playlist and there is nothing
+to resolve it to until that playlist has arrived; saving is `RunEvent::Exit`, which is why
+`run()` builds and runs rather than calling `Builder::run` — the same place the TUI's own
+save block sits, at the end of `App::run`. One rule is the GUI's alone: an *empty* queue is
+written out as an empty queue rather than skipped, because this frontend has a "clear queue"
+button and the TUI has no way to empty a queue at all — skipped, the next launch would restore
+what the user had just cleared. `None` from a queue that is *not* empty still leaves the file
+alone, since that is a quit during loading rather than a deliberate clear.
+A restored queue is the reason two things read `playback_started` rather than mpv: it has a
+track selected that mpv has never been handed, so `paused` is folded with it (or the bar draws
+a Pause button and bouncing equaliser bars over silence), and `total` falls back to YouTube's
+duration the way the OS panel already did. The frontend's own half is `playingKey` — the
+metadata fetch keyed on the queue entry *and* the video mpv has open, because either can move
+without the other; on `track` alone the player bar read "Nothing playing" over a queue that had
+just been restored.
+
+`media.rs` drives `ytm_core::media` with `Host::Windowed`. Two differences from the TUI and no
+`cfg` for either. There is no tick to drain on, so commands arrive by `media::queued()` and
+`spawn_listener` waits on it; and the handle is `!Send` on macOS and belongs to the main thread,
+so it lives in a `thread_local!` reached through `run_on_main_thread`, which is an ordinary
+dispatch everywhere. Publishing keeps its own diff (`beyond_position`) rather than leaving it
+to the backend's, because each call would otherwise cost a main-thread wakeup — the elapsed-time
+refresh is capped at one per five seconds *and only while playing*, since paused the position is
+frozen and already correct. `player::push` and the ticker both call it, so the desktop panel and
+the window learn about a track change from the same event rather than one polling behind the
+other.
+
+`history.rs` is the home page's backend, and the interesting part is *where* a play is
+recorded. Half a dozen paths start a song — `play`, `jump_to`, `next`, `prev`, a media key, a
+search result, the queue advancing at the end of a track — and hooking each is how one gets
+missed. All of them end with mpv holding a different video, and `AudioState::track` says so
+the moment `begin_track` writes it, so `observe` watches that one field from the same two
+places `playback-state` is emitted from and covers every path by construction, including ones
+added later. `last_noted` is what makes it once per *song* rather than once per tick, since
+the ticker passes through here four times a second with the same id. The file is written per
+song rather than at exit — three minutes apart, and a history a crash can erase is one nobody
+trusts — on a blocking task, so neither the ticker nor a command waits on it.
+`play_history_track` prefers the *live* library over the stored copy: if the song is still
+where it was played from it is played there, so the queue and the rest of that playlist behave
+exactly as from the library, and only a playlist that is gone (or a search track that never
+had one) falls back to `place_search_result`. The frontend's home page is `HomeView`, shown
+when no playlist is selected — which is the state the app starts in, so it fills what used to
+be an empty "Tracks" heading over nothing. Its sidebar entry is `selected === null`, sharing
+the `layoutId` highlight with the playlists so the selection slides between them as one
+control. A companion list of recently played *playlists* was built and then removed — the
+`playlists` field went with it, and an older `history.json` still carrying one loads fine,
+since serde ignores what it no longer knows about.
+
+`NowPlayingView` is Apple Music's split: two *halves* of the window, artwork and transport as
+one block centred in the left, the lyric sheet centred in the right. Half rather than "as wide
+as each needs" is the whole point — it fixes where the columns sit whatever the cover's shape
+or the length of a line, so nothing slides sideways between one track and the next; with the
+lyric column hidden there is nothing to split against and the block takes the full width. The
+transport lives under the artwork rather than across the foot of the window, since spanning
+the page put it under the lyric column too, where it was a row of controls for a sheet of
+words. The cover's box takes its `aspect-ratio` from the *picture* — square until it decodes,
+then whatever `Thumbnail`'s `onAspect` reports — which is `App::cover_aspect`'s rule in the
+TUI and matters for the same reason: album art is square and a video's thumbnail is 16:9, and
+at this size `object-cover`ing one into the other shows a strip out of the middle of the
+artwork rather than the artwork. `maxHeight` on the same box keeps a square cover from pushing
+the transport off a short window, and because a ratio is set, clamping the height narrows the
+width to match rather than distorting it.
+
+**`App.css` beats Tailwind, and that is a trap.** The file opens with `@import "tailwindcss"`,
+so every class it declares afterwards is *later in source order* than the utilities — and
+against a utility they are the same specificity, one class each. So a property set in
+`App.css` silently wins over the utility for it on the same element. `.slider-root`'s
+`position: relative` overrode `absolute` on the player bar's seek line, which then sat in flow
+as the footer's first child, drew across the *top* of the bar and pushed the row below it out
+of the window; its `width: 100%` overrode the volume slider's `w-20` in the same breath. Both
+are now said in `App.css` instead, and a component class there should declare only what no
+caller will ever want to set from the markup.
+
+`init_logging` opens `app.log` in the config directory, truncating, at the level and in the
+format `tui/src/main.rs` uses. Without it every `log::` line in `ytm-core` is discarded, and a
+GUI has no console to have printed them to instead — which is most of what the app knows about
+its own auth, playback and media backends.
+
+Its own crate (`ytm-gui`) rather than folded into `tui`, since the two frontends share
+nothing but `ytm-core` and Tauri's build artifacts have no reason to touch the ratatui
+binary. `pnpm` drives the frontend half; `cargo` alone builds `gui/src-tauri` but won't
+produce a running app without a `pnpm` build behind it (`tauri.conf.json`'s `frontendDist`).
+
 ### Event loop cadence
 
 `event::poll` normally blocks 200 ms, but `App::poll_timeout` shortens it to wake just after
@@ -561,8 +814,10 @@ every list rather than last, because it is the way to the bindings below it and
 must survive 80 columns; `the_way_to_the_full_keymap_survives_a_narrow_terminal`
 is the test that says so. `App::KEYMAP` is the `?` overlay, and
 `the_keymap_and_the_hint_bar_agree` fails if it grows a binding no hint bar names.
-`Self::TAIL` is the set that works everywhere (seek, volume, mute, mode, panel,
-quit), appended to every context except the modal picker.
+`Self::TAIL` (seek, volume, mute, mode, panel, quit) is appended to `browse_hints` and
+`lyrics_hints`. `search_hints` builds its own list by hand instead and doesn't carry all of
+it — mode has no key while search has focus, and `↑`/`↓` are repurposed to move the result
+selection rather than volume.
 
 Note: raw mode clears `ISIG`, so `Ctrl+C` never becomes a signal — `app.rs` matches it as a
 key event. The `ctrlc` handler in `main.rs` only covers SIGTERM/SIGHUP.
@@ -661,9 +916,24 @@ for the kitty protocol is hand-written in `tui/src/kitty.rs` for the same reason
 `translate::percent_encode` is — a dozen lines of table lookup against a dependency to audit
 and pin.
 
+**`tauri 2`** (`gui/src-tauri` only) is what pulls GTK into `Cargo.lock` on Linux — `atk`,
+`cairo-rs` and the rest arrive because Tauri's Linux backend is WebKitGTK, not because
+`ytm-core`/`tui` gained a dependency on them. It shares the workspace's `tokio`
+(`features = ["sync"]`, just enough for `sign_in`'s completion `oneshot`), same reasoning as
+the `reqwest` version note above.
+
+**Workspace clippy lints** (`[workspace.lints.clippy]`, `clippy.toml`) went in ahead of a
+planned split into separate `ytm-core`/`ytm-tui`/`lrclib` repos, so each starts life already
+held to the bar: `nursery`/`pedantic` denied wholesale, plus `unwrap_used`, `expect_used`,
+`panic`, `indexing_slicing`, `arithmetic_side_effects` and others individually.
+`clippy.toml` allows those back in test code only. `flake.nix` is the matching dev shell —
+`mpv-unwrapped` (the wrapped `mpv` package's runtime wrapper is no use to a build), yt-dlp,
+ffmpeg, and per-OS libs for what `media/mpris.rs` (Linux) and `media/nowplaying.rs`
+(Darwin) each need.
+
 Key deps: `ratatui 0.30`, `ytmusicapi 0.5`, `libmpv2 6`, `reqwest 0.13` (and `0.12`, pulled
 in by `ytmusicapi` and `rust-translate`), `thiserror 2`, `toml 1` / `toml_edit 0.25`,
 `mpris-server 0.10` (Linux only), `windows 0.62` (Windows only),
-`objc2 0.6` + `objc2-* 0.3` + `block2 0.6` (macOS only),
+`objc2 0.6` + `objc2-* 0.3` + `block2 0.6` (macOS only), `tauri 2` (`gui/src-tauri` only),
 `rust-translate 0.1.3`, `ctrlc 3` (termination feature), `simplelog 0.12`, `rand 0.10`,
 `dirs 6`, `throbber-widgets-tui 0.11`.

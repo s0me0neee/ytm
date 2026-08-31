@@ -1,6 +1,6 @@
 ---
 # yt-music-tui — feature plan
-Last updated: 2026-08-20
+Last updated: 2026-08-29
 
 Legend: ✅ done  🔄 in progress  ❌ not started
 
@@ -21,20 +21,65 @@ Legend: ✅ done  🔄 in progress  ❌ not started
 
 ## In progress
 
-🔄 **rustypipe URL resolution** (current branch: `rustypipe`)
-- Goal: replace the `yt-dlp --get-url` subprocess in `resolve_url()` with the rustypipe crate
-- Why: removes the yt-dlp runtime dependency for stream resolution; faster, no subprocess overhead
-- Files: `src/audio.rs:75` (`resolve_url`), `rustypipe_cache.json`, `rustypipe_reports/`
-- Blocking issue to resolve: rustypipe crate is not yet in `Cargo.toml`; verify API stability before pinning
+~~**rustypipe URL resolution**~~ — dropped; `rustypipe` never made it into `Cargo.toml` and
+`resolve_url` (now `ytm-core/src/playback.rs`, not `src/audio.rs` — the crate split happened
+since this was written) still resolves through `yt-dlp --get-url`. Current work on that path
+is perf investigation of the yt-dlp subprocess itself, not replacing it.
+
+---
+
+## Tauri GUI
+
+✅ **A full second frontend** (`gui/` + `gui/src-tauri`, package `ytm-gui`), alongside the TUI
+rather than replacing it — sign-in, library, search, full playback, lyrics, all working against
+the same `ytm-core` engine `tui/` already drives.
+
+Auth took a different path than first planned. An embedded-webview Google login (the original
+design below this section used to describe) was blocked outright by Google's own anti-phishing
+policy — "This browser or app may not be secure" — confirmed by actually trying it, not a bug to
+route around. The GUI instead uses the **`rookie` crate**, which reads cookies straight out of an
+already-installed browser's own disk storage (Chrome, Firefox, Edge, Brave, Opera, Chromium,
+Vivaldi, and Safari on macOS only) — no subprocess, no yt-dlp, no embedded login page. This
+replaced yt-dlp's `--cookies-from-browser` for **both** the TUI and the GUI, for **both** initial
+sign-in and the silent ~6h refresh (`Session::REFRESH_AFTER`) — see `ytm-core/src/session.rs`.
+yt-dlp remains a hard runtime dependency for stream-URL resolution in `playback.rs`; this change
+removed it from the auth path only.
+
+- ✅ `Session::setup_with_browser` / `refresh_cookies` in `ytm-core/src/session.rs` — cookie
+  extraction and the shared staleness/write-back logic, used by both frontends. `browser.json`'s
+  shape is unchanged, so a session started in one frontend is one the other can already read.
+- ✅ `gui/src-tauri` commands: `auth_status`/`list_browsers`/`sign_in`, `get_playlists`/
+  `get_songs`, `play`/`play_pause`/`next`/`prev`/`seek`/`seek_to`/`set_volume`/`toggle_mute`/
+  `cycle_mode`/`append_to_queue`/`remove_from_queue`/`jump_to`, `search`/`add_to_playlist`/
+  `like_track`/`play_search_result`, `get_lyrics`.
+- ✅ Auto-reauth on empty playlists — an expired session answers `get_library_playlists` with an
+  empty list rather than an auth error, so `bootstrap()` mirrors the TUI's own once-per-start
+  heuristic (`session::configured_browser`/`can_auto_reauth`) rather than showing an empty
+  library.
+- ✅ Frontend: React + TypeScript + Vite, Tailwind CSS v4, Radix UI (`react-slider`, for a
+  scrubber/volume slider whose thumb and fill can't drift apart the way a hand-styled native
+  `<input type="range">` did), `lucide-react` icons, `motion` (framer-motion) for transitions —
+  sign-in → sidebar (playlists, search) → track list with cover art → persistent player bar →
+  a dedicated Now Playing view (blurred/scaled cover background, synced lyrics) for a focused
+  one-song view, matching the TUI's own lyrics-mode intent.
+- ❌ Not in this pass, matching the TUI's own tiering below: radio/up-next, album drill-down,
+  history/albums tabs, crossfade, playback speed, offline download cache, lyric translation UI.
+- ❌ Packaging not solved yet: `flake.nix`'s devShell needs Linux's Tauri deps (webkit2gtk-4.1,
+  librsvg, …) added under `stdenv.isLinux`; `dist-workspace.toml` (cargo-dist) only builds the
+  TUI's shell/npm installers, not a Tauri `.app`/`.dmg`/`.msi`/`.AppImage`; libmpv bundling for a
+  packaged GUI build is unsolved on every platform (`ytm-core` links it rather than spawning it).
 
 ---
 
 ## Tier 1 — Core usability
 
-❌ **Search** (`s` key)
-- Open a search bar at the bottom; results populate the songs panel
-- `ytmusicapi::search()` is already available on the `YtMusic` client
-- Need a new `View::Search` variant in `App`; run search in a background thread to avoid blocking the TUI
+✅ **Search** (`s` key)
+- Songs and videos fetched as two filtered requests (`ytm-core/src/search.rs`), not
+  `ytmusicapi`'s own unfiltered search — see the "why" in CLAUDE.md's `search.rs` section
+- `↵` plays, `a` adds to a playlist (refetches it so the addition is playable this session),
+  `/` edits the query
+- Hits are filed into a synthetic `__search__` playlist so the queue/player/lyrics machinery
+  can address a search result exactly like any other track
 
 ❌ **Like / unlike current song** (`L` key)
 - `rate_song(video_id, "LIKE" | "INDIFFERENT")` is in the ytmusicapi crate
@@ -73,10 +118,13 @@ Legend: ✅ done  🔄 in progress  ❌ not started
 - `c` opens a modal to pick a different lrclib record; the choice persists in `lyrics.json`
 - Scrollable with `j`/`k`; cached per video_id so toggling never re-fetches
 
-❌ **Config file** (`~/.config/yt-music-tui/config.toml`)
-- The file is created but not read yet
-- Values to support: `default_volume`, `keybindings` (map), `browser` (chrome/firefox/brave), `auth_path`
-- Parse with `toml` crate on startup; merge over hardcoded defaults
+✅ **Config file** (`~/.config/yt-music-tui/config.toml`)
+- Read once at startup by `ytm-core/src/config.rs`; a syntax error falls back to defaults
+  whole, an unreadable individual field falls back to just that field, unknown keys are
+  logged by name — see CLAUDE.md's `config.rs` section for the full forgiving-parse design
+- Covers `lyrics.offset`/`ai-translation`/`ai-model`/`ai-key-env`/`translate-to`, `ui.covers`,
+  `auth.auto-reauth`/`cookie-browser` — no `keybindings` map or `default_volume` (volume is
+  persisted separately in `settings.json`, not `config.toml`)
 
 ❌ **Session expiry warning**
 - On startup, parse the `expires` fields in `browser.json` cookies
@@ -124,68 +172,11 @@ directly. Not worth wiring up `yup_oauth2` against — there is no token this
 flow can produce that the API will accept. Cookie auth stays the only real
 path; the plan below changes *how* the cookie is obtained, not what it is.
 
-❌ **Tauri frontend + webview login** (replaces yt-dlp cookie extraction, for
-GUI users)
-- Motivation: today's setup (`ytm-core/src/session.rs`) gets cookies by
-  reaching into an *existing* browser's cookie store via
-  `yt-dlp --cookies-from-browser` — which is where the current pain lives
-  (Chrome 127+'s App-Bound Encryption defeats yt-dlp outright, the browser
-  has to be closed first, and the manual cURL-paste fallback exists only
-  because the automatic path fails often enough to need one). A Tauri app
-  bundles its own webview (wry — WebView2 / WKWebView / WebKitGTK), so it can
-  render an actual Google login page in-process and read the session back out
-  of *that* — no external browser, no encrypted store to crack open, no "is
-  Chrome closed" prompt.
-- Architecture: `ytm-core` is already UI-agnostic (the engine `tui/` drives
-  today), so this is a fourth workspace member — a `gui/` (or `tauri-app/`)
-  crate depending on `ytm-core` the same way `tui/` does, not a rewrite of
-  anything under `ytm-core/`.
-- Auth flow:
-  1. Open a Tauri `WebviewWindow` at `music.youtube.com` (redirects to Google
-     login if signed out). The user logs in exactly as in a normal browser —
-     passkeys, 2FA, "select account" all just work, since it's a real engine.
-  2. Detect completion via a navigation hook (`on_navigation` /
-     `on_page_load`) firing for a `music.youtube.com/*` URL post-login, not a
-     fixed timer.
-  3. Read the session back out via the webview's cookie API (Tauri
-     `webview.cookies()`, wrapping the `cookie` crate) and filter to the
-     `youtube.com`/`google.com` cookies innertube needs — the same
-     `is_youtube_domain` filter `session.rs` already applies to yt-dlp's
-     Netscape-format output.
-  4. Add `Session::setup_with_webview_cookies(cookie_header: String)` to
-     `ytm-core` — a new *adapter* alongside `setup_with_browser` /
-     `setup_with_curl` that reuses `build_default_headers` and
-     `write_private` verbatim. `browser.json`'s shape doesn't change, so a
-     session started in the Tauri app is a session the TUI can already read,
-     and vice versa — no migration, no new file format.
-  5. Silent refresh: replace `refresh_cookies()`'s yt-dlp call, for GUI users
-     only, with the same webview pulled again (hidden/offscreen) before the
-     existing 6h `REFRESH_AFTER` window closes. TUI-only users keep the
-     yt-dlp path, since a terminal has no webview to reuse.
-- Suggested milestones:
-  1. Throwaway spike: bare Tauri window, log in, dump `webview.cookies()` to
-     stdout — confirms the cookie-read API actually returns `SAPISID` et al.
-     on this machine (WKWebView/macOS first) before anything is built on it.
-  2. `Session::setup_with_webview_cookies` in `ytm-core` (pure adapter, no
-     Tauri dependency inside `ytm-core` itself — the crate stays UI-agnostic).
-  3. Minimal `gui/` crate: a "Sign in" button driving the flow above, calling
-     into `ytm-core` on success. No player UI yet.
-  4. Background silent-refresh task using the same hidden-webview trick.
-  5. Decide the GUI's actual scope (full player replacing the TUI, runs
-     alongside it, or an auth-only helper that just produces `browser.json`
-     for the TUI to consume) — worth settling before building past the spike.
-- Open risks:
-  - The cookie-read API's maturity differs by platform backend (WebView2 /
-    WKWebView / WebKitGTK) — same caveat flagged for raw `wry` earlier, now
-    one layer down inside Tauri. Milestone 1 exists specifically to find this
-    out early.
-  - An embedded webview may draw extra Google anti-automation friction
-    (captcha, "this browser may not be secure") that a real Chrome/Firefox
-    profile doesn't — untested, could rule the approach out on one platform.
-  - "Login finished" is a heuristic (navigation reaching `music.youtube.com`),
-    and Google's login flow is multi-page (email → password → 2FA → "stay
-    signed in" interstitial) — needs to be robust against that sequence
-    rather than firing on the first navigation past the email screen.
+~~**Tauri frontend + webview login**~~ — the embedded-webview login this entry used to describe
+was tried and blocked outright by Google's own anti-phishing policy ("this browser or app may
+not be secure"), not a bug to route around. Superseded by `rookie`-based cookie reading, covering
+both frontends and both initial login and silent refresh — see the **Tauri GUI** section near the
+top of this file for what actually shipped.
 
 ---
 
@@ -195,4 +186,3 @@ GUI users)
 - macOS/Linux native notifications on track change (`notify-rust` crate)
 - Visualizer bar in the player area (requires PCM data from mpv's audio output)
 - Vim-style `gg`/`G` jump-to-top/bottom in any list
-- `?` opens a keybinding help overlay
