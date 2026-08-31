@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::library::Library;
 use crate::player::TrackRef;
-use crate::session::{lyrics_path, queue_path, settings_path, translations_path, write_private};
+use crate::session::{
+    history_path, lyrics_path, queue_path, settings_path, translations_path, write_private,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueueEntry {
@@ -213,6 +215,91 @@ pub fn save_translations(translations: &Translations) -> Result<()> {
 
 pub fn load_translations() -> Translations {
     std::fs::read_to_string(translations_path())
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+// ── recently played ──────────────────────────────────────────────────────────
+
+/// Tracks kept in `history.json`. Enough to fill a home page several screens
+/// deep; past this the oldest goes.
+const MAX_HISTORY_TRACKS: usize = 100;
+
+/// One track, as it was when it played.
+///
+/// The whole [`Track`] rather than a reference to one, because a `TrackRef` is
+/// a *position* and means nothing across a restart — and because a track played
+/// from search belongs to no playlist that will exist next time. Stored this
+/// way the row can be drawn with no library at all, and played by resolving the
+/// video id against whatever the library holds now.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayedTrack {
+    pub track: crate::library::Track,
+    /// Where it was played from, when that was a real playlist. `None` for a
+    /// search result, whose synthetic playlist does not outlive the session.
+    pub playlist_id: Option<String>,
+    /// Unix seconds. Ordering is by position in the list, which is kept
+    /// most-recent-first; this is for showing *when*, and for a reader of the
+    /// file.
+    pub played_at: u64,
+}
+
+/// What has been played lately, most recent first.
+///
+/// Written by the GUI's home page and read by nothing else so far, but it lives
+/// here with the other saved state rather than in `gui/`: the rules about
+/// atomic writes and private permissions belong to one place, and the TUI is
+/// free to grow the same page later without a second format to reconcile.
+///
+/// Tracks only. A `playlists` list lived here too and was dropped once the home
+/// page stopped showing one — the file keeps whatever an older build wrote,
+/// since serde ignores fields it no longer knows about.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct History {
+    #[serde(default)]
+    tracks: Vec<PlayedTrack>,
+}
+
+impl History {
+    #[must_use]
+    pub fn tracks(&self) -> &[PlayedTrack] {
+        &self.tracks
+    }
+
+    /// Records a track as just played, moving it to the front if it is already
+    /// known. Returns whether anything was recorded — a track with no video id
+    /// cannot be identified later and so is not kept.
+    ///
+    /// Replayed rather than duplicated: a song played three times in an evening
+    /// is one row, at the top, not three consecutive identical ones. That is
+    /// what makes a cap of [`MAX_HISTORY_TRACKS`] describe a hundred *songs*
+    /// rather than a hundred plays.
+    pub fn note_track(&mut self, track: crate::library::Track, playlist_id: Option<String>) -> bool {
+        let Some(video_id) = track.video_id.clone().filter(|v| !v.is_empty()) else {
+            return false;
+        };
+        self.tracks
+            .retain(|p| p.track.video_id.as_deref() != Some(video_id.as_str()));
+        self.tracks.insert(
+            0,
+            PlayedTrack {
+                track,
+                playlist_id,
+                played_at: now_secs(),
+            },
+        );
+        self.tracks.truncate(MAX_HISTORY_TRACKS);
+        true
+    }
+}
+
+pub fn save_history(history: &History) -> Result<()> {
+    write_private(&history_path(), &serde_json::to_string_pretty(history)?)
+}
+
+pub fn load_history() -> History {
+    std::fs::read_to_string(history_path())
         .ok()
         .and_then(|json| serde_json::from_str(&json).ok())
         .unwrap_or_default()
@@ -511,6 +598,79 @@ mod tests {
         assert_eq!(follow_position(Some(5), &[0, 1], 2), Some(1));
         assert_eq!(follow_position(Some(1), &[], 0), None);
         assert_eq!(follow_position(None, &[0], 1), None);
+    }
+
+    // ── recently played ──────────────────────────────────────────────────────
+
+    #[test]
+    fn the_most_recently_played_is_first() {
+        let mut history = History::default();
+        assert!(history.note_track(track("aaa"), Some("PL1".into())));
+        assert!(history.note_track(track("bbb"), Some("PL1".into())));
+        let ids: Vec<_> = history
+            .tracks()
+            .iter()
+            .map(|p| p.track.video_id.clone().unwrap())
+            .collect();
+        assert_eq!(ids, ["bbb", "aaa"]);
+    }
+
+    #[test]
+    fn replaying_a_song_moves_it_rather_than_repeating_it() {
+        // Otherwise an evening of one album on repeat fills the whole page
+        // with the same three rows, and the cap stops meaning "a hundred
+        // songs".
+        let mut history = History::default();
+        history.note_track(track("aaa"), None);
+        history.note_track(track("bbb"), None);
+        history.note_track(track("aaa"), None);
+        assert_eq!(history.tracks().len(), 2);
+        assert_eq!(history.tracks()[0].track.video_id.as_deref(), Some("aaa"));
+    }
+
+    #[test]
+    fn a_track_with_no_video_id_is_not_kept() {
+        // Nothing could play it back, and nothing could tell it from the next
+        // one like it.
+        let mut history = History::default();
+        assert!(!history.note_track(
+            Track {
+                video_id: None,
+                ..track("gone")
+            },
+            None
+        ));
+        assert!(history.tracks().is_empty());
+    }
+
+    #[test]
+    fn the_list_stops_growing_at_the_cap() {
+        let mut history = History::default();
+        for i in 0..MAX_HISTORY_TRACKS + 10 {
+            history.note_track(track(&format!("v{i}")), None);
+        }
+        assert_eq!(history.tracks().len(), MAX_HISTORY_TRACKS);
+        // The newest survived and the oldest went.
+        assert_eq!(
+            history.tracks()[0].track.video_id.as_deref(),
+            Some(format!("v{}", MAX_HISTORY_TRACKS + 9).as_str())
+        );
+        assert!(
+            history
+                .tracks()
+                .iter()
+                .all(|p| p.track.video_id.as_deref() != Some("v0"))
+        );
+    }
+
+    #[test]
+    fn a_history_survives_a_round_trip() {
+        let mut history = History::default();
+        history.note_track(track("aaa"), Some("PL1".into()));
+        let json = serde_json::to_string_pretty(&history).expect("serialised");
+        let back: History = serde_json::from_str(&json).expect("parsed");
+        assert_eq!(back.tracks()[0].track.video_id.as_deref(), Some("aaa"));
+        assert_eq!(back.tracks()[0].playlist_id.as_deref(), Some("PL1"));
     }
 
     // ── translations ─────────────────────────────────────────────────────────

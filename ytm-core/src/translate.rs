@@ -1,7 +1,8 @@
 //! Lyric translation. Two backends, chosen by [`Backend`].
 //!
-//! `lyrics.ai-translation = true` sends the whole song to Claude in one request
-//! — see [`llm`]. Everything else in this file is the free path, which is what
+//! `lyrics.ai-translation = true` sends the whole song to Anthropic or DeepSeek
+//! (whichever the configured key belongs to) in one request — see [`llm`].
+//! Everything else in this file is the free path, which is what
 //! runs by default and is described below; the AI path falls back to it on any
 //! failure, so the feature never disappears, only its quality changes.
 //!

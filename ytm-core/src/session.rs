@@ -2,13 +2,13 @@
 //!
 //! Auth is cookie-based, ytmusicapi "browser auth" style — a `browser.json`
 //! header/cookie file, no OAuth. First run (or an expired session) drives an
-//! interactive setup: either `yt-dlp --cookies-from-browser` extraction, or
-//! pasting a "Copy as cURL" export from browser DevTools.
+//! interactive setup: either reading cookies straight out of a browser's own
+//! profile via the `rookie` crate, or pasting a "Copy as cURL" export from
+//! browser DevTools.
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use inquire::{Select, Text};
@@ -128,6 +128,9 @@ pub fn lyrics_path() -> PathBuf {
 pub fn translations_path() -> PathBuf {
     app_config_dir().join("translations.json")
 }
+pub fn history_path() -> PathBuf {
+    app_config_dir().join("history.json")
+}
 pub fn config_toml_path() -> PathBuf {
     app_config_dir().join("config.toml")
 }
@@ -155,7 +158,7 @@ pub fn ensure_config_toml() -> Result<()> {
 
 // ── browser ──────────────────────────────────────────────────────────────────
 
-/// A browser yt-dlp can extract cookies from via `--cookies-from-browser`.
+/// A browser whose cookie store `rookie` knows how to read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Browser {
     Chrome,
@@ -195,9 +198,9 @@ impl Browser {
         }
     }
 
-    /// Lowercase form used both as the `--cookies-from-browser` argument and
-    /// as the on-disk format of the `.yt-tui-browser` marker file.
-    fn as_ytdlp_arg(self) -> &'static str {
+    /// Lowercase form used as the on-disk format of the `.yt-tui-browser`
+    /// marker file and `config.toml`'s `auth.cookie-browser` value.
+    fn as_config_str(self) -> &'static str {
         match self {
             Self::Chrome => "chrome",
             Self::Firefox => "firefox",
@@ -210,11 +213,12 @@ impl Browser {
         }
     }
 
-    /// Parses the lowercase form written by [`Browser::as_ytdlp_arg`] (case-insensitive).
+    /// Parses the lowercase form written by [`Browser::as_config_str`]
+    /// (case-insensitive).
     pub fn parse(s: &str) -> Option<Browser> {
         Self::ALL
             .into_iter()
-            .find(|b| b.as_ytdlp_arg().eq_ignore_ascii_case(s))
+            .find(|b| b.as_config_str().eq_ignore_ascii_case(s))
     }
 }
 
@@ -224,7 +228,7 @@ impl std::fmt::Display for Browser {
     }
 }
 
-/// The browser yt-dlp should read cookies from, if one is on record.
+/// The browser whose profile cookies should be read from, if one is on record.
 ///
 /// `config.toml` wins: it is the setting the user can see and change. The
 /// `.yt-tui-browser` marker file is the fallback, which is what sessions set up
@@ -247,9 +251,10 @@ pub fn configured_browser() -> Option<Browser> {
 
 /// Whether [`Session::reauth`] would renew silently — a browser on record and
 /// the setting left on. Asked *before* re-authenticating, by a caller deciding
-/// whether it can do so on its own: an automatic renewal is a yt-dlp run and a
-/// couple of lines on stderr, while the interactive fallback is a conversation,
-/// and only the first is something to start without being asked to.
+/// whether it can do so on its own: an automatic renewal is a re-read of that
+/// browser's own cookie store, while the interactive fallback is a
+/// conversation, and only the first is something to start without being
+/// asked to.
 pub fn can_auto_reauth() -> bool {
     configured_browser().is_some() && crate::config::Config::load().auth.auto_reauth
 }
@@ -258,7 +263,7 @@ pub fn can_auto_reauth() -> bool {
 /// the user was walked through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reauth {
-    /// Renewed with yt-dlp and no questions. The session is usable now.
+    /// Renewed from the browser on record and no questions. The session is usable now.
     Automatic,
     /// The user was taken through setup. The session is usable now too.
     Interactive,
@@ -297,43 +302,43 @@ impl Session {
         Ok(YTMusicClient::builder().with_browser_auth(auth).build()?)
     }
 
-    /// Runs the interactive (terminal) setup flow: choose Auto (yt-dlp
-    /// `--cookies-from-browser`) or Manual (paste a cURL command), then writes
-    /// `browser.json`. Blocks on stdin/stdout — call from a plain terminal
-    /// context, not from inside a raw-mode TUI screen.
+    /// Runs the interactive (terminal) setup flow: choose Auto (read cookies
+    /// straight out of a browser's own profile) or Manual (paste a cURL
+    /// command), then writes `browser.json`. Blocks on stdin/stdout — call
+    /// from a plain terminal context, not from inside a raw-mode TUI screen.
     ///
     /// For a non-interactive caller (no TTY — e.g. a daemon), use
     /// [`Session::setup_with_browser`] or [`Session::setup_with_curl`] instead.
     pub fn run_setup(&self) -> Result<()> {
         let options = vec![
-            "Auto   — extract cookies from browser via yt-dlp  (recommended)",
+            "Auto   — read cookies from a browser you're signed in to  (recommended)",
             "Manual — paste a cURL command from browser DevTools",
         ];
 
         let choice = Select::new("Authentication method:", options)
-            .with_help_message("yt-dlp reads cookies directly from your browser profile")
+            .with_help_message("reads cookies directly from your browser profile, no export needed")
             .prompt()?;
 
         std::fs::remove_file(browser_file_path()).ok();
 
         if choice.starts_with("Auto") {
-            self.setup_via_ytdlp()
+            self.setup_via_browser()
         } else {
             self.setup_via_headers()
         }
     }
 
     /// Headless equivalent of the "Auto" setup path: extracts cookies from
-    /// `browser` via yt-dlp and writes `browser.json` + the browser marker
+    /// `browser`'s own profile and writes `browser.json` + the browser marker
     /// file. No prompts — safe to call without a TTY.
     pub fn setup_with_browser(&self, browser: Browser) -> Result<()> {
-        let cookie_header = extract_cookies_via_ytdlp(browser)?;
+        let cookie_header = extract_cookies(browser)?;
         let headers = build_default_headers(cookie_header);
         write_private(&self.browser_json, &serde_json::to_string_pretty(&headers)?)?;
-        write_private(&browser_file_path(), browser.as_ytdlp_arg())?;
+        write_private(&browser_file_path(), browser.as_config_str())?;
         // Only once the extraction has actually worked — a browser that can't
         // produce cookies is not worth re-running silently forever.
-        crate::config::remember_cookie_browser(browser.as_ytdlp_arg());
+        crate::config::remember_cookie_browser(browser.as_config_str());
         Ok(())
     }
 
@@ -342,6 +347,7 @@ impl Session {
     pub fn setup_with_curl(&self, curl: &str) -> Result<()> {
         let headers = parse_curl(curl.trim())?;
         write_private(&self.browser_json, &serde_json::to_string_pretty(&headers)?)?;
+        std::fs::remove_file(browser_file_path()).ok();
         Ok(())
     }
 
@@ -354,7 +360,7 @@ impl Session {
         Ok(())
     }
 
-    /// Refreshes the `cookie` field in `browser.json` via yt-dlp.
+    /// Refreshes the `cookie` field in `browser.json` from the browser on record.
     /// No-op when setup was done with the manual cURL method, and skipped
     /// while cookies are still fresh (checked via `browser.json`'s mtime).
     pub fn refresh_cookies(&self) -> Result<()> {
@@ -362,43 +368,62 @@ impl Session {
             log::info!("[session] no browser on record — skipping cookie refresh (manual setup)");
             return Ok(());
         };
-
-        const REFRESH_AFTER: Duration = Duration::from_secs(6 * 3600);
-        if let Ok(meta) = std::fs::metadata(&self.browser_json)
-            && let Ok(modified) = meta.modified()
-            && let Ok(age) = modified.elapsed()
-            && age < REFRESH_AFTER
-        {
-            log::info!(
-                "[session] cookies {}m old — skipping refresh",
-                age.as_secs() / 60
-            );
+        if !self.cookies_stale() {
             return Ok(());
         }
 
-        log::info!("[session] refreshing cookies from {browser} via yt-dlp");
-        let cookie_header = extract_cookies_via_ytdlp(browser)?;
-
-        let json_str = std::fs::read_to_string(&self.browser_json)?;
-        let mut json: serde_json::Value = serde_json::from_str(&json_str)?;
-        json["cookie"] = serde_json::Value::String(cookie_header);
-        write_private(&self.browser_json, &serde_json::to_string_pretty(&json)?)?;
+        log::info!("[session] refreshing cookies from {browser}");
+        let cookie_header = extract_cookies(browser)?;
+        self.apply_refreshed_cookie(&cookie_header)?;
         log::info!("[session] cookies refreshed");
         Ok(())
     }
 
+    /// How old `browser.json` may get before a refresh is worth running.
+    const REFRESH_AFTER: Duration = Duration::from_secs(6 * 3600);
+
+    /// Whether the cached cookie is old enough to bother refreshing.
+    fn cookies_stale(&self) -> bool {
+        let Ok(meta) = std::fs::metadata(&self.browser_json) else {
+            return true;
+        };
+        let Ok(modified) = meta.modified() else {
+            return true;
+        };
+        let Ok(age) = modified.elapsed() else {
+            return true;
+        };
+        if age < Self::REFRESH_AFTER {
+            log::info!(
+                "[session] cookies {}m old — skipping refresh",
+                age.as_secs() / 60
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Writes a freshly-obtained cookie header into `browser.json`'s `cookie` field.
+    fn apply_refreshed_cookie(&self, cookie_header: &str) -> Result<()> {
+        let json_str = std::fs::read_to_string(&self.browser_json)?;
+        let mut json: serde_json::Value = serde_json::from_str(&json_str)?;
+        json["cookie"] = serde_json::Value::String(cookie_header.to_string());
+        write_private(&self.browser_json, &serde_json::to_string_pretty(&json)?)?;
+        Ok(())
+    }
+
     /// Renews the session: silently from the browser on record where
-    /// [`can_auto_reauth`] says so, otherwise by dropping the current session
-    /// (`browser.json` + the browser marker file) and re-running interactive
-    /// setup. Either way it returns with a usable session or an error, so the
-    /// caller can carry straight on.
+    /// [`can_auto_reauth`] says so, otherwise by [`clear`](Session::clear)ing
+    /// the current session and re-running interactive setup. Either way it
+    /// returns with a usable session or an error, so the caller can carry
+    /// straight on.
     pub fn reauth(&self) -> Result<Reauth> {
         // A session almost always expires for the dull reason — the cookies
-        // rotated — and the fix is the same yt-dlp run that set it up. Asking
-        // which method to use, then which browser, to arrive back where we
-        // started is a conversation with no content.
+        // rotated — and the fix is the same browser read that set it up.
+        // Asking which method to use, then which browser, to arrive back
+        // where we started is a conversation with no content.
         if let Some(browser) = configured_browser().filter(|_| can_auto_reauth()) {
-            eprintln!("\nSession expired — renewing from {browser} via yt-dlp…");
+            eprintln!("\nSession expired — renewing from {browser}…");
             match self.setup_with_browser(browser) {
                 Ok(()) => {
                     log::info!("[session] renewed automatically from {browser}");
@@ -422,7 +447,7 @@ impl Session {
 
     // ── interactive setup methods ───────────────────────────────────────────
 
-    fn setup_via_ytdlp(&self) -> Result<()> {
+    fn setup_via_browser(&self) -> Result<()> {
         let browser = Select::new(
             "Browser you are signed in to YouTube Music with:",
             Browser::ALL.to_vec(),
@@ -443,143 +468,74 @@ impl Session {
     }
 }
 
-// ── RAII helpers ──────────────────────────────────────────────────────────────
+// ── browser cookie extraction ───────────────────────────────────────────────
 
-struct FileGuard(String);
-impl Drop for FileGuard {
-    fn drop(&mut self) {
-        std::fs::remove_file(&self.0).ok();
-    }
-}
-
-// ── yt-dlp cookie extraction ──────────────────────────────────────────────────
-
+/// Reads YouTube's cookies straight out of `browser`'s own on-disk profile —
+/// no subprocess, no yt-dlp. `rookie` speaks each browser's cookie-store
+/// format (and, per its own docs, Chrome's App-Bound Encryption) directly.
 #[hotpath::measure]
-fn extract_cookies_via_ytdlp(browser: Browser) -> Result<String> {
-    // Not the system temp directory. yt-dlp writes every youtube.com cookie
-    // into this file, and on a shared machine `/tmp/yt-tui-cookies-<pid>.txt`
-    // is both guessable and creatable by anyone: whoever gets there first owns
-    // the path, and so either reads the session out of it or chooses where
-    // yt-dlp's write lands. The config directory is this user's alone —
-    // `ensure_config_dir` restricts it — so nobody else can even look.
-    let dir = ensure_config_dir()?;
-    let tmp = dir
-        .join(format!(".cookies-{}.txt", std::process::id()))
-        .to_string_lossy()
-        .into_owned();
-    let _guard = FileGuard(tmp.clone());
+fn extract_cookies(browser: Browser) -> Result<String> {
+    let domains = Some(vec!["youtube.com".to_string()]);
 
-    // stderr is kept rather than discarded: when the cookie store can't be read
-    // at all, yt-dlp's own message is the only thing that says why, and every
-    // cause looks the same from here — a missing file.
-    let output = std::process::Command::new("yt-dlp")
-        .args([
-            "--cookies-from-browser",
-            browser.as_ytdlp_arg(),
-            "--cookies",
-            &tmp,
-            "--skip-download",
-            "https://music.youtube.com/",
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        // output() waits, so no zombie is left behind. yt-dlp exits non-zero for
-        // this URL but still writes the cookie file, so the status is not worth
-        // checking — whether the file is there is the real answer.
-        .output()
-        .map_err(|_| Error::YtDlpNotInstalled)?;
-
-    let content = std::fs::read_to_string(&tmp).map_err(|_| {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        log::warn!(
-            "[session] yt-dlp wrote no cookie file for {browser}: {}",
-            stderr.trim()
-        );
-        Error::BrowserNotSignedIn {
-            browser,
-            diagnosis: diagnose_ytdlp_stderr(browser, &stderr),
+    let cookies = match browser {
+        Browser::Chrome => rookie::chrome(domains),
+        Browser::Firefox => rookie::firefox(domains),
+        Browser::Edge => rookie::edge(domains),
+        Browser::Brave => rookie::brave(domains),
+        Browser::Opera => rookie::opera(domains),
+        Browser::Chromium => rookie::chromium(domains),
+        Browser::Vivaldi => rookie::vivaldi(domains),
+        #[cfg(target_os = "macos")]
+        Browser::Safari => rookie::safari(domains),
+        #[cfg(not(target_os = "macos"))]
+        Browser::Safari => {
+            return Err(Error::BrowserNotSignedIn {
+                browser,
+                diagnosis: "Safari cookies can only be read on macOS".to_string(),
+            });
         }
+    }
+    .map_err(|e| Error::BrowserNotSignedIn {
+        browser,
+        // rookie's own error chain already carries the actionable part (e.g.
+        // Safari's Full Disk Access instructions) — passed through verbatim
+        // rather than re-guessed, since it's the only evidence available.
+        diagnosis: format!("{e:?}"),
     })?;
 
-    let header = parse_netscape_cookies(&content);
+    let header = cookies_to_header(&cookies);
     if header.is_empty() {
         return Err(Error::NoCookiesFound { browser });
     }
     Ok(header)
 }
 
-/// Turns yt-dlp's stderr into something actionable, appended to
-/// [`Error::BrowserNotSignedIn`].
-///
-/// Both messages recognised here mean the cookie store could not be read *at
-/// all*, which has nothing to do with being signed in — so without the hint the
-/// error sends the user off to check the one thing that isn't wrong. Anything
-/// else yt-dlp said is passed through verbatim, since it is still the only
-/// evidence available; the tail is what carries the actual error, so a long
-/// traceback is cut from the front rather than the back.
-fn diagnose_ytdlp_stderr(browser: Browser, stderr: &str) -> String {
-    const MAX_LINES: usize = 8;
-
-    let hint = if stderr.contains("Failed to decrypt with DPAPI") {
-        "\n\nChrome 127+ encrypts its cookie store with App-Bound Encryption, which yt-dlp \
-         cannot decrypt. Try one of:\
-         \n  • yt-dlp -U  — newer releases handle more of these\
-         \n  • re-run setup and pick Firefox or Edge instead\
-         \n  • re-run setup and pick Manual (paste a cURL from DevTools)"
-            .to_string()
-    } else if stderr.contains("Could not copy") {
-        format!(
-            "\n\nClose every {browser} window first — {browser} locks its cookie database while \
-             it is running."
-        )
-    } else {
-        String::new()
-    };
-
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        return hint;
-    }
-
-    let lines: Vec<&str> = stderr.lines().collect();
-    let tail = lines[lines.len().saturating_sub(MAX_LINES)..].join("\n");
-    format!("{hint}\n\nyt-dlp said:\n{tail}")
-}
-
 /// Whether a cookie's domain is YouTube's, rather than merely ending in it.
 ///
 /// A plain `ends_with("youtube.com")` also accepts `notyoutube.com` — a domain
 /// anyone can register — and every cookie that passes this test is put in the
-/// header sent to Google. The leading dot is how a Netscape cookie file spells
-/// "and its subdomains".
+/// header sent to Google. The leading dot is how a browser spells "and its
+/// subdomains".
 fn is_youtube_domain(domain: &str) -> bool {
     let domain = domain.trim_start_matches('.');
     domain == "youtube.com" || domain.ends_with(".youtube.com")
 }
 
-fn parse_netscape_cookies(content: &str) -> String {
-    content
-        .lines()
-        .filter(|l| !l.starts_with('#') && !l.is_empty())
-        .filter_map(|l| {
-            let mut parts = l.splitn(7, '\t');
-            let domain = parts.next()?;
-            let _subdom = parts.next()?;
-            let _path = parts.next()?;
-            let _secure = parts.next()?;
-            let _expiry = parts.next()?;
-            let name = parts.next()?;
-            let value = parts.next()?;
-            // Skip per-tab session-token cookies (ST-*): browser profiles
-            // accumulate dozens of them and the resulting header blows past
-            // Google's request-size limit (HTTP 413). ytmusicapi does not
-            // need them.
-            if is_youtube_domain(domain) && !name.starts_with("ST-") {
-                Some(format!("{name}={value}"))
-            } else {
-                None
-            }
-        })
+/// Turns rookie's cookie list into the `name=value; ...` header ytmusicapi
+/// expects, filtered to YouTube's own domains.
+///
+/// rookie's own `domains` filter (passed above to narrow which rows it even
+/// reads) is `ends_with`-based and not trustworthy on its own — the same
+/// lookalike gap [`is_youtube_domain`] exists to close — so this is the one
+/// check that actually decides what reaches the header.
+fn cookies_to_header(cookies: &[rookie::enums::Cookie]) -> String {
+    cookies
+        .iter()
+        // Skip per-tab session-token cookies (ST-*): browser profiles
+        // accumulate dozens of them and the resulting header blows past
+        // Google's request-size limit (HTTP 413). ytmusicapi does not need them.
+        .filter(|c| is_youtube_domain(&c.domain) && !c.name.starts_with("ST-"))
+        .map(|c| format!("{}={}", c.name, c.value))
         .collect::<Vec<_>>()
         .join("; ")
 }
@@ -654,40 +610,17 @@ fn extract_single_quoted(text: &str, flag: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// What yt-dlp prints on Windows when Chrome's cookie store is App-Bound
-    /// encrypted, trimmed to the lines that matter.
-    const DPAPI: &str = "\
-WARNING: [Cookies] Failed to decrypt with DPAPI. See  https://github.com/yt-dlp/yt-dlp/issues/7271
-ERROR: Unable to extract cookies from browser";
-
-    #[test]
-    fn app_bound_encryption_says_what_to_do_instead() {
-        let out = diagnose_ytdlp_stderr(Browser::Chrome, DPAPI);
-        assert!(out.contains("App-Bound Encryption"));
-        assert!(out.contains("Firefox or Edge"));
-        // The evidence is kept alongside the hint, not replaced by it.
-        assert!(out.contains("Failed to decrypt with DPAPI"));
-    }
-
-    #[test]
-    fn a_locked_cookie_database_names_the_browser_to_close() {
-        let out = diagnose_ytdlp_stderr(
-            Browser::Brave,
-            "ERROR: Could not copy Brave cookie database",
-        );
-        assert!(out.contains("Close every Brave window"));
-    }
-
-    #[test]
-    fn an_unrecognised_failure_still_passes_the_evidence_through() {
-        let out = diagnose_ytdlp_stderr(Browser::Firefox, "ERROR: something else entirely");
-        assert!(out.contains("yt-dlp said:"));
-        assert!(out.contains("something else entirely"));
-    }
-
-    #[test]
-    fn silence_from_yt_dlp_adds_nothing() {
-        assert_eq!(diagnose_ytdlp_stderr(Browser::Chrome, "   \n\n"), "");
+    fn cookie(name: &str, value: &str, domain: &str) -> rookie::enums::Cookie {
+        rookie::enums::Cookie {
+            domain: domain.to_string(),
+            path: "/".to_string(),
+            secure: true,
+            expires: None,
+            name: name.to_string(),
+            value: value.to_string(),
+            http_only: true,
+            same_site: 0,
+        }
     }
 
     #[test]
@@ -706,14 +639,35 @@ ERROR: Unable to extract cookies from browser";
 
     #[test]
     fn a_lookalike_domains_cookies_never_reach_the_header() {
-        let jar = "\
-# Netscape HTTP Cookie File
-.youtube.com\tTRUE\t/\tTRUE\t0\tSAPISID\treal
-notyoutube.com\tTRUE\t/\tTRUE\t0\tSTOLEN\tnope
-.youtube.com\tTRUE\t/\tTRUE\t0\tST-tab1\tdropped
-";
-        let header = parse_netscape_cookies(jar);
-        assert_eq!(header, "SAPISID=real");
+        let cookies = [
+            cookie("SAPISID", "real", ".youtube.com"),
+            cookie("STOLEN", "nope", "notyoutube.com"),
+            cookie("ST-tab1", "dropped", ".youtube.com"),
+        ];
+        assert_eq!(cookies_to_header(&cookies), "SAPISID=real");
+    }
+
+    #[test]
+    fn multiple_cookies_join_in_order() {
+        let cookies = [
+            cookie("SAPISID", "a", ".youtube.com"),
+            cookie("HSID", "b", ".youtube.com"),
+        ];
+        assert_eq!(cookies_to_header(&cookies), "SAPISID=a; HSID=b");
+    }
+
+    #[test]
+    fn no_matching_cookies_is_an_empty_header() {
+        let cookies = [cookie("SOMETHING", "else", "example.com")];
+        assert_eq!(cookies_to_header(&cookies), "");
+    }
+
+    #[test]
+    #[ignore = "reads this machine's real Chrome cookies"]
+    fn chrome_cookies_can_actually_be_read() {
+        let header = extract_cookies(Browser::Chrome).expect("read chrome cookies");
+        assert!(!header.is_empty());
+        assert!(header.contains("SAPISID") || header.contains("HSID"));
     }
 
     #[test]
@@ -744,18 +698,5 @@ notyoutube.com\tTRUE\t/\tTRUE\t0\tSTOLEN\tnope
         }
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn a_long_traceback_is_cut_from_the_front() {
-        let stderr = (1..=20)
-            .map(|i| format!("line {i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let out = diagnose_ytdlp_stderr(Browser::Chrome, &stderr);
-        // The tail carries the actual error, so that is the end kept.
-        assert!(out.contains("line 20"));
-        assert!(out.contains("line 13"));
-        assert!(!out.contains("line 12"));
     }
 }

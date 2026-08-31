@@ -158,8 +158,10 @@ fn strip_bracketed(title: &str, keywords: &[&str]) -> String {
     let mut out = String::with_capacity(title.len());
     let mut rest = title;
 
-    while let Some(open) = rest.find(['(', '[', '【', '「', '『']) {
-        let open_char = rest[open..].chars().next().unwrap();
+    while let Some((open, open_char)) = rest
+        .char_indices()
+        .find(|&(_, c)| matches!(c, '(' | '[' | '【' | '「' | '『'))
+    {
         let close_char = match open_char {
             '(' => ')',
             '[' => ']',
@@ -621,8 +623,13 @@ fn merge_rung(
     next
 }
 
-/// Orders candidates best-first: synced before plain, then closest duration,
-/// then artist/title agreement, then LRCLIB's own relevance order.
+/// Orders candidates best-first: synced before plain, then whether the record
+/// even credits this artist, then whether it looks like a fragment rather than
+/// the full song, then closest duration, then title agreement, then LRCLIB's
+/// own relevance order. Artist and fragment checks rank above duration
+/// deliberately — a record for a *different* song of the same name can match
+/// the duration exactly (see the inline comments below for the regressions
+/// that caused this ordering).
 ///
 /// Records more than [`MAX_DURATION_DELTA`] from a known duration are dropped
 /// outright — at that distance they are a different song, and offering the
@@ -1240,6 +1247,54 @@ mod tests {
         }
     }
 
+    // ── LyricsQuery::from_track ──────────────────────────────────────────
+
+    fn track(title: Option<&str>) -> Track {
+        Track {
+            video_id: Some("abc".into()),
+            title: title.map(str::to_string),
+            artists: vec![
+                ytmusicapi::Artist {
+                    name: "Crusher-P".into(),
+                    id: None,
+                },
+                ytmusicapi::Artist {
+                    name: "Someone Else".into(),
+                    id: None,
+                },
+            ],
+            album: Some(ytmusicapi::Album {
+                name: "Echo EP".into(),
+                id: None,
+            }),
+            duration: None,
+            duration_seconds: Some(245),
+            thumbnail: None,
+        }
+    }
+
+    #[test]
+    fn from_track_carries_every_field_over() {
+        let q = LyricsQuery::from_track(&track(Some("Echo"))).unwrap();
+        assert_eq!(q.title, "Echo");
+        assert_eq!(q.artist, "Crusher-P, Someone Else");
+        assert_eq!(q.album, "Echo EP");
+        assert_eq!(q.duration, Some(245.0));
+    }
+
+    #[test]
+    fn from_track_defaults_the_album_when_there_is_none() {
+        let mut t = track(Some("Echo"));
+        t.album = None;
+        let q = LyricsQuery::from_track(&t).unwrap();
+        assert_eq!(q.album, "");
+    }
+
+    #[test]
+    fn from_track_is_none_without_a_title() {
+        assert!(LyricsQuery::from_track(&track(None)).is_none());
+    }
+
     // ── query normalisation ───────────────────────────────────────────────
 
     #[test]
@@ -1750,6 +1805,23 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_title_beats_a_decorated_one_at_the_same_rounded_duration() {
+        // "Rounded to the second so a 0.4s difference doesn't outweigh a
+        // title match" -- both these round to the same delta (0), so title
+        // is what has to decide it.
+        let decorated = TrackLyrics {
+            track_name: "Echo (Remix)".into(),
+            ..rec(1, 245.0, true)
+        };
+        let exact = TrackLyrics {
+            track_name: "Echo".into(),
+            ..rec(2, 245.4, true)
+        };
+        let out = rank(vec![decorated, exact], &q(Some(245.0)));
+        assert_eq!(ids(&out), [2, 1]);
+    }
+
+    #[test]
     fn artist_matching_does_not_fire_on_a_substring() {
         assert!(credits_artist("crusher-p", "crusher-p"));
         assert!(credits_artist(
@@ -1816,6 +1888,34 @@ mod tests {
             Some(245.0),
             typical_line_count(&items, Some(245.0))
         ));
+    }
+
+    #[test]
+    fn a_right_artist_stub_still_beats_a_complete_wrong_artist_record() {
+        // The "Ride It"/"Do Better" shape, but with the stub axis actually
+        // live (3+ peers, so `typical_line_count` is `Some`): if artist and
+        // stub were ever swapped in the sort key, the wrong-artist complete
+        // records would win the stub axis before artist gets a say.
+        let right_artist_stub = with_lines(1, 245.0, 5);
+        let wrong_artist = |id, n| TrackLyrics {
+            artist_name: "Somebody Else".into(),
+            ..with_lines(id, 245.0, n)
+        };
+        let out = rank(
+            vec![
+                right_artist_stub,
+                wrong_artist(2, 40),
+                wrong_artist(3, 41),
+                wrong_artist(4, 42),
+            ],
+            &q(Some(245.0)),
+        );
+        assert_eq!(
+            out[0].id,
+            1,
+            "the right artist's fragment should still lead: {:?}",
+            ids(&out)
+        );
     }
 
     #[test]

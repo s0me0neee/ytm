@@ -59,6 +59,45 @@ fn largest_thumbnail(thumbnails: &[ytmusicapi::Thumbnail]) -> Option<String> {
         .map(|t| t.url.clone())
 }
 
+/// Where each of `before`'s tracks ended up in `now`, matched by video id, or
+/// `None` when every one of them is exactly where it was.
+///
+/// The `None` is the common answer and the reason this is worth a function: a
+/// track added to an ordinary playlist is *appended*, so a refetch moves
+/// nothing and there is no reason to rebuild a queue. Adding to Liked Music
+/// puts it at the top, and then everything has moved. A track that has left the
+/// playlist gets `Some(None)` — its own entry, saying it is gone.
+///
+/// Lives here rather than in a frontend because it is the other half of
+/// [`Player::remap_refs`](crate::Player::remap_refs): a `TrackRef` is a
+/// position, so every frontend that refetches a playlist needs exactly this
+/// answer to keep its queue meaning the same songs.
+#[must_use]
+pub fn moved_indices(before: &[Option<String>], now: &[Track]) -> Option<Vec<Option<usize>>> {
+    let places: std::collections::HashMap<&str, usize> = now
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| Some((t.video_id.as_deref()?, i)))
+        .collect();
+    let moved: Vec<Option<usize>> = before
+        .iter()
+        .enumerate()
+        .map(|(i, id)| match id.as_deref() {
+            Some(id) => places.get(id).copied(),
+            // A track with no video id is unplayable and unmatchable, so it is
+            // left exactly where it was rather than counted as having moved —
+            // otherwise one such track means every refetch of that playlist
+            // reads as a reorder and drops it out of the queue.
+            None => Some(i),
+        })
+        .collect();
+    moved
+        .iter()
+        .enumerate()
+        .any(|(i, m)| *m != Some(i))
+        .then_some(moved)
+}
+
 // ── fetching ─────────────────────────────────────────────────────────────────
 
 #[hotpath::measure]
@@ -195,7 +234,7 @@ pub struct PlaylistEntry {
 }
 
 /// Playlists and their tracks, filled in progressively as background
-/// fetches (see [`spawn_library_fetch`]) complete.
+/// fetches (see [`LibraryFetcher::fetch`]) complete.
 #[derive(Debug, Clone, Default)]
 pub struct Library {
     entries: Vec<PlaylistEntry>,
@@ -509,5 +548,57 @@ mod tests {
         lib.apply_song_batch(9, Some(vec![track("aaa")]));
         lib.apply_song_batch(9, None);
         assert_eq!(lib.len(), 1);
+    }
+
+    #[test]
+    fn clearing_the_search_playlist_empties_it_without_removing_it() {
+        let mut lib = library();
+        let (pl, _) = lib.place_search_result(track("zzz"));
+        lib.place_search_result(track("yyy"));
+        assert_eq!(lib.songs(pl).len(), 2);
+
+        lib.clear_search_playlist();
+
+        // The entry survives at the same index -- a TrackRef elsewhere in the
+        // app is a position, and removing the playlist would renumber it.
+        assert_eq!(lib.len(), 2);
+        assert!(lib.is_search_playlist(pl));
+        assert!(lib.songs(pl).is_empty());
+        assert_eq!(lib.total_duration_secs(pl), 0);
+    }
+
+    #[test]
+    fn clearing_the_search_playlist_before_it_exists_is_a_no_op() {
+        let mut lib = library();
+        lib.clear_search_playlist();
+        assert_eq!(lib.len(), 1);
+    }
+
+    #[test]
+    fn find_song_index_matches_by_video_id_within_the_right_playlist() {
+        let mut lib = library();
+        lib.apply_song_batch(0, Some(vec![track("aaa"), track("bbb")]));
+
+        assert_eq!(lib.find_song_index(0, "bbb"), Some(1));
+        assert_eq!(lib.find_song_index(0, "missing"), None);
+        assert_eq!(
+            lib.find_song_index(9, "aaa"),
+            None,
+            "a playlist index out of range must not panic"
+        );
+    }
+
+    #[test]
+    #[ignore = "hits the real API with this machine's real session"]
+    fn real_session_actually_lists_playlists() {
+        let session = crate::Session::new().expect("session");
+        let yt = session.build_client().expect("build client");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let playlists = rt.block_on(get_playlists(&yt)).expect("get_playlists");
+        eprintln!("got {} playlists", playlists.len());
+        assert!(!playlists.is_empty(), "expected at least one real playlist");
     }
 }

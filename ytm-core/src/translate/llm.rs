@@ -121,6 +121,15 @@ impl Provider {
 const TOKENS_PER_LINE: usize = 200;
 const MIN_TOKENS: usize = 8192;
 
+/// `max_tokens` for a song of `line_count` distinct lines. DeepSeek's own
+/// ceiling equals [`MIN_TOKENS`], so every DeepSeek request asks for exactly
+/// that regardless of song length — there is no ceiling left to scale into,
+/// not a bug in the clamp. Anthropic's higher ceiling is what actually grows
+/// with `line_count`.
+fn max_tokens_for(line_count: usize, provider: Provider) -> usize {
+    (line_count * TOKENS_PER_LINE).clamp(MIN_TOKENS, provider.token_ceiling())
+}
+
 /// One request for a whole song, answered twice over.
 const TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -321,7 +330,7 @@ pub async fn translate(lines: &[String], to: &str, ai: &Ai) -> Result<Vec<String
         .replace("{last}", &(order.len() - 1).to_string())
         .replace("{numbered}", &numbered);
 
-    let max_tokens = (order.len() * TOKENS_PER_LINE).clamp(MIN_TOKENS, ai.provider.token_ceiling());
+    let max_tokens = max_tokens_for(order.len(), ai.provider);
 
     // Thinking is off because on a model that does it by default it comes out
     // of `max_tokens` — `deepseek-v4-flash` spent all 8192 of them reasoning,
@@ -550,6 +559,30 @@ mod tests {
         let lines = song(&["one", "", "one", "", "two"]);
         let (_, seen) = distinct(&lines);
         assert_eq!(numbered(&lines, &seen), "0\tone\n\n1\ttwo");
+    }
+
+    #[test]
+    fn a_short_song_still_gets_the_token_floor() {
+        assert_eq!(max_tokens_for(3, Provider::Anthropic), MIN_TOKENS);
+        assert_eq!(max_tokens_for(3, Provider::DeepSeek), MIN_TOKENS);
+    }
+
+    #[test]
+    fn anthropic_scales_up_for_a_long_song() {
+        // 200 distinct lines * 200 tokens/line = 40000, past Anthropic's
+        // ceiling, so this also proves the ceiling side of the clamp.
+        assert_eq!(max_tokens_for(200, Provider::Anthropic), 32000);
+        // Under the ceiling: the floor doesn't clip it.
+        assert_eq!(max_tokens_for(60, Provider::Anthropic), 60 * TOKENS_PER_LINE);
+    }
+
+    #[test]
+    fn deepseek_is_pinned_at_its_ceiling_regardless_of_song_length() {
+        // DeepSeek's own ceiling equals MIN_TOKENS, so there is no room
+        // between the floor and the ceiling to scale into -- every request,
+        // short song or long, asks for exactly 8192.
+        assert_eq!(max_tokens_for(1, Provider::DeepSeek), MIN_TOKENS);
+        assert_eq!(max_tokens_for(500, Provider::DeepSeek), MIN_TOKENS);
     }
 
     #[test]
