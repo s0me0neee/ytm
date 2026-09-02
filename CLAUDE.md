@@ -923,10 +923,19 @@ and pin.
 the `reqwest` version note above.
 
 **Workspace clippy lints** (`[workspace.lints.clippy]`, `clippy.toml`) went in ahead of a
-planned split into separate `ytm-core`/`ytm-tui`/`lrclib` repos, so each starts life already
-held to the bar: `nursery`/`pedantic` denied wholesale, plus `unwrap_used`, `expect_used`,
-`panic`, `indexing_slicing`, `arithmetic_side_effects` and others individually.
-`clippy.toml` allows those back in test code only. `flake.nix` is the matching dev shell —
+planned split into separate `ytm-core`/`ytm-tui`/`lrclib` repos, so each would start life
+already held to the bar: `nursery`/`pedantic` denied wholesale, plus `unwrap_used`,
+`expect_used`, `panic`, `indexing_slicing`, `arithmetic_side_effects` and others
+individually. `clippy.toml` allows those back in test code only.
+
+None of the three actually was, for a while. A member inherits that table only by saying
+`[lints] workspace = true`, and only `gui/src-tauri` ever did — so a `#[deny]`-level
+`indexing_slicing` sat next to `self.queue[pos]` in `player.rs` while a clean
+`cargo clippy --workspace` reported it. Opting the three in surfaced ~650 findings, and
+underneath them a clippy ICE (`large_futures`, on this workspace's async fns) that had been
+aborting the run and hiding the rest. What could hide a panic is fixed; the remainder is a
+counted `#![allow]` list at the top of each crate, which is a backlog rather than a
+dismissal — everything not named there is denied, so the gate is real for new code. `flake.nix` is the matching dev shell —
 `mpv-unwrapped` (the wrapped `mpv` package's runtime wrapper is no use to a build), yt-dlp,
 ffmpeg, and per-OS libs for what `media/mpris.rs` (Linux) and `media/nowplaying.rs`
 (Darwin) each need.

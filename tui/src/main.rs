@@ -1,7 +1,8 @@
-/* The workspace's clippy table reaches this crate for the first time — a
-   member only inherits `[workspace.lints]` by saying `[lints] workspace =
-   true`, and only `gui/src-tauri` ever did, so the three crates the table was
-   written for were held to nothing. See the longer note in `ytm-core`'s
+/* Held to the same `deny`-level list as `ytm-core`, and likewise never
+   actually passing it: in the monorepo the table was `[workspace.lints]`,
+   which a member only inherits by saying `[lints] workspace = true`, and only
+   `gui/src-tauri` ever did; in the standalone split it is inline and has been
+   failing since that repo was created. See the longer note in `ytm-core`'s
    `lib.rs`.
 
    158 findings here, listed rather than quietly dropped: each line is a
