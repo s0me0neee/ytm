@@ -753,6 +753,21 @@ artwork rather than the artwork. `maxHeight` on the same box keeps a square cove
 the transport off a short window, and because a ratio is set, clamping the height narrows the
 width to match rather than distorting it.
 
+The window's own title bar is hidden on the two platforms that have been looked at, and
+each gets there differently. macOS keeps its decorations and hides the bar with
+`titleBarStyle: "Overlay"`, which is what leaves the traffic lights floating over the
+app's own header (`IS_MAC` and `TRAFFIC_LIGHT_SPAN` in `App.tsx` are the space reserved
+for them). Linux has no equivalent — GTK either draws a title bar or it doesn't — so
+`tauri.linux.conf.json` sets `decorations: false`, and the header carrying
+`data-tauri-drag-region` becomes the only way to move the window. Resizing still works:
+tao hit-tests a 5px border on an undecorated GTK window and starts the drag itself. What
+is gone with the bar is the close/minimise/maximise buttons, since nothing in the app
+draws its own. Windows is untouched and still has the system bar. `decorations: false`
+cannot go in `tauri.conf.json` alongside the macOS keys, because on macOS it means a
+*borderless* window with no traffic lights either — and platform configs are merged as
+RFC 7396, which replaces the whole `app.windows` array rather than merging into it, so
+the Linux file has to repeat the window's size and title. Keep the two in step.
+
 **`App.css` beats Tailwind, and that is a trap.** The file opens with `@import "tailwindcss"`,
 so every class it declares afterwards is *later in source order* than the utilities — and
 against a utility they are the same specificity, one class each. So a property set in
