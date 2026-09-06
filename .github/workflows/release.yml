@@ -127,6 +127,46 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Fetch libmpv (Windows)"
+        if: "runner.os == 'Windows'"
+        run: |
+          $url = 'https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260903/mpv-dev-x86_64-20260903-git-69e63f425a.7z'
+          $dir = Join-Path $env:RUNNER_TEMP 'libmpv'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          curl.exe --fail --location --silent --show-error --output "$dir\mpv-dev.7z" $url
+          7z x "$dir\mpv-dev.7z" "-o$dir" -y | Out-Null
+          "LIBMPV_DIR=$dir" >> $env:GITHUB_ENV
+          $dir >> $env:GITHUB_PATH
+        shell: "pwsh"
+      - name: "Set up MSVC (Windows)"
+        uses: "ilammy/msvc-dev-cmd@v1"
+        if: "runner.os == 'Windows'"
+      - name: "Build an MSVC import library for libmpv (Windows)"
+        if: "runner.os == 'Windows'"
+        run: |
+          $dir = $env:LIBMPV_DIR
+          $exports = dumpbin /exports "$dir\libmpv-2.dll"
+          $names = $exports |
+            Select-String -Pattern '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value }
+          if ($names.Count -eq 0) { throw "no exports found in libmpv-2.dll" }
+          @('EXPORTS') + $names | Set-Content -Encoding ascii "$dir\mpv.def"
+          lib /def:"$dir\mpv.def" /name:libmpv-2.dll /out:"$dir\mpv.lib" /machine:x64
+          Write-Host "generated mpv.lib from $($names.Count) exports"
+        shell: "pwsh"
+      - name: "Set up pnpm"
+        uses: "pnpm/action-setup@v4"
+        with:
+          "version": 11
+      - name: "Set up Node"
+        uses: "actions/setup-node@v4"
+        with:
+          "node-version": 22
+      - name: "Build the GUI frontend"
+        run: |
+          cd gui
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm build
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

@@ -15,3 +15,36 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+
+# Extra CI steps, spliced into the build job ahead of `dist build`. Two things
+# have to happen there that no package manager can do:
+#
+#   * the GUI's frontend has to be *built*, because `frontendDist` is what
+#     `tauri::generate_context!()` embeds at compile time. `beforeBuildCommand`
+#     in `tauri.conf.json` is run by the tauri CLI, and dist builds with plain
+#     cargo — so without this step `ytm-gui` compiles against an empty `dist/`.
+#   * Windows has no libmpv to install. See `.github/build-setup.yml`.
+#
+# It lives beside the workflows rather than in them: anything under
+# `.github/workflows/` is parsed by GitHub as a workflow of its own, and a bare
+# list of steps is not one — it would show up in the Actions tab as an invalid
+# workflow file forever.
+github-build-setup = "../build-setup.yml"
+
+# libmpv is linked, so the *library* has to be present on every builder, and
+# the GUI adds WebKitGTK on top of it — `ytm-gui` is Tauri, whose Linux backend
+# is webkit2gtk-4.1 (the 4.0 in jammy's base is Tauri 1's and will not do).
+# Windows takes neither of these; it is handled in `build-setup.yml`.
+[dist.dependencies.apt]
+libmpv-dev = '*'
+libwebkit2gtk-4.1-dev = '*'
+libgtk-3-dev = '*'
+libayatana-appindicator3-dev = '*'
+librsvg2-dev = '*'
+libxdo-dev = '*'
+libssl-dev = '*'
+build-essential = '*'
+file = '*'
+
+[dist.dependencies.homebrew]
+mpv = '*'

@@ -1,0 +1,76 @@
+# Spliced into `release.yml`'s build job by dist (`github-build-setup` in
+# `dist-workspace.toml`). Not a workflow — a bare list of steps, which is why it
+# sits here rather than under `workflows/`, where GitHub would try to parse it
+# as one.
+#
+# Everything the release build needs that neither apt nor Homebrew can provide.
+
+# ---------------------------------------------------------------- libmpv, Windows
+#
+# There is no pkg-config on Windows and the mpv *player* builds ship no import
+# library, so libmpv comes from the separate mpv-dev package — the same one
+# CLAUDE.md tells a human to unpack and point `LIBMPV_DIR` at. Pinned to a dated
+# build rather than "latest": a release should be reproducible, and the tag is
+# the only thing that says which libmpv a binary was linked against.
+#
+# The non-`v3` archive deliberately. `-v3` is built for the x86-64-v3
+# microarchitecture (AVX2 and friends) and would fault on anything older, which
+# is not a thing to discover from a shipped binary.
+- name: Fetch libmpv (Windows)
+  if: runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $url = 'https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260903/mpv-dev-x86_64-20260903-git-69e63f425a.7z'
+    $dir = Join-Path $env:RUNNER_TEMP 'libmpv'
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    curl.exe --fail --location --silent --show-error --output "$dir\mpv-dev.7z" $url
+    7z x "$dir\mpv-dev.7z" "-o$dir" -y | Out-Null
+    "LIBMPV_DIR=$dir" >> $env:GITHUB_ENV
+    $dir >> $env:GITHUB_PATH
+
+# MSVC's linker cannot read the GNU import library (`libmpv.dll.a`) that is the
+# only one in that archive, and `rustc-link-lib=mpv` makes it ask for `mpv.lib`.
+# So build one from the DLL's own export table — the standard `dumpbin` → `.def`
+# → `lib` route. `/name:` is what makes the stub load `libmpv-2.dll` at runtime
+# rather than `mpv.dll`, which is not a file that exists.
+- name: Set up MSVC (Windows)
+  if: runner.os == 'Windows'
+  uses: ilammy/msvc-dev-cmd@v1
+- name: Build an MSVC import library for libmpv (Windows)
+  if: runner.os == 'Windows'
+  shell: pwsh
+  run: |
+    $dir = $env:LIBMPV_DIR
+    $exports = dumpbin /exports "$dir\libmpv-2.dll"
+    $names = $exports |
+      Select-String -Pattern '^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)' |
+      ForEach-Object { $_.Matches[0].Groups[1].Value }
+    if ($names.Count -eq 0) { throw "no exports found in libmpv-2.dll" }
+    @('EXPORTS') + $names | Set-Content -Encoding ascii "$dir\mpv.def"
+    lib /def:"$dir\mpv.def" /name:libmpv-2.dll /out:"$dir\mpv.lib" /machine:x64
+    Write-Host "generated mpv.lib from $($names.Count) exports"
+
+# ---------------------------------------------------------------- the GUI frontend
+#
+# `ytm-gui` is Tauri, and `tauri::generate_context!()` embeds `frontendDist`
+# (`gui/dist`) at *compile* time. `beforeBuildCommand` would build it, but that
+# is run by the tauri CLI and dist builds with plain cargo — so without this the
+# crate compiles against a directory that does not exist. Every runner builds it,
+# since every runner builds that crate.
+#
+# `--ignore-scripts` is not tidiness: `react-devtools` drags in electron, whose
+# postinstall downloads ~100MB and, per CLAUDE.md, can fail silently. It is a
+# dev-only profiler and nothing in `pnpm build` touches it.
+- name: Set up pnpm
+  uses: pnpm/action-setup@v4
+  with:
+    version: 11
+- name: Set up Node
+  uses: actions/setup-node@v4
+  with:
+    node-version: 22
+- name: Build the GUI frontend
+  run: |
+    cd gui
+    pnpm install --frozen-lockfile --ignore-scripts
+    pnpm build
