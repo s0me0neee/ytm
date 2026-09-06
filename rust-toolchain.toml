@@ -1,0 +1,5 @@
+# Pinned to stable: rustix 0.37 (async-io 1 ← zbus 3 ← rookie) enables
+# `feature(rustc_attrs)` on any nightly and no longer compiles under one, so a
+# default-nightly machine cannot build this workspace without this file.
+[toolchain]
+channel = "stable"
