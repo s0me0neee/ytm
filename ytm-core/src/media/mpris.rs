@@ -610,7 +610,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let mut controls = MediaControls::new(rt.handle()).expect("a session bus");
+        let mut controls = MediaControls::new(rt.handle(), Host::Console).expect("a session bus");
         let name = controls.bus_name().to_string();
 
         controls.update(&NowPlaying {
