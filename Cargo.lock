@@ -7939,6 +7939,7 @@ dependencies = [
  "hotpath",
  "inquire",
  "jpeg-decoder",
+ "libc",
  "libmpv2",
  "log",
  "lrclib",

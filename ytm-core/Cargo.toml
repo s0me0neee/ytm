@@ -54,6 +54,13 @@ hotpath = "0.23.1"
 # "Auto" setup path), in-process — no yt-dlp subprocess, and per its own docs
 # it handles Chrome's App-Bound Encryption that yt-dlp cannot decrypt.
 rookie = "0.5.6"
+# `setlocale` alone, for `playback.rs`'s `force_c_numeric_locale` — mpv refuses
+# to be created under a non-C `LC_NUMERIC` and says so only on a stderr a
+# windowed app hasn't got. Not a target dependency: the constant and the
+# function exist on all three, and the category number differs between them,
+# which is the reason to take them from here rather than declare the extern by
+# hand.
+libc = "0.2.186"
 
 # MPRIS2 — the desktop's media-player protocol. This is what makes the
 # keyboard's media keys work and what lists the app as a player in GNOME/KDE.

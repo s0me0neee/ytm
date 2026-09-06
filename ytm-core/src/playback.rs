@@ -46,6 +46,81 @@ pub struct AudioState {
     pub track: Option<String>,
 }
 
+/// Puts `LC_NUMERIC` back to `C` for the whole process, which is the one
+/// condition mpv places on being created at all.
+///
+/// `mpv_create` checks the category itself and returns NULL for anything else,
+/// having printed *"Non-C locale detected. This is not supported."* to stderr —
+/// which a windowed app has not got. `libmpv2` turns that null into
+/// `Error::Null`, so all that reaches the log is `libmpv init failed: Null`,
+/// naming neither locales nor the environment variable behind it.
+///
+/// Nothing in the TUI calls `setlocale`, so it keeps the `C` that every C
+/// program starts in and never needed this. The GUI inherits one on the way up:
+/// `gtk_init`, bringing up the WebKitGTK webview, calls `setlocale(LC_ALL, "")`,
+/// which takes every category from the environment. So on any machine whose
+/// `LANG` is not `C` or `POSIX` — which is to say nearly all of them — the GUI
+/// came up with no audio engine at all, and one line to say why.
+///
+/// Process-wide rather than this thread's, because mpv reads and writes option
+/// values through the C library's own float conversions on threads of its own,
+/// and a thread starts life with the *global* locale whatever the thread that
+/// spawned it had chosen. `LC_NUMERIC` alone, since it is the only category mpv
+/// objects to and the only one whose environment value would change what a
+/// float means: dates, sorting and messages keep the user's.
+///
+/// Called before the audio thread is spawned rather than from it, so the one
+/// write to a process-global happens-before every read of it that matters, and
+/// after Tauri has brought GTK up rather than before, since `gtk_init` would
+/// otherwise simply undo it.
+fn force_c_numeric_locale() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        set_c_numeric();
+    });
+}
+
+/// The half of [`force_c_numeric_locale`] that does the work, split out so the
+/// test can ask for it again after the once-guard has been spent. Answers with
+/// the name it found, which is what that test checks.
+fn set_c_numeric() -> Option<String> {
+    let current = numeric_locale();
+    if current.as_deref() == Some("C") {
+        return current;
+    }
+    // SAFETY: `setlocale` as its own header declares it — a category constant
+    // and a NUL-terminated static. Only whether it answered is read.
+    if unsafe { libc::setlocale(libc::LC_NUMERIC, c"C".as_ptr()) }.is_null() {
+        log::error!("[audio] LC_NUMERIC is {current:?} and will not be set to C — mpv needs C");
+    } else {
+        log::info!("[audio] LC_NUMERIC {current:?} -> C, which is what mpv requires");
+    }
+    current
+}
+
+/// The name of the process's `LC_NUMERIC`, copied rather than borrowed.
+///
+/// `setlocale`'s answer points into the C library's own storage and is valid
+/// only until the next call to it — including the one that sets `C` a few lines
+/// above. Held as a `&str` across that call, the name keeps the length it had
+/// while the bytes under it are replaced, and merely *logging* it then slices
+/// through whatever is there now: `core::fmt` panicked on a byte index that is
+/// no longer a character boundary, with a different index and a different stray
+/// character each run.
+fn numeric_locale() -> Option<String> {
+    // SAFETY: as above, with null asking rather than setting. The pointer is
+    // copied out before it can be invalidated, which is the whole point.
+    let name = unsafe { libc::setlocale(libc::LC_NUMERIC, std::ptr::null()) };
+    if name.is_null() {
+        return None;
+    }
+    Some(
+        unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 pub struct AudioEngine {
     cmd_tx: Option<std::sync::mpsc::Sender<Cmd>>,
     state: Arc<Mutex<AudioState>>,
@@ -66,6 +141,9 @@ impl AudioEngine {
     /// could do with a `Result` here but exit.
     #[allow(clippy::expect_used)] // see `# Panics`
     pub fn new(rt: tokio::runtime::Handle, audio: crate::config::Audio) -> Self {
+        // Before the thread that creates mpv exists, so the ordering between
+        // the two needs no reasoning about. See `force_c_numeric_locale`.
+        force_c_numeric_locale();
         let (tx, rx) = std::sync::mpsc::channel();
         let state = Arc::new(Mutex::new(AudioState::default()));
         let state2 = Arc::clone(&state);
@@ -880,6 +958,32 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `mpv_create` refuses a non-C `LC_NUMERIC`, and the GUI arrives with one
+    /// because `gtk_init` calls `setlocale(LC_ALL, "")` on its way to the
+    /// webview. This is that sequence: install the environment's locale the way
+    /// the toolkit does, then check the one category mpv cares about is back
+    /// where it has to be before the engine would create it.
+    ///
+    /// Runs against whatever `LANG` the machine has, so on a `C`-locale box it
+    /// proves only that nothing was broken — which is why it asserts on the
+    /// category's value rather than on it having changed.
+    ///
+    /// The second assertion is the one with teeth: it compares the name the
+    /// call *found* against the name that was there, after the C library's
+    /// buffer holding both has been rewritten. A borrowed name does not survive
+    /// that, which is how this was first met — as a panic inside `core::fmt`
+    /// while logging it.
+    #[test]
+    fn the_toolkits_locale_is_put_back_before_mpv_would_see_it() {
+        unsafe { libc::setlocale(libc::LC_ALL, c"".as_ptr()) };
+        let installed = numeric_locale();
+
+        let found = set_c_numeric();
+
+        assert_eq!(numeric_locale().as_deref(), Some("C"));
+        assert_eq!(found, installed);
+    }
 
     fn cache_of(n: usize) -> UrlCache {
         let mut cache = UrlCache::default();
