@@ -67,12 +67,22 @@
      space every column above has to reserve -- is derived from them rather
      than written out a second time.
 
-     Apple's pill is 56px tall inside a 668px maximum. Ours is a size up from
-     that, because this window is not a browser tab with a toolbar and a URL
-     bar over it: the island is the only chrome on screen, so it can afford
-     the room, and the cover it carries is worth seeing at 40px rather than
-     32. The proportions are Apple's either way -- the cover is 62% of the
-     pill's height there and here.
+     Apple's pill is 56px tall inside a 668px maximum. Ours is taller,
+     because this window is not a browser tab with a toolbar and a URL bar
+     over it: the island is the only chrome on screen, so it can afford the
+     room, and the cover it carries is worth seeing at 40px rather than 32.
+     The proportions are Apple's either way -- the cover is 62% of the pill's
+     height there and here.
+
+     It is *narrower* than Apple's, though, and for the reason the height is
+     taller: theirs centres the LCD in the middle column and ours aligns it
+     left, so that the seek line starts where the words do (see
+     `.player-island-lcd`). Centred, surplus width falls either side of the
+     text and reads as margin. Left-aligned, all of it collects at the right
+     of the LCD and reads as a hole -- which at 48rem was ~300px of empty
+     pill between a short title and the volume control, on a window where
+     nothing else is empty. 38rem leaves the LCD about 280px, enough that an
+     ordinary title still runs out of room before the pill does.
 
      That reservation is by hand because the island is `fixed` and so out of
      flow: it cannot push anything. The moment the number is written twice it
@@ -81,7 +91,7 @@
      again and the padding overshot the other way. */
   --player-island-h: 4rem;
   --player-island-gap: 0.75rem;
-  --player-island-w: 48rem;
+  --player-island-w: 38rem;
   --player-bar-h: calc(var(--player-island-h) + var(--player-island-gap) * 2);
 
   /* What each side panel takes out of the row, its margin included --
@@ -125,6 +135,20 @@ body {
 ::selection {
   background: var(--color-accent);
   color: #fff;
+}
+
+/* Focus, said once. WebKit's default ring is its own blue -- the only blue
+   this palette contains, and it was landing on every button, playlist and
+   track row in the app the moment anything was reached by keyboard. One rule
+   on the pseudo-class rather than a utility per control, since every
+   focusable thing here wants the same answer; `.slider-thumb:focus-visible`
+   further down is a two-class selector and so keeps its own. `outline`
+   rather than a ring built from `box-shadow` because an outline follows the
+   element's own `border-radius`, which matters when the focusable things are
+   pills, 2xl-rounded rows and 12px circles. */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
 }
 
 /* Floating chrome. Deliberately *not* applied to full-width backgrounds or
@@ -286,10 +310,19 @@ body {
   will-change: transform;
 }
 
+/* Paused. Deliberately *not* the animation's own low frame: three bars at
+   0.3 scale is 4px of dot, 4px of gap, 4px of dot -- which is an ellipsis,
+   and read as one in the row it marks, where the column beside it is
+   truncating text. Held at full height instead, dimmed, the mark keeps the
+   shape it has while playing and only stops moving, which is what paused
+   means. */
 .eq-bar-idle {
   transform-origin: bottom;
-  transform: scaleY(0.3);
-  transition: transform 0.2s ease;
+  transform: scaleY(1);
+  opacity: 0.55;
+  transition:
+    transform 0.2s ease,
+    opacity 0.2s ease;
 }
 
 /* Now Playing text sits over the blurred artwork rather than over a panel, so

@@ -1,6 +1,6 @@
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
-use ytm_core::{Track, TrackRef};
+use ytm_core::{PlayMode, Track, TrackRef};
 
 use crate::state::AppState;
 
@@ -355,6 +355,26 @@ pub fn toggle_mute(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
 pub fn cycle_mode(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     state.player.lock().map_err(|e| e.to_string())?.cycle_mode();
+    push(&app, &state);
+    Ok(())
+}
+
+/// Switches straight to one mode, where [`cycle_mode`] steps through all
+/// three. The playlist header's Shuffle button is the caller, and "shuffle
+/// this playlist" is one action: cycling to it would take up to two presses,
+/// pass through Single on the way, and mean something different depending on
+/// where the mode happened to be. Applied *before* the `play` that follows,
+/// since it is `Player::build_queue` that reads the mode and shuffles.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
+pub fn set_mode(app: AppHandle, state: State<'_, AppState>, mode: &str) -> Result<(), String> {
+    let mode = match mode {
+        "cycle" => PlayMode::Cycle,
+        "single" => PlayMode::Single,
+        "shuffle" => PlayMode::Shuffle,
+        other => return Err(format!("unknown play mode: {other}")),
+    };
+    state.player.lock().map_err(|e| e.to_string())?.set_mode(mode);
     push(&app, &state);
     Ok(())
 }

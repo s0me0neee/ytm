@@ -129,6 +129,7 @@ pub fn run() -> tauri::Result<()> {
             player::set_volume,
             player::toggle_mute,
             player::cycle_mode,
+            player::set_mode,
             player::append_to_queue,
             player::remove_from_queue,
             player::jump_to,
