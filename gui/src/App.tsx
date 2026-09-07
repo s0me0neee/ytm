@@ -155,6 +155,21 @@ type SortDir = "asc" | "desc";
 const TRACK_GRID =
   "grid grid-cols-[1.25rem_2.75rem_minmax(0,3fr)_3.5rem] md:grid-cols-[1.25rem_2.75rem_minmax(0,3fr)_minmax(0,2fr)_3.5rem] lg:grid-cols-[1.25rem_2.75rem_minmax(0,3fr)_minmax(0,2fr)_minmax(0,2fr)_3.5rem] items-center gap-3";
 
+/** A heading over a block of content, as opposed to `TrackHeader`'s column
+ * labels. Those are 11px uppercase and faint because they name the columns of
+ * a table the eye is meant to read past; this names a section and is meant to
+ * be read, so it is set as text rather than as a legend. */
+const SECTION_HEADING = "px-3 pb-3 text-[15px] font-semibold text-ink";
+
+/** How many of the most recent plays get a card rather than a row.
+ *
+ * `history.json` holds a hundred, and a hundred covers is a wall rather than a
+ * page -- so the shelf takes the top of the list and the rest keeps the row
+ * form, where a hundred is a list somebody can scroll. Twelve is about two
+ * screenfuls of shelf on a wide window, which leaves the row somewhere to
+ * scroll to without ever looking short. */
+const HOME_SHELF = 12;
+
 /** macOS is the only platform where `titleBarStyle: "Overlay"` applies, so it
  * is the only one whose header has to leave room for the traffic lights. */
 const IS_MAC = navigator.userAgent.includes("Mac OS X");
@@ -191,6 +206,20 @@ function formatTime(secs: number): string {
   const m = Math.floor(secs / 60);
   const s = Math.floor(secs % 60);
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+/** A playlist's total length: "3 hr 6 min", not a timecode.
+ *
+ * Deliberately a different format from `formatTime` above, which measures a
+ * position inside one track. This one is a quantity the reader is weighing --
+ * whether the album fits the walk home -- and at that size minutes are noise
+ * and seconds are absurd. */
+function formatTotal(secs: number): string {
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins} min`;
+  const h = Math.floor(mins / 60);
+  const m = mins % 60;
+  return m === 0 ? `${h} hr` : `${h} hr ${m} min`;
 }
 
 /** Which line is playing at `elapsed`, or -1 before the first timestamp.
@@ -412,6 +441,8 @@ interface HomeViewProps {
  * per song and the rest only on a real action. */
 const HomeView = memo(function HomeView({ history, currentTrackId, paused, onPlayTrack }: HomeViewProps) {
   const tracks = history?.tracks ?? [];
+  const shelf = tracks.slice(0, HOME_SHELF);
+  const rest = tracks.slice(HOME_SHELF);
 
   if (history && tracks.length === 0) {
     return (
@@ -424,28 +455,82 @@ const HomeView = memo(function HomeView({ history, currentTrackId, paused, onPla
 
   return (
     <div className="select-none">
-      {tracks.length > 0 && (
+      {shelf.length > 0 && (
         <>
-          <p className="px-3 pb-2 text-[11px] font-semibold tracking-wider text-ink-faint uppercase">
-            Recently played
-          </p>
-          <ul>
-            {tracks.map((p, i) => {
+          <h2 className={SECTION_HEADING}>Recently played</h2>
+          {/* The one place in the app where the artwork is the row rather than
+              an icon beside it. Everywhere else a cover is 40-44px, which is
+              an identifier; at 160 it is the thing being offered, which is
+              what a page with no other content on it needs to be offering.
+
+              Horizontal rather than a wrapping grid, and it is the *history*
+              that decides: a hundred covers in a grid is a wall the eye has
+              no way into, while a shelf says "these first, most recent at the
+              left" -- and leaves the page room for the list underneath, which
+              is the form the other ninety belong in. `px-1` against the
+              heading's `px-3` because each card carries `p-2` of its own, so
+              the covers line up with the words above them rather than the
+              cards' hover backgrounds doing. */}
+          <div className="no-scrollbar flex gap-2 overflow-x-auto px-1 pb-6">
+            {shelf.map((p, i) => {
               const t = p.track;
               const isPlaying = Boolean(t.video_id) && t.video_id === currentTrackId;
               return (
-                <li key={`${t.video_id ?? "row"}-${i}`} className="row">
+                <button
+                  key={`${t.video_id ?? "card"}-${i}`}
+                  onClick={() => onPlayTrack(i)}
+                  className="w-44 flex-shrink-0 rounded-2xl p-2 text-left transition-colors hover:bg-surface"
+                >
+                  <div className="relative mb-2">
+                    <Thumbnail
+                      srcs={t.thumbnail ? coverCandidates(t.thumbnail, 320) : []}
+                      className="aspect-square w-full rounded-xl"
+                    />
+                    {/* The mark rides on the cover rather than in a column of
+                        its own, since a card has no column to spare -- and on
+                        a scrim, because it is the one element here drawn over
+                        a picture the app did not choose. */}
+                    {isPlaying && (
+                      <span className="absolute right-1.5 bottom-1.5 flex h-6 w-6 items-center justify-center rounded-full bg-black/55">
+                        <PlayingIndicator paused={paused} />
+                      </span>
+                    )}
+                  </div>
+                  <p className={`truncate text-[13px] ${isPlaying ? "text-accent" : "text-ink"}`}>
+                    {t.title ?? "Untitled"}
+                  </p>
+                  <p className="truncate text-xs text-ink-dim">{artistNames(t)}</p>
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
+
+      {rest.length > 0 && (
+        <>
+          <h2 className={SECTION_HEADING}>Earlier</h2>
+          <ul>
+            {rest.map((p, i) => {
+              const t = p.track;
+              /* The index the shelf did not take. `onPlayTrack` addresses the
+                 history as one list, so the row has to name its position in
+                 that list rather than in the slice it was drawn from. */
+              const at = i + HOME_SHELF;
+              const isPlaying = Boolean(t.video_id) && t.video_id === currentTrackId;
+              return (
+                <li key={`${t.video_id ?? "row"}-${at}`} className="row">
                   <button
                     className={`${TRACK_GRID} w-full rounded-xl px-3 py-1.5 text-left transition-colors hover:bg-surface ${
                       isPlaying ? "bg-surface" : ""
                     }`}
-                    onClick={() => onPlayTrack(i)}
+                    onClick={() => onPlayTrack(at)}
                   >
                     <span className="flex items-center justify-end">
                       {isPlaying ? (
                         <PlayingIndicator paused={paused} />
                       ) : (
-                        <span className="font-mono text-xs text-ink-faint">{i + 1}</span>
+                        <span className="font-mono text-xs text-ink-faint">{at + 1}</span>
                       )}
                     </span>
                     <Thumbnail srcs={[t.thumbnail]} className="h-11 w-11 rounded-md object-cover" />
@@ -1015,6 +1100,23 @@ function App() {
     [selected, toPlaylistIndex],
   );
 
+  /* Shuffle the playlist on screen: set the mode first, then start on a song
+     picked at random.
+
+     Both halves matter. `Player::build_queue` is what shuffles, and it reads
+     the mode as it builds -- so a `play` sent before the mode change would
+     queue the playlist in order and only shuffle whatever came *after* it.
+     And it positions the new queue at the song it was given, so starting at 0
+     would open every shuffle with the same track: the order behind it would
+     be random and the one thing the user hears first would not be. */
+  const shufflePlaylist = useCallback(() => {
+    if (selected === null || filteredSongs.length === 0) return;
+    const shown = Math.floor(Math.random() * filteredSongs.length);
+    invoke("set_mode", { mode: "shuffle" })
+      .then(() => invoke("play", { playlist: selected, song: toPlaylistIndex(shown) }))
+      .catch((e) => setError(String(e)));
+  }, [selected, filteredSongs.length, toPlaylistIndex]);
+
   const playResult = useCallback((result: SearchResult) => {
     invoke("play_search_result", { result }).catch((e) => setError(String(e)));
   }, []);
@@ -1221,6 +1323,7 @@ function App() {
         onSignIn={handleSignIn}
         onSearch={runSearch}
         onPlaySong={playSong}
+        onShuffle={shufflePlaylist}
         onHoverSong={prefetchSong}
         onPlayResult={playResult}
         onRetryPlaylist={retryPlaylist}
@@ -1305,6 +1408,7 @@ interface LibraryViewProps {
   onSignIn: () => void;
   onSearch: (e: React.FormEvent) => void;
   onPlaySong: (i: number) => void;
+  onShuffle: () => void;
   onHoverSong: (i: number) => void;
   onPlayResult: (r: SearchResult) => void;
   onRetryPlaylist: (i: number) => void;
@@ -1353,6 +1457,7 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
     onSignIn,
     onSearch,
     onPlaySong,
+    onShuffle,
     onHoverSong,
     onPlayResult,
     onRetryPlaylist,
@@ -1369,6 +1474,31 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
     onQueueMenu,
     onPlaylistMenu,
   } = props;
+
+  const playlistTitle = selected === null ? null : (playlists[selected]?.title ?? null);
+
+  /* What the page's second line says, in the four states it has. A filter is
+     the odd one: `songs` is already the filtered list, so its length is a
+     count of matches rather than of the playlist, and calling those "songs"
+     next to a title that names the whole thing would be a lie. The length is
+     dropped there for the same reason -- the sum of what happens to match a
+     search is not a figure anybody wants.
+
+     Falling back to the sidebar's `count` covers the seconds between picking
+     a playlist and its tracks arriving, when `songs` is empty and the page
+     would otherwise have a title over nothing. */
+  const shownSecs = useMemo(
+    () => songs.reduce((total, t) => total + (t.duration_seconds ?? 0), 0),
+    [songs],
+  );
+  const meta = useMemo(() => {
+    if (results) return `${results.length} result${results.length === 1 ? "" : "s"}`;
+    if (selected === null) return "";
+    if (filter) return `${songs.length} matching`;
+    if (songs.length > 0) return `${songs.length} songs · ${formatTotal(shownSecs)}`;
+    const count = playlists[selected]?.count;
+    return count == null ? "" : `${count} songs`;
+  }, [results, selected, filter, songs.length, shownSecs, playlists]);
 
   return (
     <div className={`flex h-full flex-col ${visible ? "" : "invisible"}`}>
@@ -1477,10 +1607,53 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
               />
             ) : (
             <>
-            <div className="flex items-center justify-between gap-4 px-3 pb-2 select-none">
-              <p className="text-[11px] font-semibold tracking-wider text-ink-faint uppercase">
-                {results ? "Search results" : "Tracks"}
-              </p>
+            {/* The page's own name. It had none: the playlist being shown was
+                said only by the highlight in the sidebar, and the content
+                column opened with an 11px "TRACKS" -- a label for a thing
+                that is self-evidently a list of tracks, over a second label
+                naming its columns. So the view had two legends and no title,
+                and nothing on it was set larger than 13px, which is a page
+                with nowhere for the eye to land.
+
+                The count and the length under it are the same argument: they
+                are what somebody actually wants to know about a list before
+                reading it, and they were nowhere in the app. `count` comes
+                from the sidebar's own data, so the line is answerable in the
+                moment between selecting a playlist and its tracks arriving --
+                which is exactly when a blank page reads as a broken one. */}
+            <header className="flex items-end justify-between gap-4 px-3 pt-1 pb-4 select-none">
+              <div className="min-w-0">
+                <h1 className="truncate text-[26px] leading-tight font-semibold tracking-tight text-ink">
+                  {results ? "Search results" : (playlistTitle ?? "Tracks")}
+                </h1>
+                {meta && <p className="mt-1 truncate text-[13px] text-ink-dim">{meta}</p>}
+              </div>
+              <div className="flex flex-shrink-0 items-center gap-2">
+                {/* Play takes the list as it is shown -- filtered, sorted, or
+                    neither -- because that is what the user is looking at and
+                    `onPlaySong` already speaks in shown positions. Shuffle
+                    cannot: it has to set the mode first, since it is
+                    `build_queue` that shuffles and it reads the mode on the
+                    way past. Hence a handler of its own rather than a second
+                    call to this one. */}
+                {!results && selected !== null && songs.length > 0 && (
+                  <>
+                    <button
+                      onClick={() => onPlaySong(0)}
+                      className="flex items-center gap-1.5 rounded-full bg-accent px-4 py-1.5 text-[13px] font-medium text-white transition hover:bg-accent-2"
+                    >
+                      <Play size={13} fill="currentColor" />
+                      Play
+                    </button>
+                    <button
+                      onClick={onShuffle}
+                      className="flex items-center gap-1.5 rounded-full bg-surface px-4 py-1.5 text-[13px] font-medium text-ink transition hover:bg-surface-2"
+                    >
+                      <Shuffle size={13} />
+                      Shuffle
+                    </button>
+                  </>
+                )}
               {/* The TUI's `/`: filters the playlist already loaded, which is
                   a different thing from the header's search of YouTube. Only
                   offered where there is a playlist to filter. */}
@@ -1505,7 +1678,8 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
                   )}
                 </div>
               )}
-            </div>
+              </div>
+            </header>
             {!results && songs.length > 0 && (
               <TrackHeader sortKey={sortKey} sortDir={sortDir} onSort={onSort} />
             )}
