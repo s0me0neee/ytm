@@ -1,1 +1,19 @@
 [env]
+# `libesedb-sys` (via `libesedb` ← `rookie`, the in-process cookie reader) builds
+# a vendored copy of libyal's libesedb, and its build script only ever configures
+# that C tree for **MSVC**. The chain is `common/config_winapi.h`, which includes
+# `<windows.h>` — and so gets `WINAPI` defined, and with it every `memory_*`,
+# `narrow_string_*` and `wide_string_*` macro the sources are written against —
+# only when one of `HAVE_WINDOWS_H`, `__BORLANDC__` or `_MSC_VER` is set. cl.exe
+# supplies `_MSC_VER` itself; gcc supplies none of them, and the build script
+# passes `HAVE_CONFIG_H` on Unix only, so under `x86_64-pc-windows-gnu` the
+# sources compile with *no* memory macros at all. Every use is then an implicit
+# function declaration, which GCC 14 and later reject outright:
+#
+#   common/memory.h:64:18: error: implicit declaration of function 'memory_allocate'
+#
+# Saying `HAVE_WINDOWS_H` here is the first arm of that same `#if`, so the header
+# configures itself exactly as it does for MSVC. It is per-target rather than a
+# bare `CFLAGS` so an MSVC or a cross build is untouched, and cargo lets a
+# `CFLAGS_*` already in the environment win over it.
+CFLAGS_x86_64_pc_windows_gnu = "-DHAVE_WINDOWS_H=1"
