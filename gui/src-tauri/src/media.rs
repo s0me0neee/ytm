@@ -72,6 +72,28 @@ pub fn init(rt: &tokio::runtime::Handle) {
     CONTROLS.with_borrow_mut(|slot| *slot = controls);
 }
 
+/// Gives the handle up while the process is still alive.
+///
+/// Must be called from `RunEvent::Exit`, and the *while* is the whole point.
+/// Left to the thread-local's own destructor this is not a tidy-up but a crash,
+/// every time, on Windows: tao's event loop ends in `std::process::exit`, so
+/// `ExitProcess` terminates every other thread — the SMTC worker included — and
+/// only *then* does the CRT run the main thread's TLS destructors. Dropping
+/// `MediaControls` there joins a thread the OS has already killed, which leaves
+/// no result behind for `JoinHandle::join` to find, so std's own
+/// `expect("threads should not terminate unexpectedly")` fires — inside a
+/// destructor, where a panic is not recoverable. The process dies with
+/// `fatal runtime error: thread local panicked on drop` and exit code
+/// `0xc0000409`, after everything the user asked for has already been done.
+///
+/// Dropped here instead, the worker is still running and the join is the
+/// ordinary one the backend was written for; the destructor then finds a `None`
+/// and does nothing. `try_with` because a destructor may already have claimed
+/// the slot on some other path out, which is not worth a second failure.
+pub fn shutdown() {
+    let _ = CONTROLS.try_with(|slot| slot.borrow_mut().take());
+}
+
 /// Waits for the desktop to ask for something, and acts on it.
 ///
 /// One wake can cover several commands — a run of key presses, a drag on a

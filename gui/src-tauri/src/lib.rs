@@ -159,10 +159,14 @@ pub fn run() -> tauri::Result<()> {
         // volume are written on the way out, not on every change, so a volume
         // drag is not a file write per frame.
         .run(|handle, event| {
-            if matches!(event, tauri::RunEvent::Exit)
-                && let Some(state) = handle.try_state::<AppState>()
-            {
-                persist::save(&state);
+            if matches!(event, tauri::RunEvent::Exit) {
+                if let Some(state) = handle.try_state::<AppState>() {
+                    persist::save(&state);
+                }
+                // Unconditional, and after the save rather than instead of it:
+                // this is the last moment the media handle can be given up
+                // while its worker thread is still alive. See `media::shutdown`.
+                media::shutdown();
             }
         });
     Ok(())
