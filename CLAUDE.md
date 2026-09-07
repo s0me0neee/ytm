@@ -166,11 +166,19 @@ a later `dist generate` drops that step silently. The step is marked `HAND-ADDED
 `release.yml` and the reasoning is in `dist-workspace.toml`'s closing comment, so what to put
 back is recorded in both places.
 
-Repacking is safe there because of one detail: the manifest records the checksum *file's
-name*, not the hash it holds, so writing that file again beside the changed zip is the whole
-of what keeping them consistent requires. It is dist's own format — `<sha256> *<name>`, LF,
-and a trailing blank line — and the aggregate `sha256.sum` is built later, in the global job,
-from what the build job uploaded.
+Changing the zip invalidates **two** records of its hash, and 1.1.0 and 1.1.1 both shipped
+with only one of them fixed. `<name>.zip.sha256` is the obvious one, written again in dist's own format
+(`<sha256> *<name>`, LF, trailing blank line — checked byte for byte against a real dist
+release). The other is `checksums.sha256` *inside* `dist-manifest.json`, which dist fills in
+during `dist build` and the **global** job reads afterwards to build the aggregate
+`sha256.sum` — it does not re-hash what was uploaded. Miss that one and `sha256.sum`
+contradicts the artifact it names while the per-file checksum agrees with it, which is about
+the worst state an integrity file can be in. Both are written now; the `sha256.sum` in 1.1.0 and
+1.1.1 is wrong for their two Windows zips each, and 1.1.2 is the fix.
+
+The manifest is patched by string-replacing the old hash with the new rather than by
+rewriting JSON: a sha256 cannot collide with anything else in the file, and PowerShell's
+`ConvertTo-Json` silently truncates past a depth this manifest exceeds.
 
 ## Credential Setup
 

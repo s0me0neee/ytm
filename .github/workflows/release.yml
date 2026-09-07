@@ -190,10 +190,22 @@ jobs:
       # bare STATUS_DLL_NOT_FOUND. dist's `include` cannot be scoped to one
       # target, hence repacking here rather than configuring it.
       #
-      # The checksum has to be written again because the zip has changed, and it
-      # is dist's own format: `<sha256> *<name>`, LF, and the trailing blank line
-      # dist emits. The manifest refers to this file by *name*, so rewriting it
-      # in place is all that is needed to keep the two agreeing.
+      # Changing the zip invalidates *two* records of its hash, and v1.1.0 and
+      # v1.1.1 both shipped with only the first of them fixed:
+      #
+      #   * `<name>.zip.sha256`, written again here in dist's own format —
+      #     `<sha256> *<name>`, LF, and the trailing blank line it emits;
+      #   * `checksums.sha256` inside `dist-manifest.json`, which dist filled in
+      #     during `dist build` and which the *global* job later reads to build
+      #     the aggregate `sha256.sum`. Miss it and `sha256.sum` disagrees with
+      #     the artifact it names, while the per-file checksum agrees — which is
+      #     as confusing a state as an integrity file can be in.
+      #
+      # The manifest is patched by replacing the old hash string with the new
+      # one rather than by rewriting JSON: a sha256 cannot collide with anything
+      # else in the file, and PowerShell's ConvertTo-Json truncates past a depth
+      # this manifest exceeds. `dist-manifest.json` is the one in the working
+      # directory, which the Post-build step below copies onward.
       - name: Bundle libmpv into the Windows zips
         if: runner.os == 'Windows'
         shell: pwsh
@@ -202,12 +214,17 @@ jobs:
           if (-not (Test-Path $dll)) { throw "no libmpv-2.dll at $dll" }
           $zips = Get-ChildItem target/distrib -Filter '*-x86_64-pc-windows-msvc.zip'
           if ($zips.Count -eq 0) { throw "no windows zip in target/distrib" }
+          $manifest = 'dist-manifest.json'
           foreach ($zip in $zips) {
+            $before = (Get-FileHash -Algorithm SHA256 $zip.FullName).Hash.ToLower()
             7z a -tzip $zip.FullName $dll
             if ($LASTEXITCODE -ne 0) { throw "7z failed on $($zip.Name)" }
-            $hash = (Get-FileHash -Algorithm SHA256 $zip.FullName).Hash.ToLower()
-            [System.IO.File]::WriteAllText("$($zip.FullName).sha256", "$hash *$($zip.Name)`n`n")
-            Write-Host "$($zip.Name): bundled libmpv-2.dll, sha256 $hash"
+            $after = (Get-FileHash -Algorithm SHA256 $zip.FullName).Hash.ToLower()
+            [System.IO.File]::WriteAllText("$($zip.FullName).sha256", "$after *$($zip.Name)`n`n")
+            $text = Get-Content $manifest -Raw
+            if (-not $text.Contains($before)) { throw "no $before in $manifest for $($zip.Name)" }
+            [System.IO.File]::WriteAllText((Resolve-Path $manifest), $text.Replace($before, $after))
+            Write-Host "$($zip.Name): bundled libmpv-2.dll, $before -> $after"
           }
       - id: cargo-dist
         name: Post-build

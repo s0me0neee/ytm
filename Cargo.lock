@@ -3193,7 +3193,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lrclib"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "log",
  "reqwest 0.13.4",
@@ -7916,7 +7916,7 @@ dependencies = [
 
 [[package]]
 name = "yt-music-tui"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "ctrlc",
@@ -7932,7 +7932,7 @@ dependencies = [
 
 [[package]]
 name = "ytm-core"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "block2",
  "dirs",
@@ -7966,7 +7966,7 @@ dependencies = [
 
 [[package]]
 name = "ytm-gui"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "log",
  "serde",
