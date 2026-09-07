@@ -1,6 +1,6 @@
 [package]
 name = "yt-music-tui"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 repository = "https://github.com/s0me0neee/yt-music-tui.git"
 

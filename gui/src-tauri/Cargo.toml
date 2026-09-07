@@ -1,6 +1,6 @@
 [package]
 name = "ytm-gui"
-version = "1.1.0"
+version = "1.1.1"
 description = "ytm — Tauri desktop player for YouTube Music"
 edition = "2024"
 
