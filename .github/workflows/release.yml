@@ -184,6 +184,31 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      # HAND-ADDED, and lost by `dist generate` — see `dist-workspace.toml`.
+      # `ytm.exe` links libmpv, and Windows has nothing that would put it on a
+      # user's machine, so without the DLL beside it the binary exits with a
+      # bare STATUS_DLL_NOT_FOUND. dist's `include` cannot be scoped to one
+      # target, hence repacking here rather than configuring it.
+      #
+      # The checksum has to be written again because the zip has changed, and it
+      # is dist's own format: `<sha256> *<name>`, LF, and the trailing blank line
+      # dist emits. The manifest refers to this file by *name*, so rewriting it
+      # in place is all that is needed to keep the two agreeing.
+      - name: Bundle libmpv into the Windows zips
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dll = Join-Path $env:LIBMPV_DIR 'libmpv-2.dll'
+          if (-not (Test-Path $dll)) { throw "no libmpv-2.dll at $dll" }
+          $zips = Get-ChildItem target/distrib -Filter '*-x86_64-pc-windows-msvc.zip'
+          if ($zips.Count -eq 0) { throw "no windows zip in target/distrib" }
+          foreach ($zip in $zips) {
+            7z a -tzip $zip.FullName $dll
+            if ($LASTEXITCODE -ne 0) { throw "7z failed on $($zip.Name)" }
+            $hash = (Get-FileHash -Algorithm SHA256 $zip.FullName).Hash.ToLower()
+            [System.IO.File]::WriteAllText("$($zip.FullName).sha256", "$hash *$($zip.Name)`n`n")
+            Write-Host "$($zip.Name): bundled libmpv-2.dll, sha256 $hash"
+          }
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up

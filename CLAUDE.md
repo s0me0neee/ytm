@@ -146,12 +146,31 @@ beside the workflows rather than in them because GitHub parses anything under
   ~100MB and fails silently (above), and nothing in `pnpm build` touches it.
 
 Everything else is `[dist.dependencies]`: `libmpv-dev` plus Tauri's WebKitGTK set on apt,
-`mpv` on Homebrew. Every target has a native runner, so none of this is cross-compiled.
+`mpv` on Homebrew. Every target has a native runner, so none of this is cross-compiled. Any
+package name with a **dot** in it has to be quoted there — `libwebkit2gtk-4.1-dev = '*'` is a
+TOML *dotted key*, and dist duly asked apt for a package called `libwebkit2gtk-4`, which is
+an exit 100 in the middle of a release and says nothing about why.
 
-What the release does **not** carry is `libmpv-2.dll`: the Windows zip holds `ytm.exe` alone,
-so libmpv has to be on `PATH` on the user's machine or the binary exits with a bare
-`STATUS_DLL_NOT_FOUND`. dist's `include` is per-workspace rather than per-target, so bundling
-it would mean shipping a Windows DLL inside the macOS and Linux tarballs as well.
+The Windows zips carry `libmpv-2.dll` beside the binary, and getting it there is the one
+place this setup fights the tool. Nothing on Windows would put libmpv on a user's machine,
+and without it the binary exits with a bare `STATUS_DLL_NOT_FOUND` and no message. dist
+cannot express "this file, that target": `include` is per-workspace, so the same 120MB DLL
+would ride along in both macOS tarballs, both Linux tarballs and both npm packages — and a
+path present only on the Windows runner is a hard error rather than a skip (`failed to copy
+asset ... No such file or directory`, measured).
+
+So the zip is repacked after `dist build` by a step **hand-added** to `release.yml`, and
+`allow-dirty = ["ci"]` is what stops dist checking or regenerating the file over it. The
+cost is real and worth stating: `release.yml` is no longer reproducible from the config, and
+a later `dist generate` drops that step silently. The step is marked `HAND-ADDED` in
+`release.yml` and the reasoning is in `dist-workspace.toml`'s closing comment, so what to put
+back is recorded in both places.
+
+Repacking is safe there because of one detail: the manifest records the checksum *file's
+name*, not the hash it holds, so writing that file again beside the changed zip is the whole
+of what keeping them consistent requires. It is dist's own format — `<sha256> *<name>`, LF,
+and a trailing blank line — and the aggregate `sha256.sum` is built later, in the global job,
+from what the build job uploaded.
 
 ## Credential Setup
 

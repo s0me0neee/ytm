@@ -15,6 +15,10 @@ targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-da
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+# `release.yml` is hand-edited after generation and dist must neither check it
+# nor rewrite it. The edit is one Windows-only step, described at the foot of
+# this file; re-running `dist generate` drops it, so it has to go back after.
+allow-dirty = ["ci"]
 
 # Extra CI steps, spliced into the build job ahead of `dist build`. Two things
 # have to happen there that no package manager can do:
@@ -37,7 +41,7 @@ github-build-setup = "../build-setup.yml"
 # Windows takes neither of these; it is handled in `build-setup.yml`.
 [dist.dependencies.apt]
 libmpv-dev = '*'
-libwebkit2gtk-4.1-dev = '*'
+"libwebkit2gtk-4.1-dev" = '*'
 libgtk-3-dev = '*'
 libayatana-appindicator3-dev = '*'
 librsvg2-dev = '*'
@@ -48,3 +52,16 @@ file = '*'
 
 [dist.dependencies.homebrew]
 mpv = '*'
+
+# The Windows zip ships `libmpv-2.dll` beside `ytm.exe`, because without it the
+# binary exits with a bare `STATUS_DLL_NOT_FOUND` and no message — libmpv is
+# linked, and there is no package that would put it on a user's machine.
+#
+# dist cannot express that. `include` is per-workspace, so the same 120MB DLL
+# would go into both macOS tarballs, both Linux tarballs and both npm packages;
+# and a path that exists only on the Windows runner is a hard error rather than
+# a skip ("failed to copy asset ... No such file or directory"). So the zip is
+# repacked after `dist build` instead, by a step hand-added to `release.yml` —
+# which is what `allow-dirty` above is for. Repacking there is safe because the
+# manifest names the checksum *file* rather than the hash it holds, so writing
+# that file again alongside is the whole of what consistency requires.
