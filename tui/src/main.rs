@@ -28,7 +28,6 @@
 #![allow(clippy::struct_excessive_bools)] // 1
 #![allow(clippy::too_many_lines)] // 2
 #![allow(clippy::unused_self)] // 4
-#![allow(clippy::assert_is_empty)] // 1 — in tests
 #![allow(clippy::redundant_closure_for_method_calls)] // 1
 #![allow(clippy::unnested_or_patterns)] // 1
 

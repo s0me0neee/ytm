@@ -148,6 +148,8 @@ impl Iface {
     }
 }
 
+// The trait is async; these answer from the snapshot and have nothing to await.
+#[allow(clippy::unused_async_trait_impl)]
 impl RootInterface for Iface {
     async fn raise(&self) -> fdo::Result<()> {
         // A terminal app cannot raise itself; `CanRaise` says so, and the
@@ -202,6 +204,7 @@ impl RootInterface for Iface {
     }
 }
 
+#[allow(clippy::unused_async_trait_impl)]
 impl PlayerInterface for Iface {
     async fn next(&self) -> fdo::Result<()> {
         self.send(MediaCmd::Next)
@@ -369,7 +372,7 @@ impl std::fmt::Debug for MediaControls {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MediaControls")
             .field("bus_name", &self.server.bus_name().as_str())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -467,6 +470,7 @@ impl MediaControls {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // the expected values are exact: literals, clamp bounds, zeroed state
 mod tests {
     use super::*;
     use crate::media::TrackInfo;
@@ -518,7 +522,7 @@ mod tests {
         };
         let b = NowPlaying {
             track: Some(track("abc", 213.0)),
-            ..a.clone()
+            ..a
         };
         assert!(matches!(changed(&b, &a)[..], [Property::Metadata(_)]));
     }

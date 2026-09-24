@@ -956,6 +956,7 @@ fn run(
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // the expected values are exact: literals, clamp bounds, zeroed state
 mod tests {
     use super::*;
 

@@ -51,6 +51,8 @@ fn init_logging() {
 
 /// # Errors
 /// Returns an error if the Tauri runtime fails to start.
+// `generate_context!` expands to a `process::exit`; it is tauri's code, not ours.
+#[allow(clippy::exit)]
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> tauri::Result<()> {
     init_logging();

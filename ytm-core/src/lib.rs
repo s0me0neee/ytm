@@ -54,7 +54,6 @@
 #![allow(clippy::semicolon_if_nothing_returned)] // 2
 #![allow(clippy::format_push_string)] // 2
 #![allow(clippy::literal_string_with_formatting_args)] // 2
-#![allow(clippy::assert_is_empty)] // 5 — all in tests
 #![allow(clippy::many_single_char_names)] // 1
 #![allow(clippy::struct_excessive_bools)] // 1
 #![allow(clippy::too_many_lines)] // 1
