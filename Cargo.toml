@@ -37,3 +37,8 @@ panic_in_result_fn = "deny"
 panic = "deny"
 exit = "deny"
 as_conversions = "deny"
+
+# crossterm 0.29.0 spins at 100% CPU once its terminal is closed: the tty read
+# loop in `event/source/unix/mio.rs` never exits on EOF/EIO. Patched to error out.
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }

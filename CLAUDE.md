@@ -943,6 +943,14 @@ the same on either. Note 0.13 moved `RequestBuilder::query` behind a **`query` f
 where 0.12 has it unconditionally, so a bump in either direction has to touch the features
 list as well as the version.
 
+**crossterm is vendored** (`vendor/crossterm`, via `[patch.crates-io]`), because 0.29.0 —
+also upstream master as of 2026-09 — spins at 100% CPU once its terminal is closed: the tty
+read loop in `src/event/source/unix/mio.rs` retries EOF/EIO forever and never returns to
+`event::poll`'s caller, so the shutdown flag is never seen. The patch returns an error
+instead. Don't "bump" it away until upstream fixes that loop; the test is to run `ytm` and
+close its terminal window, then check it's gone. `App::run` uses `ratatui::try_restore` for
+the same scenario — `restore` `eprintln!`s its failure, which panics on a dead tty.
+
 **`mpris-server 0.10`** is a Linux-only target dependency, so Windows and macOS builds never
 see zbus at all. Its `tokio` feature matters more than it looks: zbus picks a reactor by
 asking `Handle::try_current()` *while the connection is being built*, so `Server::new` has to

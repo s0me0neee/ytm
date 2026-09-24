@@ -2275,7 +2275,12 @@ impl App {
         ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture)?;
         let result = self.event_loop(&mut terminal);
         ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture).ok();
-        ratatui::restore();
+        // Not `restore`: it eprintln!s its failure, which panics once the terminal is closed.
+        if let Err(e) = ratatui::try_restore() {
+            log::warn!("failed to restore terminal: {e}");
+            // Its Drop would eprintln! the same failure and panic the same way.
+            std::mem::forget(terminal);
+        }
 
         // Persist queue before anything else so a crash during reauth doesn't lose it.
         if let Some(state) = persistence::build_queue_state(
