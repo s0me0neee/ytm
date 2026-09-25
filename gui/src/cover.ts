@@ -1,6 +1,15 @@
 // Mirrors ytm-core/src/cover.rs's at_size/hd_variant string rewrites, done
 // client-side since they're pure URL manipulation with no fetch involved.
 
+import { convertFileSrc } from "@tauri-apps/api/core";
+
+/** `url`, fetched by the backend's `cover://` scheme rather than by the
+ * webview, which fires a request per row at once and gets 429'd by the CDN
+ * for it. See `src-tauri/src/cover.rs`. */
+export function viaBackend(url: string): string {
+  return convertFileSrc(url, "cover");
+}
+
 /** The named frames YouTube serves for a video, smallest first.
  *
  * `hq720.jpg` is deliberately absent though it exists: it is the same
@@ -11,7 +20,7 @@
 const YT_THUMB_SIZES = ["default.jpg", "mqdefault.jpg", "hqdefault.jpg", "sddefault.jpg", "maxresdefault.jpg"];
 
 /** Rewrites a Google image URL's `w120-h120-...` size params to `px`. */
-export function coverAtSize(url: string, px: number): string {
+function coverAtSize(url: string, px: number): string {
   const eq = url.lastIndexOf("=");
   if (eq === -1) return url;
   const base = url.slice(0, eq);
@@ -29,7 +38,7 @@ export function coverAtSize(url: string, px: number): string {
  * advertised crop left a twentieth of the library at 400x225 when
  * `sddefault` (640x480) was there for nearly all of them. Each rung can 404 --
  * callers fall through. */
-export function hdLadder(url: string): string[] {
+function hdLadder(url: string): string[] {
   const base = url.split("?")[0];
   const idx = base.lastIndexOf("/");
   if (idx === -1) return [];
@@ -56,5 +65,5 @@ export function coverCandidates(url: string, px: number): string[] {
 /** The single best URL for a cover, where only one can be given (a CSS
  * `background-image`, which has no fallback chain). */
 export function bestCoverUrl(url: string, px: number): string {
-  return coverCandidates(url, px)[0];
+  return viaBackend(coverCandidates(url, px)[0]);
 }

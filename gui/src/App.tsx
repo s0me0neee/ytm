@@ -243,6 +243,48 @@ function activeLyricIndex(lines: LyricLineView[], elapsed: number): number {
   return idx;
 }
 
+// How long a clicked line outranks playback ticks, which still carry the pre-seek position.
+const SEEK_HOLD_MS = 1000;
+
+// The active lyric on a clock extrapolated between the 250ms ticks, re-rendered at each line.
+function useActiveLyric(
+  lines: LyricLineView[] | null,
+  elapsed: number,
+  paused: boolean,
+  offset: number,
+): [number, (at: number) => void] {
+  // The position last reported, and when it was received.
+  const [base, setBase] = useState({ at: elapsed, time: performance.now(), seeked: 0 });
+  const [, setWake] = useState(0);
+
+  useEffect(() => {
+    setBase((b) => {
+      const now = performance.now();
+      // Ignore pre-seek ticks that arrive after a click, until one agrees with it.
+      const projected = b.at + (paused ? 0 : (now - b.time) / 1000);
+      if (now - b.seeked < SEEK_HOLD_MS && Math.abs(elapsed - projected) > 1) return b;
+      return { at: elapsed, time: now, seeked: 0 };
+    });
+  }, [elapsed, paused]);
+
+  const clock = base.at + (paused ? 0 : (performance.now() - base.time) / 1000) + offset;
+  const active = lines ? activeLyricIndex(lines, clock) : -1;
+
+  useEffect(() => {
+    if (!lines || paused) return;
+    const next = lines[active + 1];
+    if (!next) return;
+    const t = window.setTimeout(() => setWake((w) => w + 1), Math.max(0, (next.at - clock) * 1000) + 5);
+    return () => window.clearTimeout(t);
+  }, [lines, active, clock, paused]);
+
+  const seeked = useCallback(
+    (at: number) => setBase({ at: at - offset, time: performance.now(), seeked: performance.now() }),
+    [offset],
+  );
+  return [active, seeked];
+}
+
 function modeIcon(mode: string) {
   const m = mode.toLowerCase();
   if (m.includes("shuffle")) return <Shuffle size={16} />;
@@ -1029,8 +1071,11 @@ function App() {
       if (!ref) return;
       const [playlist, song] = ref;
       setPickerOpen(false);
+      // Same guard as `loadLyrics`: a track change while this is in flight wins.
+      const seq = ++lyricsRequest.current;
       invoke<LyricsView | null>("choose_lyrics", { playlist, song, recordId })
         .then((l) => {
+          if (seq !== lyricsRequest.current) return;
           setLyrics(l);
           setLyricsError(l === null);
         })
@@ -1269,17 +1314,21 @@ function App() {
     }
   }, [browser]);
 
+  // Searches run concurrently now, so only the latest query's answer is shown.
+  const searchRequest = useRef(0);
   const runSearch = useCallback(
     async (e: React.FormEvent) => {
       e.preventDefault();
+      const seq = ++searchRequest.current;
       if (!query.trim()) {
         setResults(null);
         return;
       }
       try {
-        setResults(await invoke<SearchResult[]>("search", { query }));
+        const found = await invoke<SearchResult[]>("search", { query });
+        if (seq === searchRequest.current) setResults(found);
       } catch (e) {
-        setError(String(e));
+        if (seq === searchRequest.current) setError(String(e));
       }
     },
     [query],
@@ -1840,7 +1889,7 @@ function PlayerBar({
             className="slider-seekbar"
             value={playback.elapsed}
             max={playback.total}
-            onChange={(v) => invoke("seek_to", { secs: v })}
+            onCommit={(v) => invoke("seek_to", { secs: v })}
           />
         </div>
 
@@ -2180,17 +2229,22 @@ function NowPlayingView({
 }: NowPlayingViewProps) {
   // The configured offset shifts the clock handed to the active-line search,
   // never the cached records -- same rule as the TUI's `Config::lyric_time`.
-  const clock = playback.elapsed + (config?.lyricsOffset ?? 0);
-  const activeLine = lyrics?.synced ? activeLyricIndex(lyrics.lines, clock) : -1;
+  const [activeLine, lyricSeeked] = useActiveLyric(
+    lyrics?.synced ? lyrics.lines : null,
+    playback.elapsed,
+    playback.paused,
+    config?.lyricsOffset ?? 0,
+  );
   /* The inverse of that line, and the reason the offset is not applied in
      `LyricsPanel`: a lyric's `at` is on the shifted clock, so seeking to it
      means undoing the shift. Memoised because `LyricsPanel` is, and an inline
      arrow would defeat that on every 250ms tick. */
   const onSeekLyric = useCallback(
     (at: number) => {
+      lyricSeeked(at);
       invoke("seek_to", { secs: Math.max(0, at - (config?.lyricsOffset ?? 0)) });
     },
-    [config?.lyricsOffset],
+    [config?.lyricsOffset, lyricSeeked],
   );
   const [showLyrics, setShowLyrics] = useState(true);
   const coverRef = useRef<HTMLDivElement>(null);
@@ -2233,13 +2287,14 @@ function NowPlayingView({
           // averaging every cover towards black regardless of what it actually
           // looked like. Saturation and brightness push it the other way, so a
           // light cover reads as a light room.
+          // `will-change-transform`: its own layer, or WebKitGTK re-blurs it on every seek-bar tick (170ms frames).
           <motion.div
             key={currentTrack.video_id ?? "bg"}
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
             transition={{ duration: 0.5 }}
-            className="absolute inset-0 scale-125 bg-cover bg-center blur-3xl saturate-[1.7] brightness-110"
+            className="absolute inset-0 scale-125 bg-cover bg-center blur-3xl saturate-[1.7] brightness-110 will-change-transform"
             style={{ backgroundImage: `url(${bestCoverUrl(currentTrack.thumbnail, 200)})` }}
           />
         ) : (
@@ -2361,7 +2416,7 @@ function NowPlayingView({
                   className="w-full"
                   value={playback.elapsed}
                   max={playback.total}
-                  onChange={(v) => invoke("seek_to", { secs: v })}
+                  onCommit={(v) => invoke("seek_to", { secs: v })}
                 />
                 <div className="on-artwork mt-1.5 flex justify-between font-mono text-[11px] text-white/60 tabular-nums select-none">
                   <span>{formatTime(playback.elapsed)}</span>

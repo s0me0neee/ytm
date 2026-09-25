@@ -1,3 +1,5 @@
+// tauri::command's macro expansion emits an unreachable!() on async fns, which the workspace lints deny by default.
+#![allow(clippy::unreachable)]
 use serde::Serialize;
 use tauri::State;
 use ytm_core::persistence;
@@ -94,43 +96,49 @@ fn query_for(state: &AppState, playlist: usize, song: usize) -> Result<(LyricsQu
 /// the same precedence `best_for`'s `override_id` implements for the TUI.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn get_lyrics(state: State<'_, AppState>, playlist: usize, song: usize) -> Result<Option<LyricsView>, String> {
-    let (query, video_id) = query_for(&state, playlist, song)?;
-    let override_id = state
-        .lyrics_overrides
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get(&video_id);
+pub async fn get_lyrics(state: State<'_, AppState>, playlist: usize, song: usize) -> Result<Option<LyricsView>, String> {
+    crate::state::off_main(&state, move |state| {
+        let (query, video_id) = query_for(state, playlist, song)?;
+        let override_id = state
+            .lyrics_overrides
+            .lock()
+            .map_err(|e| e.to_string())?
+            .get(&video_id);
 
-    let service = LyricsService::new();
-    let rt_handle = tauri::async_runtime::handle().inner().clone();
-    let found = rt_handle
-        .block_on(service.best_for(&query, override_id))
-        .map_err(|e| e.to_string())?;
+        let service = LyricsService::new();
+        let rt_handle = tauri::async_runtime::handle().inner().clone();
+        let found = rt_handle
+            .block_on(service.best_for(&query, override_id))
+            .map_err(|e| e.to_string())?;
 
-    Ok(found.map(|record| {
-        let overridden = override_id == Some(record.id);
-        view_of(record, overridden)
-    }))
+        Ok(found.map(|record| {
+            let overridden = override_id == Some(record.id);
+            view_of(record, overridden)
+        }))
+    })
+    .await
 }
 
 /// The `c` picker's rows: every record lrclib offers for this track, with the
 /// one on screen guaranteed a place.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn get_lyrics_choices(
+pub async fn get_lyrics_choices(
     state: State<'_, AppState>,
     playlist: usize,
     song: usize,
     on_screen: Option<u64>,
 ) -> Result<Vec<LyricsChoiceView>, String> {
-    let (query, _) = query_for(&state, playlist, song)?;
-    let service = LyricsService::new();
-    let rt_handle = tauri::async_runtime::handle().inner().clone();
-    let found = rt_handle
-        .block_on(service.candidates(&query, on_screen))
-        .map_err(|e| e.to_string())?;
-    Ok(found.iter().map(LyricsChoiceView::from).collect())
+    crate::state::off_main(&state, move |state| {
+        let (query, _) = query_for(state, playlist, song)?;
+        let service = LyricsService::new();
+        let rt_handle = tauri::async_runtime::handle().inner().clone();
+        let found = rt_handle
+            .block_on(service.candidates(&query, on_screen))
+            .map_err(|e| e.to_string())?;
+        Ok(found.iter().map(LyricsChoiceView::from).collect())
+    })
+    .await
 }
 
 /// Records a manual choice and returns the chosen record's words.
@@ -139,35 +147,39 @@ pub fn get_lyrics_choices(
 /// that the choice outlives the session.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn choose_lyrics(
+pub async fn choose_lyrics(
     state: State<'_, AppState>,
     playlist: usize,
     song: usize,
     record_id: u64,
 ) -> Result<Option<LyricsView>, String> {
-    let (_, video_id) = query_for(&state, playlist, song)?;
+    crate::state::off_main(&state, move |state| {
+        let (_, video_id) = query_for(state, playlist, song)?;
 
-    let service = LyricsService::new();
-    let rt_handle = tauri::async_runtime::handle().inner().clone();
-    let found = rt_handle
-        .block_on(service.by_id(record_id))
-        .map_err(|e| e.to_string())?;
+        let service = LyricsService::new();
+        let rt_handle = tauri::async_runtime::handle().inner().clone();
+        let found = rt_handle
+            .block_on(service.by_id(record_id))
+            .map_err(|e| e.to_string())?;
 
-    if found.is_some() && !video_id.is_empty() {
-        // Snapshot under the lock, write outside it: the write is a rename
-        // over a temporary file, and holding the mutex across it would stall
-        // every other command that needs the overrides.
-        let snapshot = {
-            let mut overrides = state.lyrics_overrides.lock().map_err(|e| e.to_string())?;
-            overrides.set(&video_id, record_id);
-            overrides.clone()
-        };
-        if let Err(e) = persistence::save_lyrics_overrides(&snapshot) {
-            eprintln!("[gui] could not save the lyric choice: {e}");
+        if found.is_some() && !video_id.is_empty() {
+            // Snapshot under the lock, write outside it: the write is a rename
+            // over a temporary file, and holding the mutex across it would stall
+            // every other command that needs the overrides.
+            let _save = crate::state::SAVE_LOCK.lock().map_err(|e| e.to_string())?;
+            let snapshot = {
+                let mut overrides = state.lyrics_overrides.lock().map_err(|e| e.to_string())?;
+                overrides.set(&video_id, record_id);
+                overrides.clone()
+            };
+            if let Err(e) = persistence::save_lyrics_overrides(&snapshot) {
+                eprintln!("[gui] could not save the lyric choice: {e}");
+            }
         }
-    }
 
-    Ok(found.map(|record| view_of(record, true)))
+        Ok(found.map(|record| view_of(record, true)))
+    })
+    .await
 }
 
 /// Drops a manual choice, putting the track back on automatic matching.
@@ -175,6 +187,7 @@ pub fn choose_lyrics(
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
 pub fn clear_lyrics_override(state: State<'_, AppState>, playlist: usize, song: usize) -> Result<(), String> {
     let (_, video_id) = query_for(&state, playlist, song)?;
+    let _save = crate::state::SAVE_LOCK.lock().map_err(|e| e.to_string())?;
     let snapshot = {
         let mut overrides = state.lyrics_overrides.lock().map_err(|e| e.to_string())?;
         overrides.clear(&video_id);

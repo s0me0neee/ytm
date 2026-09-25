@@ -1,39 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Music2 } from "lucide-react";
-
-/** How long to wait before each re-ask, and by its length how many there are.
- * Short: a cover is wanted while the track it belongs to is on screen. */
-const RETRY_BACKOFF_MS = [300, 900];
-
-/** Whether a candidate is a guess that may legitimately not exist.
- *
- * Every rung of `hdLadder` is: those frames exist only for videos uploaded at
- * that size, so 404 is an ordinary answer and re-asking would only delay the
- * rung below. Measured over the library, 5% of videos have no `maxresdefault`
- * at all.
- *
- * Everything else is either the URL the API advertised or a size rewrite of
- * it, which the CDN serves at any size up to 1400 -- 157 of 157 art tracks
- * came back at full size, so a failure there is something that went wrong on
- * the way rather than a picture that isn't there. Settling for a smaller one
- * over that is how a track ends up showing a 120px thumbnail stretched across
- * a 352px box for the rest of the session. */
-function isGuess(url: string): boolean {
-  return /\/(maxres|sd|hq|mq)default\.jpg$/.test(url);
-}
-
-/** The same URL, marked so a retry can't be answered out of the cache.
- *
- * A network failure isn't cached and a remount alone would re-request, but
- * the failure this exists for is the other one -- a 200 whose body didn't
- * decode, which is cacheable and which a plain remount would be served again
- * byte for byte. Only ever appended to a URL that has no query string of its
- * own, so a signed one (`?sqp=`) can't be disturbed by it; measured
- * byte-identical on i.ytimg.com. A CDN that rejected the extra parameter
- * would fail this attempt and fall through exactly as it does today. */
-function bust(url: string, attempt: number): string {
-  return attempt === 0 || url.includes("?") ? url : `${url}?ytmretry=${attempt}`;
-}
+import { viaBackend } from "./cover";
 
 interface ThumbnailProps {
   srcs: (string | null | undefined)[];
@@ -66,35 +33,16 @@ interface ThumbnailProps {
  * `error` the way a 404 does, so `error` alone left that glyph stuck on
  * screen instead of falling through to the next candidate. */
 export function Thumbnail({ srcs, alt = "", className, onAspect }: ThumbnailProps) {
-  const candidates = srcs.filter((s): s is string => Boolean(s));
+  const candidates = srcs.filter((s): s is string => Boolean(s)).map(viaBackend);
   const key = candidates.join("|");
   const [idx, setIdx] = useState(0);
-  const [attempt, setAttempt] = useState(0);
-  const timer = useRef<number | undefined>(undefined);
 
   useEffect(() => {
     setIdx(0);
-    setAttempt(0);
   }, [key]);
 
-  // A pending retry outlives the element it was scheduled for otherwise --
-  // a list row scrolled away, or a track changed mid-backoff.
-  useEffect(() => () => window.clearTimeout(timer.current), []);
-
-  /* One candidate is exhausted only once it has been asked for and re-asked.
-     Advancing on the first failure is what silently trades quality for
-     whatever happened to the network a second ago. */
-  const failed = useCallback(() => {
-    const url = candidates[idx];
-    if (url && !isGuess(url) && attempt < RETRY_BACKOFF_MS.length) {
-      const wait = RETRY_BACKOFF_MS[attempt];
-      window.clearTimeout(timer.current);
-      timer.current = window.setTimeout(() => setAttempt((a) => a + 1), wait);
-    } else {
-      setIdx((i) => i + 1);
-      setAttempt(0);
-    }
-  }, [candidates, idx, attempt]);
+  // Final: the backend already retried whatever could succeed on a second ask.
+  const failed = () => setIdx((i) => i + 1);
 
   if (idx >= candidates.length) {
     return (
@@ -108,10 +56,9 @@ export function Thumbnail({ srcs, alt = "", className, onAspect }: ThumbnailProp
   }
 
   /* The smallest candidate, shown underneath while a better one is being
-     fetched -- and, more to the point, while it is being *re*-fetched. The
-     retries above are worth having but they take a second and a half to run
-     out, and an empty square for a second and a half is a worse answer than
-     a soft picture immediately. It is the URL the API advertised, ~15KB and
+     fetched -- and, more to the point, while the backend is re-asking for it,
+     which under a rate limit takes seconds. An empty square for that long is a
+     worse answer than a soft picture immediately. It is the URL the API advertised, ~15KB and
      already in the fallback chain, so this costs one small request and never
      a second one for a row (where there is only ever one candidate).
 
@@ -137,11 +84,8 @@ export function Thumbnail({ srcs, alt = "", className, onAspect }: ThumbnailProp
         />
       )}
       <img
-        /* `attempt` is in the key so a retry remounts the element and the
-           request actually goes out again, rather than React seeing the same
-           `src` and leaving the failed image where it is. */
-        key={`${candidates[idx]}#${attempt}`}
-        src={bust(candidates[idx], attempt)}
+        key={candidates[idx]}
+        src={candidates[idx]}
         alt={alt}
         /* A playlist row's cover is one of hundreds on screen at once. `lazy`
          * keeps the ones scrolled out of view from being fetched at all, and

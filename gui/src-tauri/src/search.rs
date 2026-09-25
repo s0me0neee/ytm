@@ -1,3 +1,5 @@
+// tauri::command's macro expansion emits an unreachable!() on async fns, which the workspace lints deny by default.
+#![allow(clippy::unreachable)]
 use tauri::State;
 use ytm_core::search as core_search;
 use ytm_core::{SearchResult, YTMusicClient};
@@ -15,41 +17,50 @@ fn client(state: &AppState) -> Result<std::sync::Arc<YTMusicClient>, String> {
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn search(state: State<'_, AppState>, query: String) -> Result<Vec<SearchResult>, String> {
-    let yt = client(&state)?;
-    let rt_handle = tauri::async_runtime::handle().inner().clone();
-    rt_handle.block_on(core_search::search(&yt, &query)).map_err(|e| e.to_string())
+pub async fn search(state: State<'_, AppState>, query: String) -> Result<Vec<SearchResult>, String> {
+    crate::state::off_main(&state, move |state| {
+        let yt = client(state)?;
+        let rt_handle = tauri::async_runtime::handle().inner().clone();
+        rt_handle.block_on(core_search::search(&yt, &query)).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn add_to_playlist(state: State<'_, AppState>, playlist_id: String, video_id: String) -> Result<(), String> {
-    let yt = client(&state)?;
-    let rt_handle = tauri::async_runtime::handle().inner().clone();
-    rt_handle
-        .block_on(core_search::add_to_playlist(&yt, &playlist_id, &video_id))
-        .map_err(|e| e.to_string())?;
+pub async fn add_to_playlist(state: State<'_, AppState>, playlist_id: String, video_id: String) -> Result<(), String> {
+    crate::state::off_main(&state, move |state| {
+        let yt = client(state)?;
+        let rt_handle = tauri::async_runtime::handle().inner().clone();
+        rt_handle
+            .block_on(core_search::add_to_playlist(&yt, &playlist_id, &video_id))
+            .map_err(|e| e.to_string())?;
 
-    // Refetch, so the track is playable in the session that added it rather
-    // than at the next start. The refetch is also what makes the queue-remap
-    // in `follow_tracks` necessary -- see `refresh_after_edit`.
-    let index = state
-        .library
-        .lock()
-        .map_err(|e| e.to_string())?
-        .find_playlist_index(&playlist_id);
-    if let Some(index) = index {
-        crate::library::refresh_after_edit(&state, index)?;
-    }
-    Ok(())
+        // Refetch, so the track is playable in the session that added it rather
+        // than at the next start. The refetch is also what makes the queue-remap
+        // in `follow_tracks` necessary -- see `refresh_after_edit`.
+        let index = state
+            .library
+            .lock()
+            .map_err(|e| e.to_string())?
+            .find_playlist_index(&playlist_id);
+        if let Some(index) = index {
+            crate::library::refresh_after_edit(state, index)?;
+        }
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn like_track(state: State<'_, AppState>, video_id: String) -> Result<(), String> {
-    let yt = client(&state)?;
-    let rt_handle = tauri::async_runtime::handle().inner().clone();
-    rt_handle.block_on(core_search::like(&yt, &video_id)).map_err(|e| e.to_string())
+pub async fn like_track(state: State<'_, AppState>, video_id: String) -> Result<(), String> {
+    crate::state::off_main(&state, move |state| {
+        let yt = client(state)?;
+        let rt_handle = tauri::async_runtime::handle().inner().clone();
+        rt_handle.block_on(core_search::like(&yt, &video_id)).map_err(|e| e.to_string())
+    })
+    .await
 }
 
 /// Queues `result` without playing it -- "Play Next" (`next`) or "Play Last".

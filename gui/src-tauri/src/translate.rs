@@ -1,3 +1,5 @@
+// tauri::command's macro expansion emits an unreachable!() on async fns, which the workspace lints deny by default.
+#![allow(clippy::unreachable)]
 use serde::Serialize;
 use tauri::State;
 use ytm_core::persistence;
@@ -49,45 +51,49 @@ pub struct TranslationView {
 /// leaves the paid translation where it was.
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn translate_lyrics(
+pub async fn translate_lyrics(
     state: State<'_, AppState>,
     record_id: u64,
     lines: Vec<String>,
     use_ai: bool,
     force: bool,
 ) -> Result<TranslationView, String> {
-    let backend = state.config.lyrics.backend(use_ai);
-    if backend.to.is_empty() {
-        return Err("no translation language is configured".to_string());
-    }
-
-    if use_ai && !force {
-        let cached = state
-            .translations
-            .lock()
-            .map_err(|e| e.to_string())?
-            .get(record_id, &backend.to)
-            .map(<[String]>::to_vec);
-        if let Some(lines) = cached {
-            return Ok(TranslationView { lines, model: String::new() });
+    crate::state::off_main(&state, move |state| {
+        let backend = state.config.lyrics.backend(use_ai);
+        if backend.to.is_empty() {
+            return Err("no translation language is configured".to_string());
         }
-    }
 
-    let rt_handle = tauri::async_runtime::handle().inner().clone();
-    let done = rt_handle.block_on(translate::translate_lines(&lines, &backend))?;
-
-    if !done.model.is_empty() {
-        // Snapshot under the lock, write outside it -- same reasoning as
-        // `lyrics::choose_lyrics`.
-        let snapshot = {
-            let mut saved = state.translations.lock().map_err(|e| e.to_string())?;
-            saved.set(record_id, &backend.to, &done.model, done.lines.clone());
-            saved.clone()
-        };
-        if let Err(e) = persistence::save_translations(&snapshot) {
-            eprintln!("[gui] could not save the translation: {e}");
+        if use_ai && !force {
+            let cached = state
+                .translations
+                .lock()
+                .map_err(|e| e.to_string())?
+                .get(record_id, &backend.to)
+                .map(<[String]>::to_vec);
+            if let Some(lines) = cached {
+                return Ok(TranslationView { lines, model: String::new() });
+            }
         }
-    }
 
-    Ok(TranslationView { lines: done.lines, model: done.model })
+        let rt_handle = tauri::async_runtime::handle().inner().clone();
+        let done = rt_handle.block_on(translate::translate_lines(&lines, &backend))?;
+
+        if !done.model.is_empty() {
+            // Snapshot under the lock, write outside it -- same reasoning as
+            // `lyrics::choose_lyrics`.
+            let _save = crate::state::SAVE_LOCK.lock().map_err(|e| e.to_string())?;
+            let snapshot = {
+                let mut saved = state.translations.lock().map_err(|e| e.to_string())?;
+                saved.set(record_id, &backend.to, &done.model, done.lines.clone());
+                saved.clone()
+            };
+            if let Err(e) = persistence::save_translations(&snapshot) {
+                eprintln!("[gui] could not save the translation: {e}");
+            }
+        }
+
+        Ok(TranslationView { lines: done.lines, model: done.model })
+    })
+    .await
 }

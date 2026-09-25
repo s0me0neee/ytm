@@ -1,4 +1,5 @@
 mod auth;
+mod cover;
 mod history;
 mod library;
 mod lyrics;
@@ -57,6 +58,9 @@ fn init_logging() {
 pub fn run() -> tauri::Result<()> {
     init_logging();
     tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("cover", |_ctx, request, responder| {
+            cover::handle(&request, responder);
+        })
         .setup(|app| {
             let session = ytm_core::Session::new()?;
             let rt_handle = tauri::async_runtime::handle().inner().clone();

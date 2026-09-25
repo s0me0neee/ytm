@@ -76,3 +76,17 @@ pub struct AppState {
     /// their own library fetch and race to overwrite `library`/`client`.
     pub bootstrapping: Arc<AtomicBool>,
 }
+
+// Network-bound command bodies: a sync command blocks the main thread, and with it all input.
+pub async fn off_main<T: Send + 'static>(
+    state: &AppState,
+    body: impl FnOnce(&AppState) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let state = state.clone();
+    tauri::async_runtime::spawn_blocking(move || body(&state))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+// Held from snapshot to rename, so concurrent saves land in the order they were taken.
+pub static SAVE_LOCK: Mutex<()> = Mutex::new(());

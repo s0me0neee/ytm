@@ -491,13 +491,9 @@ tools/           not a member and not shipped — see `macos-check` above
   therefore means something went wrong on the way — a reset, a 5xx, a body truncated under
   load — rather than that the picture isn't there. `hd_variant`'s `maxresdefault.jpg` gets
   one attempt only, since 404 is its ordinary answer and re-asking would just delay the
-  fallback that was always coming. The GUI's `Thumbnail` applies the same split, keyed on the
-  URL rather than on position (`isGuess`), and its stakes are higher: its next candidate is
-  the *raw* 120px thumbnail, so one unlucky request used to leave a track showing that
-  stretched across a 352px box for the rest of the session. It also cache-busts each retry,
-  since the failure a plain remount cannot fix is the cacheable one — a 200 whose body didn't
-  decode — and it appends the parameter only to URLs with no query string of their own, so a
-  signed `?sqp=` URL can't be disturbed by it.
+  fallback that was always coming. The GUI applies the same split in `gui/src-tauri/src/cover.rs`
+  (see `gui/` below): a 429, a 5xx or a dropped connection is re-asked, a 404 goes straight back
+  to the webview so `Thumbnail` steps down to its next candidate.
 
   `Cover::filling` is the last step before
   the terminal, giving the image the box's exact shape so the terminal's own fill has
@@ -778,6 +774,24 @@ metadata fetch keyed on the queue entry *and* the video mpv has open, because ei
 without the other; on `track` alone the player bar read "Nothing playing" over a queue that had
 just been restored.
 
+`cover.rs` is why the webview never fetches artwork itself. Every cover URL is handed to
+`convertFileSrc(url, "cover")` and served by a `cover://` scheme from `ytm_core::cover::fetch_raw`
+— the TUI's client — at most `MAX_IN_FLIGHT` (6) at a time, with a small in-memory cache. Left to
+itself WebKitGTK fired a request per row the moment a playlist opened (`loading="lazy"` measured as
+deferring nothing), ~170 at once, and Google's image CDN answered with **429** for minutes after
+while curl from the same machine was served; the TUI never tripped it because it fetches one at a
+time. Only `https` URLs on the artwork hosts are fetched, so the scheme is not a proxy the page can
+point anywhere. A 404 from `i.ytimg.com` carries a valid 120×90 grey JPEG body that an `img` would
+happily decode — passing the status through as a real 404 is what lets the size ladder step down.
+
+Commands that wait on the network — search, like, add-to-playlist, the three lyrics commands and
+translation — are `async` and run their body through `state::off_main` (`spawn_blocking`). A sync
+`#[tauri::command]` runs on the main thread, which on Linux also delivers every input event to the
+webview, so a lyrics lookup there froze the whole window for the ~2s lrclib took on every track
+change. `spawn_blocking` rather than `.await` for the reason `library::bootstrap` gives. A command
+module with async commands needs the `#![allow(clippy::unreachable)]` `auth.rs` has, since
+`tauri::command`'s async expansion emits one.
+
 `media.rs` drives `ytm_core::media` with `Host::Windowed`. Two differences from the TUI and no
 `cfg` for either. There is no tick to drain on, so commands arrive by `media::queued()` and
 `spawn_listener` waits on it; and the handle is `!Send` on macOS and belongs to the main thread,
@@ -824,6 +838,15 @@ at this size `object-cover`ing one into the other shows a strip out of the middl
 artwork rather than the artwork. `maxHeight` on the same box keeps a square cover from pushing
 the transport off a short window, and because a ratio is set, clamping the height narrows the
 width to match rather than distorting it.
+
+The lyric sheet runs on its own clock (`useActiveLyric`): `elapsed` arrives only every 250ms, so
+lines lit late and a clicked line waited for the next tick. Between ticks the position is
+extrapolated from wall time and a render is scheduled for the next line's timestamp, not every
+frame; a click moves the highlight at once and ignores pre-seek ticks for a second. The seek bars
+send one `seek_to` on release (`Slider`'s `onCommit`) — a seek per pointer-move had mpv play a
+sliver from each position, which sounded like the wrong speed. The window-sized background blur
+carries `will-change-transform`: without its own layer WebKitGTK re-ran the blur on every seek-bar
+tick, 170ms frames during playback.
 
 The window's own title bar is hidden on the two platforms that have been looked at, and
 each gets there differently. macOS keeps its decorations and hides the bar with

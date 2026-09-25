@@ -97,19 +97,25 @@ pub fn observe(app: &AppHandle, state: &AppState, playing_video: Option<&str>) {
         let Ok(mut history) = state.history.lock() else {
             return;
         };
-        history.note_track(track, playlist_id).then(|| history.clone())
+        history.note_track(track, playlist_id)
     };
     if let Ok(mut last) = state.last_noted.lock() {
         *last = Some(video_id.to_string());
     }
-    let Some(snapshot) = kept else { return };
+    if !kept {
+        return;
+    }
 
     let _ = app.emit("history-changed", ());
     // Off the caller's thread: this is reached from the ticker and from every
     // command that starts a song, and neither should wait on a file write.
     // Written per song rather than at exit, because a history that a crash can
     // erase is one nobody trusts -- and a song is three minutes, not a frame.
+    let history = std::sync::Arc::clone(&state.history);
     tauri::async_runtime::spawn_blocking(move || {
+        // Re-read under the save lock: two of these can run out of order.
+        let Ok(_save) = crate::state::SAVE_LOCK.lock() else { return };
+        let Some(snapshot) = history.lock().ok().map(|h| h.clone()) else { return };
         if let Err(e) = persistence::save_history(&snapshot) {
             log::warn!("failed to save history: {e}");
         }

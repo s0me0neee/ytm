@@ -7967,8 +7967,8 @@ name = "ytm-gui"
 version = "1.1.2"
 dependencies = [
  "log",
+ "percent-encoding",
  "serde",
- "serde_json",
  "simplelog",
  "tauri",
  "tauri-build",

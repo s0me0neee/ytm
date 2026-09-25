@@ -80,11 +80,14 @@ fn restrict(path: &Path, mode: u32) {
 /// contents or the new ones and never a prefix of either.
 pub fn write_private(path: &Path, contents: &str) -> Result<()> {
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    // Unique per call: two threads saving the same file must not share a temporary.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id()));
 
-    // `create_new` after removing our own leftover: it fails rather than
-    // follows if anything is at that path, and it is what makes `mode` below
-    // describe the file we actually write to.
+    // `create_new` after removing a leftover (a crashed run with a reused pid):
+    // it fails rather than follows if anything is at that path, and it is what
+    // makes `mode` below describe the file we actually write to.
     std::fs::remove_file(&tmp).ok();
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);

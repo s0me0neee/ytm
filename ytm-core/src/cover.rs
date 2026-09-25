@@ -406,10 +406,30 @@ async fn fetch_insisting(url: &str) -> Result<Cover, String> {
 /// itself — and should do it through the same client and the same ceiling as
 /// everything else here rather than growing its own.
 pub(crate) async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let client = client().ok_or("no HTTP client")?;
-    let mut response = client.get(url).send().await.map_err(|e| e.to_string())?;
+    fetch_raw(url).await.map_err(|e| match e {
+        FetchError::Status(code) => code.to_string(),
+        FetchError::Other(msg) => msg,
+    })
+}
+
+/// Why [`fetch_raw`] came back empty-handed.
+#[derive(Debug)]
+pub enum FetchError {
+    /// The CDN answered, with this non-success status.
+    Status(u16),
+    /// It never answered usefully: no client, a reset, a timeout, a body over the cap.
+    Other(String),
+}
+
+/// [`fetch_bytes`] with the CDN's status kept, for a caller that has to tell a
+/// 404 (the frame doesn't exist) from a 429 (ask again later) — the GUI's
+/// `cover://` scheme, which hands both on to a webview that treats them apart.
+pub async fn fetch_raw(url: &str) -> Result<Vec<u8>, FetchError> {
+    let other = |e: String| FetchError::Other(e);
+    let client = client().ok_or_else(|| other("no HTTP client".into()))?;
+    let mut response = client.get(url).send().await.map_err(|e| other(e.to_string()))?;
     if !response.status().is_success() {
-        return Err(format!("{}", response.status()));
+        return Err(FetchError::Status(response.status().as_u16()));
     }
     // Read in chunks against a ceiling rather than with `bytes()`, which takes
     // whatever the far end sends. A header claiming more than the cap is
@@ -418,12 +438,12 @@ pub(crate) async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
         .content_length()
         .is_some_and(|n| n > MAX_BYTES as u64)
     {
-        return Err(format!("cover is larger than {MAX_BYTES} bytes"));
+        return Err(other(format!("cover is larger than {MAX_BYTES} bytes")));
     }
     let mut bytes: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+    while let Some(chunk) = response.chunk().await.map_err(|e| other(e.to_string()))? {
         if bytes.len() + chunk.len() > MAX_BYTES {
-            return Err(format!("cover is larger than {MAX_BYTES} bytes"));
+            return Err(other(format!("cover is larger than {MAX_BYTES} bytes")));
         }
         bytes.extend_from_slice(&chunk);
     }

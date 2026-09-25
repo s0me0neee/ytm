@@ -7,14 +7,12 @@
    -- nothing looked like it was *above* anything else. */
 @theme {
   --color-bg: #0b0b0d;
-  --color-bg-2: #121215;
 
   /* Surfaces are white at low alpha, never opaque fills, so a surface always
      reads as the canvas plus light rather than as a different-coloured slab.
      Stacking two of them (row inside a panel) therefore reads as depth. */
   --color-surface: rgba(255, 255, 255, 0.05);
   --color-surface-2: rgba(255, 255, 255, 0.08);
-  --color-surface-3: rgba(255, 255, 255, 0.12);
 
   /* Text is one colour at four opacities, the way Apple's label ladder works:
      contrast then adapts to whatever it sits on instead of being a fixed hex
@@ -342,7 +340,7 @@ body {
 
      - the line being sung is near-opaque white, unblurred, and 5% larger;
      - lines still to come sit at 40% white behind a 1px blur;
-     - lines already sung fade out completely.
+     - lines already sung dim further, but stay readable.
 
    The blur is the part that is easy to leave out and does most of the work.
    Without it an inactive line is merely dimmer, and dimmer text is still text
@@ -350,9 +348,8 @@ body {
    of words rather than as one line held in focus. Blurring puts the rest of
    the sheet behind the plane the current line is on.
 
-   Fading a sung line to nothing is the other half, and is what keeps the
-   panel from silting up: past the first chorus, everything above the current
-   line is text nobody is going to read again. */
+   Sung lines stay faintly on screen rather than fading to nothing, so the
+   line just sung can still be glanced back at -- and clicked. */
 .lyric-line {
   transform: scale(1);
   color: rgba(255, 255, 255, 0.4);
@@ -369,19 +366,10 @@ body {
 }
 
 .lyric-line.is-past {
-  opacity: 0;
-  /* The one asymmetric duration. A full second is slow enough that a sung
-     line reads as receding rather than as being switched off -- but the same
-     second spent fading back *in* after a backward seek would be a second of
-     blank panel. A transition's duration is read off the state being moved
-     to, so putting the slow one only here gets the fade-out without paying
-     for it in the other direction. */
+  opacity: 0.5;
+  /* Slow out, fast back in: a transition's duration is read off the state
+     being moved to, so a backward seek doesn't wait a second for its lines. */
   transition-duration: 0.1s, 1s, 0.1s, 0.25s;
-  /* A sung line is transparent, and a transparent thing that can still be
-     clicked is a trap: the sheet would carry a stack of invisible seek
-     targets over the words being read. Restored while browsing, which is the
-     state that brings those lines back to be clicked. */
-  pointer-events: none;
 }
 
 /* While the user is scrolling by hand the sheet is being read rather than
