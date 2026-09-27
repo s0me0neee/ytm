@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Music2 } from "lucide-react";
 import { viaBackend } from "./cover";
 
@@ -19,6 +19,49 @@ interface ThumbnailProps {
   onAspect?: (ratio: number) => void;
 }
 
+/* Whether a thumbnail is near enough to the screen to be worth fetching.
+
+   `loading="lazy"` was meant to do this and measurably does nothing in
+   WebKitGTK: opening a playlist fired a request per row, ~170 at once, which
+   is the burst the CDN answers with 429 -- and every one of them queued in
+   front of the cover actually being looked at. So the `src` is withheld until
+   the row is close, and a playlist opens with the twenty-odd requests the
+   screen can show.
+
+   One observer for every thumbnail rather than one each: a playlist mounts
+   hundreds of rows, and an observer per row is a native object and a set of
+   intersection computations per row. `scrollMargin` is what reaches the rows
+   just past the edge of the scrolling column -- `rootMargin` only grows the
+   viewport, and each column is its own scroll container that clips first. An
+   engine that doesn't know it ignores it, and rows then load as they enter. */
+const nearWatchers = new Map<Element, () => void>();
+let nearObserver: IntersectionObserver | null = null;
+
+function watchNear(el: Element, onNear: () => void): () => void {
+  if (typeof IntersectionObserver === "undefined") {
+    onNear();
+    return () => {};
+  }
+  nearObserver ??= new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const cb = nearWatchers.get(entry.target);
+        nearWatchers.delete(entry.target);
+        nearObserver?.unobserve(entry.target);
+        cb?.();
+      }
+    },
+    { rootMargin: "400px", scrollMargin: "400px" } as IntersectionObserverInit,
+  );
+  nearWatchers.set(el, onNear);
+  nearObserver.observe(el);
+  return () => {
+    nearWatchers.delete(el);
+    nearObserver?.unobserve(el);
+  };
+}
+
 /** Tries each candidate URL in order, falling back on load failure, and
  * finally to a quiet note-icon placeholder if every one 404s. The fade-in is
  * a plain CSS animation keyed to mount, not gated on the `load` event -- for
@@ -36,13 +79,29 @@ export function Thumbnail({ srcs, alt = "", className, onAspect }: ThumbnailProp
   const candidates = srcs.filter((s): s is string => Boolean(s)).map(viaBackend);
   const key = candidates.join("|");
   const [idx, setIdx] = useState(0);
+  // Latched: once a row has been near the screen its cover stays wanted, so
+  // scrolling back past it never re-requests or blanks it.
+  const [near, setNear] = useState(false);
+  const box = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     setIdx(0);
   }, [key]);
 
+  // `key` too: a thumbnail that mounts with nothing to show (the player bar
+  // before a track is known) renders no box to watch, so the watch has to
+  // start when candidates arrive rather than only on mount.
+  useEffect(() => {
+    if (near || !box.current) return;
+    return watchNear(box.current, () => setNear(true));
+  }, [near, key]);
+
   // Final: the backend already retried whatever could succeed on a second ask.
   const failed = () => setIdx((i) => i + 1);
+
+  if (!near && candidates.length > 0) {
+    return <div ref={box} className={`${className} bg-surface-2`} aria-hidden />;
+  }
 
   if (idx >= candidates.length) {
     return (

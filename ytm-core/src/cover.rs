@@ -408,6 +408,7 @@ async fn fetch_insisting(url: &str) -> Result<Cover, String> {
 pub(crate) async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
     fetch_raw(url).await.map_err(|e| match e {
         FetchError::Status(code) => code.to_string(),
+        FetchError::RateLimited(_) => "429".to_string(),
         FetchError::Other(msg) => msg,
     })
 }
@@ -415,10 +416,29 @@ pub(crate) async fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
 /// Why [`fetch_raw`] came back empty-handed.
 #[derive(Debug)]
 pub enum FetchError {
-    /// The CDN answered, with this non-success status.
+    /// The CDN answered, with this non-success status. Never 429, which is
+    /// [`FetchError::RateLimited`].
     Status(u16),
+    /// A 429, with how long the CDN asked us to wait when it said. Kept apart
+    /// from `Status` because the right response is not per-request: every
+    /// fetch to that host should hold off, not just the one that was told.
+    RateLimited(Option<std::time::Duration>),
     /// It never answered usefully: no client, a reset, a timeout, a body over the cap.
     Other(String),
+}
+
+/// `Retry-After` in its delay-seconds form. The HTTP-date form is not worth a
+/// date parser here: Google's image CDN has only ever been seen sending
+/// seconds, and a missing answer just means the caller's own backoff decides.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let secs: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(std::time::Duration::from_secs(secs))
 }
 
 /// [`fetch_bytes`] with the CDN's status kept, for a caller that has to tell a
@@ -428,6 +448,9 @@ pub async fn fetch_raw(url: &str) -> Result<Vec<u8>, FetchError> {
     let other = |e: String| FetchError::Other(e);
     let client = client().ok_or_else(|| other("no HTTP client".into()))?;
     let mut response = client.get(url).send().await.map_err(|e| other(e.to_string()))?;
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Err(FetchError::RateLimited(retry_after(response.headers())));
+    }
     if !response.status().is_success() {
         return Err(FetchError::Status(response.status().as_u16()));
     }
@@ -453,6 +476,19 @@ pub async fn fetch_raw(url: &str) -> Result<Vec<u8>, FetchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_is_read_in_seconds_and_ignored_otherwise() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let with = |v: &'static str| {
+            let mut h = HeaderMap::new();
+            h.insert(RETRY_AFTER, HeaderValue::from_static(v));
+            h
+        };
+        assert_eq!(retry_after(&with("7")), Some(std::time::Duration::from_secs(7)));
+        assert_eq!(retry_after(&with("Wed, 21 Oct 2026 07:28:00 GMT")), None);
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
 
     #[test]
     fn a_bigger_copy_is_asked_for_by_rewriting_the_size() {

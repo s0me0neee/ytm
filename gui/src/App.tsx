@@ -31,7 +31,7 @@ import { ContextMenu } from "./ContextMenu";
 import type { MenuItem, MenuState } from "./ContextMenu";
 import { QueuePanel } from "./QueuePanel";
 import type { QueueEntry } from "./QueuePanel";
-import { bestCoverUrl, coverCandidates } from "./cover";
+import { backdropUrl, coverCandidates } from "./cover";
 import "./App.css";
 
 interface PlaylistView {
@@ -2594,7 +2594,7 @@ function NowPlayingView({
             exit={{ opacity: 0 }}
             transition={{ duration: 0.5 }}
             className="absolute inset-0 scale-125 bg-cover bg-center blur-3xl saturate-[1.7] brightness-110 will-change-transform"
-            style={{ backgroundImage: `url(${bestCoverUrl(currentTrack.thumbnail, 200)})` }}
+            style={{ backgroundImage: `url(${backdropUrl(currentTrack.thumbnail)})` }}
           />
         ) : (
           <motion.div
@@ -2685,7 +2685,7 @@ function NowPlayingView({
                   <div
                     aria-hidden
                     className="pointer-events-none absolute inset-0 scale-[1.04] rounded-2xl bg-cover bg-center opacity-40 blur-[20px] saturate-[2]"
-                    style={{ backgroundImage: `url(${bestCoverUrl(currentTrack.thumbnail, 200)})` }}
+                    style={{ backgroundImage: `url(${backdropUrl(currentTrack.thumbnail)})` }}
                   />
                 )}
                 <Thumbnail

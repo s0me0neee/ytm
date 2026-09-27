@@ -800,6 +800,21 @@ time. Only `https` URLs on the artwork hosts are fetched, so the scheme is not a
 point anywhere. A 404 from `i.ytimg.com` carries a valid 120×90 grey JPEG body that an `img` would
 happily decode — passing the status through as a real 404 is what lets the size ladder step down.
 
+Under a rate limit the scheme does three things, because an `img` sees any failure as "this
+picture doesn't exist" and steps down to the small copy for good. **Two lanes**
+(`ROW_PERMITS`/`LARGE_PERMITS`, split by `is_large` on the URL's size), so the cover being
+looked at never queues behind a playlist's row thumbnails. **One shared `Gate`**: a 429 —
+`FetchError::RateLimited`, carrying `Retry-After` when the CDN sends one — pauses *every*
+fetch, doubling per 429 in a row up to 30s, and while recovering requests go one at a time
+until one succeeds, so the queue doesn't stampede back into the limit. **More patience for
+large covers** (6 attempts against 3), since the webview shows the small copy underneath
+while one waits. The cache is bounded by bytes (48MB), not entries. On the frontend,
+`Thumbnail` withholds `src` until the row is near the screen (one shared
+`IntersectionObserver`, since `loading="lazy"` defers nothing in WebKitGTK) — a 170-track
+playlist opens with ~24 requests, not 170 — `hdLadder` stops at the smallest frame that covers
+the size asked for, and the blurred backdrops use the advertised URL (`backdropUrl`), which
+always exists and is already cached.
+
 Commands that wait on the network — search, like, add-to-playlist, the three lyrics commands and
 translation — are `async` and run their body through `state::off_main` (`spawn_blocking`). A sync
 `#[tauri::command]` runs on the main thread, which on Linux also delivers every input event to the
