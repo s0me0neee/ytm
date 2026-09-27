@@ -412,6 +412,19 @@ pub struct QueueEntryView {
     pub current: bool,
 }
 
+/// The track after the one playing, for the "up next" line.
+///
+/// Asked for by the frontend when `queue_revision` or `queue_position` moves,
+/// like `get_queue`, rather than carried on every tick's snapshot.
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
+pub fn get_up_next(state: State<'_, AppState>) -> Option<Track> {
+    let library = state.library.lock().ok()?;
+    let next = state.player.lock().ok()?.upcoming(1).first().copied();
+    let (pl, song) = next?;
+    library.track(pl, song).cloned()
+}
+
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
 pub fn get_queue(state: State<'_, AppState>) -> Vec<QueueEntryView> {

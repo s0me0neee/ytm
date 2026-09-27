@@ -355,25 +355,7 @@ impl Library {
     /// track already filed keeps its place, so replaying one from a later
     /// search doesn't accumulate copies.
     pub fn place_search_result(&mut self, track: Track) -> (usize, usize) {
-        let pl_idx = match self.find_playlist_index(Self::SEARCH_PLAYLIST_ID) {
-            Some(idx) => idx,
-            None => {
-                self.entries.push(PlaylistEntry {
-                    playlist: Playlist {
-                        playlist_id: Self::SEARCH_PLAYLIST_ID.to_string(),
-                        title: "Search".to_string(),
-                        count: None,
-                    },
-                    songs: Vec::new(),
-                    // Nothing is ever fetched for it, so it is born finished.
-                    loaded: true,
-                    failed: false,
-                    total_duration_secs: 0,
-                });
-                self.entries.len() - 1
-            }
-        };
-
+        let pl_idx = self.search_playlist_index();
         let entry = &mut self.entries[pl_idx];
         if let Some(video_id) = track.video_id.as_deref()
             && let Some(song_idx) = entry
@@ -386,6 +368,59 @@ impl Library {
         entry.total_duration_secs += u64::from(track.duration_seconds.unwrap_or(0));
         entry.songs.push(track);
         (pl_idx, entry.songs.len() - 1)
+    }
+
+    /// [`Library::place_search_result`] for a batch — a radio page, most
+    /// likely — answering one position per track, in order.
+    ///
+    /// One pass to index what is already filed rather than a scan per track,
+    /// since a station arrives twenty-odd at a time into a playlist that may
+    /// already hold [`crate::player::MAX_SEARCH_TRACKS`].
+    pub fn place_off_library(&mut self, tracks: Vec<Track>) -> Vec<(usize, usize)> {
+        let pl_idx = self.search_playlist_index();
+        let entry = &mut self.entries[pl_idx];
+        let mut filed: std::collections::HashMap<String, usize> = entry
+            .songs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| Some((t.video_id.clone()?, i)))
+            .collect();
+        tracks
+            .into_iter()
+            .map(|track| {
+                if let Some(&at) = track.video_id.as_ref().and_then(|id| filed.get(id)) {
+                    return (pl_idx, at);
+                }
+                let at = entry.songs.len();
+                if let Some(id) = track.video_id.clone() {
+                    filed.insert(id, at);
+                }
+                entry.total_duration_secs += u64::from(track.duration_seconds.unwrap_or(0));
+                entry.songs.push(track);
+                (pl_idx, at)
+            })
+            .collect()
+    }
+
+    /// Where the search playlist is, creating it the first time anything is
+    /// filed there.
+    fn search_playlist_index(&mut self) -> usize {
+        if let Some(idx) = self.find_playlist_index(Self::SEARCH_PLAYLIST_ID) {
+            return idx;
+        }
+        self.entries.push(PlaylistEntry {
+            playlist: Playlist {
+                playlist_id: Self::SEARCH_PLAYLIST_ID.to_string(),
+                title: "Search".to_string(),
+                count: None,
+            },
+            songs: Vec::new(),
+            // Nothing is ever fetched for it, so it is born finished.
+            loaded: true,
+            failed: false,
+            total_duration_secs: 0,
+        });
+        self.entries.len() - 1
     }
 
     /// Empties the search playlist, keeping the playlist itself.
@@ -452,6 +487,18 @@ mod tests {
             duration_seconds: Some(100),
             thumbnail: None,
         }
+    }
+
+    #[test]
+    fn a_batch_is_filed_once_each_and_answers_in_order() {
+        let mut lib = library();
+        let (pl, first) = lib.place_search_result(track("aaa"));
+        let placed =
+            lib.place_off_library(vec![track("bbb"), track("aaa"), track("bbb"), track("ccc")]);
+        assert_eq!(placed, [(pl, 1), (pl, first), (pl, 1), (pl, 2)]);
+        assert_eq!(lib.songs(pl).len(), 3);
+        assert_eq!(lib.total_duration_secs(pl), 300);
+        assert!(lib.is_search_playlist(pl));
     }
 
     #[test]

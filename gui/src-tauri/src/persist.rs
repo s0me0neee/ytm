@@ -79,22 +79,7 @@ pub fn save(state: &AppState) {
         return;
     };
 
-    let built = persistence::build_queue_state(&library, player.queue(), player.queue_position());
-    // `None` has two causes and they want opposite things. An *empty* queue is
-    // the user having cleared it, and must overwrite the file or the next
-    // launch restores what they cleared — the GUI has a "clear queue" button
-    // where the TUI has no way to empty a queue at all, so this case is new
-    // here. `None` from a queue that is *not* empty means nothing in it
-    // resolved to a video id, which is what a quit during loading looks like,
-    // and the right answer to that is to leave the saved queue alone.
-    let state_to_save = match built {
-        Some(built) => Some(built),
-        None if player.queue().is_empty() => Some(QueueState {
-            entries: Vec::new(),
-            position: None,
-        }),
-        None => None,
-    };
+    let state_to_save = persistence::queue_to_save(&library, player.queue(), player.queue_position());
     if let Some(queue) = state_to_save
         && let Err(e) = persistence::save_queue(&queue)
     {

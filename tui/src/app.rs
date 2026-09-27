@@ -497,6 +497,15 @@ enum Panel {
     Songs,
 }
 
+/// What the right column lists when neither search nor lyrics has it:
+/// the selected playlist's songs, the queue (`o`), or recently played (`H`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Listing {
+    Songs,
+    Queue,
+    History,
+}
+
 // ── lyrics ────────────────────────────────────────────────────────────────────
 
 /// The currently-playing lyric line. Green matches what the songs list already
@@ -878,6 +887,16 @@ pub struct App {
     show_queue: bool,
     show_keymap: bool,
     queue_view_state: TableState,
+    // recently played
+    /// `H`: the right column lists recently played instead of songs or queue.
+    show_history: bool,
+    /// `history.json`, shared with the GUI's home page — see
+    /// `persistence::History`.
+    history: persistence::History,
+    history_state: TableState,
+    /// The video last recorded, so a play is noted once per song rather than
+    /// once per tick.
+    history_noted: Option<String>,
     notification: Option<(String, Instant)>,
     reauth_requested: bool,
     /// Whether an empty library may renew the session by itself: a browser on
@@ -1029,6 +1048,10 @@ impl App {
             show_queue: false,
             show_keymap: false,
             queue_view_state: TableState::default(),
+            show_history: false,
+            history: persistence::load_history(),
+            history_state: TableState::default(),
+            history_noted: None,
             notification: None,
             reauth_requested: false,
             auto_reauth,
@@ -2283,7 +2306,10 @@ impl App {
         }
 
         // Persist queue before anything else so a crash during reauth doesn't lose it.
-        if let Some(state) = persistence::build_queue_state(
+        // `queue_to_save` rather than `build_queue_state`: `D` can empty the
+        // queue now, and an empty one has to be written as such or the next
+        // launch brings back what was just cleared.
+        if let Some(state) = persistence::queue_to_save(
             &self.library,
             self.player.queue(),
             self.player.queue_position(),
@@ -2362,6 +2388,7 @@ impl App {
             // After the auto-advance above, so a track change reaches the
             // desktop on the same tick the UI shows it.
             self.update_media();
+            self.note_history();
             if event::poll(self.poll_timeout())? {
                 match event::read()? {
                     Event::Mouse(me) => self.handle_mouse(me),
@@ -2412,6 +2439,10 @@ impl App {
                                 // The songs list is hidden behind the lyrics, so
                                 // scroll those rather than a cursor nobody sees.
                                 Panel::Songs if self.lyrics_mode => self.scroll_lyrics(1),
+                                Panel::Songs if self.show_history => {
+                                    let n = self.history.tracks().len();
+                                    select_next_bounded(&mut self.history_state, n);
+                                }
                                 Panel::Songs if self.show_queue => {
                                     let n = self.queue_rows();
                                     select_next_bounded(&mut self.queue_view_state, n);
@@ -2430,6 +2461,10 @@ impl App {
                                     self.clear_filter();
                                 }
                                 Panel::Songs if self.lyrics_mode => self.scroll_lyrics(-1),
+                                Panel::Songs if self.show_history => {
+                                    let n = self.history.tracks().len();
+                                    select_prev_bounded(&mut self.history_state, n);
+                                }
                                 Panel::Songs if self.show_queue => {
                                     let n = self.queue_rows();
                                     select_prev_bounded(&mut self.queue_view_state, n);
@@ -2460,6 +2495,11 @@ impl App {
                                     self.clear_filter();
                                     self.prefetch_selected();
                                 }
+                                Panel::Songs if self.show_history => {
+                                    if let Some(idx) = self.history_state.selected() {
+                                        self.play_history(idx);
+                                    }
+                                }
                                 Panel::Songs if self.show_queue => {
                                     if let Some(display_idx) = self.queue_view_state.selected() {
                                         // Copied out, so the cached filter is
@@ -2488,7 +2528,9 @@ impl App {
                                 }
                             },
                             // ── filter ────────────────────────────────────────────────
-                            KeyCode::Char('/') if self.active_panel == Panel::Songs => {
+                            KeyCode::Char('/')
+                                if self.active_panel == Panel::Songs && !self.show_history =>
+                            {
                                 self.filter_mode = true;
                             }
                             // ── playback ──────────────────────────────────────────────
@@ -2512,7 +2554,14 @@ impl App {
                             }
                             KeyCode::Char('m') => self.player.toggle_mute(),
                             // ── queue edit ────────────────────────────────────────────
-                            KeyCode::Char('a')
+                            KeyCode::Char(c @ ('a' | 'A'))
+                                if self.active_panel == Panel::Songs && self.show_history =>
+                            {
+                                if let Some(idx) = self.history_state.selected() {
+                                    self.queue_history(idx, c == 'A');
+                                }
+                            }
+                            KeyCode::Char(c @ ('a' | 'A'))
                                 if self.active_panel == Panel::Songs && !self.show_queue =>
                             {
                                 if let (Some(pl), Some(display_idx)) =
@@ -2520,10 +2569,23 @@ impl App {
                                 {
                                     let song = self.filtered_songs(pl).get(display_idx).copied();
                                     if let Some(song) = song {
-                                        self.do_append_to_queue(pl, song);
+                                        if c == 'A' {
+                                            self.do_play_next(pl, song);
+                                        } else {
+                                            self.do_append_to_queue(pl, song);
+                                        }
                                     }
                                 }
                             }
+                            KeyCode::Char('D')
+                                if self.active_panel == Panel::Songs && self.show_queue =>
+                            {
+                                self.player.clear_queue();
+                                self.queue_view_state.select(None);
+                                self.notify("Queue cleared");
+                            }
+                            KeyCode::Char('H') => self.toggle_history(),
+                            KeyCode::Char('L') => self.like_playing(),
                             KeyCode::Char('d')
                                 if self.active_panel == Panel::Songs && self.show_queue =>
                             {
@@ -2536,6 +2598,7 @@ impl App {
                                 }
                             }
                             KeyCode::Char('o') => {
+                                self.show_history = false;
                                 self.show_queue = !self.show_queue;
                                 self.filter.clear();
                                 self.filter_mode = false;
@@ -2615,6 +2678,9 @@ impl App {
                 } else if self.songs_area.contains(pos) {
                     if self.lyrics_mode {
                         self.scroll_lyrics(1);
+                    } else if self.show_history {
+                        let n = self.history.tracks().len();
+                        select_next_bounded(&mut self.history_state, n);
                     } else if self.show_queue {
                         let n = self.queue_rows();
                         select_next_bounded(&mut self.queue_view_state, n);
@@ -2635,6 +2701,9 @@ impl App {
                 } else if self.songs_area.contains(pos) {
                     if self.lyrics_mode {
                         self.scroll_lyrics(-1);
+                    } else if self.show_history {
+                        let n = self.history.tracks().len();
+                        select_prev_bounded(&mut self.history_state, n);
                     } else if self.show_queue {
                         let n = self.queue_rows();
                         select_prev_bounded(&mut self.queue_view_state, n);
@@ -2653,6 +2722,17 @@ impl App {
 
     /// Keeps the queue panel's visual cursor pinned to whatever is currently
     /// playing. No-op while the queue panel isn't visible.
+    /// What the right column is listing when nothing has taken it over.
+    fn listing(&self) -> Listing {
+        if self.show_history {
+            Listing::History
+        } else if self.show_queue {
+            Listing::Queue
+        } else {
+            Listing::Songs
+        }
+    }
+
     fn sync_queue_view(&mut self) {
         if self.show_queue {
             self.queue_view_state.select(self.player.queue_position());
@@ -2671,6 +2751,131 @@ impl App {
                 self.notify(format!("+ queue #{queue_len}: {title}"));
             }
         }
+    }
+
+    /// `A`: queue a song to play straight after the current one.
+    fn do_play_next(&mut self, pl_idx: usize, song_idx: usize) {
+        let title = self
+            .library
+            .track(pl_idx, song_idx)
+            .and_then(|t| t.title.clone())
+            .unwrap_or_else(|| "song".to_string());
+        match self.player.insert_next(&self.library, pl_idx, song_idx) {
+            AppendOutcome::StartedPlaying { .. } => self.notify(format!("Playing: {title}")),
+            AppendOutcome::Queued { .. } => self.notify(format!("Next up: {title}")),
+        }
+    }
+
+    // ── recently played ───────────────────────────────────────────────────────
+
+    /// Records the playing track in `history.json` once per song — the same
+    /// rule the GUI's `history::observe` follows, through the same
+    /// `persistence::played_from`, so either frontend's plays show in both.
+    ///
+    /// Called every tick, so the common case — the same song as last tick — is
+    /// answered from the library by reference, with nothing cloned.
+    fn note_history(&mut self) {
+        // A queue restored from disk has a track selected that mpv has never
+        // been handed; it has not been *played*.
+        if !self.player.playback_started() {
+            return;
+        }
+        let playing = self.player.playing();
+        let Some(id) = playing
+            .and_then(|(pl, song)| self.library.track(pl, song))
+            .and_then(|t| t.video_id.as_deref())
+        else {
+            return;
+        };
+        if self.history_noted.as_deref() == Some(id) {
+            return;
+        }
+        self.history_noted = Some(id.to_string());
+        let Some((track, playlist_id)) = persistence::played_from(&self.library, playing) else {
+            return;
+        };
+        if !self.history.note_track(track, playlist_id) {
+            return;
+        }
+        // Written per song rather than at exit, and off this thread: a song is
+        // minutes, and a history a crash can erase is one nobody trusts.
+        static SAVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let snapshot = self.history.clone();
+        self.lyrics_handle.spawn_blocking(move || {
+            let Ok(_guard) = SAVE.lock() else { return };
+            if let Err(e) = persistence::save_history(&snapshot) {
+                log::warn!("failed to save history: {e}");
+            }
+        });
+    }
+
+    fn toggle_history(&mut self) {
+        self.show_history = !self.show_history;
+        if self.show_history {
+            self.show_queue = false;
+            self.lyrics_mode = false;
+            self.clear_filter();
+            self.active_panel = Panel::Songs;
+            if self.history_state.selected().is_none() && !self.history.tracks().is_empty() {
+                self.history_state.select(Some(0));
+            }
+        }
+    }
+
+    /// Where a history row plays from — see `persistence::place_played`.
+    fn locate_history(&mut self, idx: usize) -> Option<(usize, usize)> {
+        let entry = self.history.tracks().get(idx)?.clone();
+        let at = persistence::place_played(&mut self.library, &entry);
+        if at.is_none() {
+            self.notify("That track can't be played");
+        }
+        at
+    }
+
+    fn play_history(&mut self, idx: usize) {
+        if let Some((pl, song)) = self.locate_history(idx) {
+            self.player.play(&self.library, pl, song);
+            self.sync_queue_view();
+        }
+    }
+
+    fn queue_history(&mut self, idx: usize, next: bool) {
+        if let Some((pl, song)) = self.locate_history(idx) {
+            if next {
+                self.do_play_next(pl, song);
+            } else {
+                self.do_append_to_queue(pl, song);
+            }
+        }
+    }
+
+    /// `L`: likes whatever is playing — the GUI's heart button.
+    fn like_playing(&mut self) {
+        let Some((video_id, title)) = self
+            .player
+            .playing()
+            .and_then(|(pl, song)| self.library.track(pl, song))
+            .and_then(|t| Some((t.video_id.clone()?, t.title.clone().unwrap_or_default())))
+        else {
+            self.notify("Nothing playing to like");
+            return;
+        };
+        // Refetched when the like lands, so the song is in the session's copy
+        // of Liked Music — the same path `a` → Liked Music takes from search.
+        let playlist = self.library.find_playlist_index("LM").unwrap_or(usize::MAX);
+        self.notify(format!("Liking {title}…"));
+        search::spawn_add(
+            &self.lyrics_handle,
+            std::sync::Arc::clone(&self.yt),
+            search::AddRequest {
+                playlist_id: String::new(),
+                playlist,
+                video_id,
+                title,
+                where_to: "Liked Music".to_string(),
+            },
+            self.search_tx.clone(),
+        );
     }
 
     fn do_remove_from_queue(&mut self, q_pos: usize) {
@@ -3041,8 +3246,8 @@ impl App {
         keys
     }
 
-    fn browse_hints(panel: Panel, queue: bool) -> Vec<(&'static str, &'static str)> {
-        let mut keys = match (panel, queue) {
+    fn browse_hints(panel: Panel, listing: Listing) -> Vec<(&'static str, &'static str)> {
+        let mut keys = match (panel, listing) {
             (Panel::Playlists, _) => vec![
                 ("j/k", "nav"),
                 ("l/↵", "open"),
@@ -3053,30 +3258,51 @@ impl App {
                 ("y", "lyrics"),
                 ("s", "search"),
             ],
-            (Panel::Songs, false) => vec![
+            (Panel::Songs, Listing::Songs) => vec![
                 ("↵", "play"),
                 ("spc", "pause"),
                 ("/", "filter"),
                 ("a", "+queue"),
                 ("o", "queue"),
                 ("?", "keys"),
+                ("A", "play next"),
                 ("y", "lyrics"),
                 ("s", "search"),
+                ("H", "recent"),
+                ("L", "like"),
                 ("p/n", "skip"),
                 ("j/k", "nav"),
                 ("Esc", "back"),
             ],
-            (Panel::Songs, true) => vec![
+            (Panel::Songs, Listing::Queue) => vec![
                 ("↵", "play"),
                 ("spc", "pause"),
                 ("d", "remove"),
                 ("o", "songs"),
                 ("y", "lyrics"),
                 ("?", "keys"),
+                ("D", "clear"),
                 ("s", "search"),
+                ("H", "recent"),
+                ("L", "like"),
                 ("p/n", "skip"),
                 ("j/k", "nav"),
                 ("/", "filter"),
+                ("Esc", "back"),
+            ],
+            (Panel::Songs, Listing::History) => vec![
+                ("↵", "play"),
+                ("spc", "pause"),
+                ("a", "+queue"),
+                ("H", "close"),
+                ("o", "queue"),
+                ("?", "keys"),
+                ("A", "play next"),
+                ("y", "lyrics"),
+                ("s", "search"),
+                ("L", "like"),
+                ("p/n", "skip"),
+                ("j/k", "nav"),
                 ("Esc", "back"),
             ],
         };
@@ -3096,7 +3322,7 @@ impl App {
         } else if self.lyrics_mode {
             Self::lyrics_hints(self.config.lyrics.ai_available())
         } else {
-            Self::browse_hints(self.active_panel, self.show_queue)
+            Self::browse_hints(self.active_panel, self.listing())
         }
     }
 
@@ -3147,8 +3373,12 @@ impl App {
         ("t", "Cycle play mode"),
         ("", ""),
         ("a", "Add selected song to queue"),
+        ("A", "Play selected song next"),
         ("d", "Remove selected queue entry"),
+        ("D", "Clear the queue (in queue)"),
         ("o", "Toggle queue / songs"),
+        ("H", "Recently played"),
+        ("L", "Like the playing song"),
         ("", ""),
         ("s", "Search YouTube Music"),
         ("a", "In search: add the result to a playlist"),
@@ -3291,8 +3521,18 @@ impl App {
         // `kitty::fit_cells`. The rows left for the words are the other bound:
         // title, artist, album, a rule and the length come to six, plus the
         // blank row between them and the art.
+        // What plays after this one, when there is anything: the queue is the
+        // thing a radio will keep topping up, so it is worth a glance here.
+        let up_next = self
+            .player
+            .upcoming(1)
+            .first()
+            .and_then(|&(pl, song)| self.library.track(pl, song))
+            .and_then(|t| t.title.clone());
         let max_cols = body.width.saturating_sub(2).min(MAX_COVER_COLS);
-        let max_rows = body.height.saturating_sub(7);
+        let max_rows = body
+            .height
+            .saturating_sub(if up_next.is_some() { 10 } else { 7 });
         let aspect = self.cover_aspect(track.video_id.as_deref());
         let (cover_w, cover_h) = kitty::fit_cells(max_cols, max_rows, aspect);
         let can_draw = self.covers_enabled && cover_w >= 8 && cover_h >= 1;
@@ -3334,6 +3574,11 @@ impl App {
                 .centered(),
             );
             lines.push(Line::styled(duration, theme::DIM).centered());
+        }
+        if let Some(next) = up_next {
+            lines.push(Line::from(""));
+            lines.push(Line::styled("UP NEXT", theme::DIM).centered());
+            lines.push(Line::styled(truncate_line(&next, width), theme::META).centered());
         }
 
         // Cover, a blank row, then the words — placed as one block and centred
@@ -3789,7 +4034,9 @@ impl App {
             return;
         }
 
-        if self.show_queue {
+        if self.show_history {
+            self.render_history(frame, area);
+        } else if self.show_queue {
             self.render_queue(frame, area);
         } else {
             self.render_songs(frame, area);
@@ -4360,6 +4607,52 @@ impl App {
 
     // ── queue view ────────────────────────────────────────────────────────────
 
+    fn render_history(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.active_panel == Panel::Songs;
+        let tracks = self.history.tracks();
+        let status = (!tracks.is_empty())
+            .then(|| Line::styled(format!("{}", tracks.len()), theme::DIM));
+        let body = section(frame, area, "Recently played", status, focused);
+
+        if tracks.is_empty() {
+            centered_message(
+                frame,
+                body,
+                vec![
+                    Line::styled("Nothing played yet", theme::DIM),
+                    Line::from(""),
+                    Line::from(hint("H", "back")),
+                ],
+            );
+            return;
+        }
+
+        let playing = self
+            .player
+            .playing()
+            .and_then(|(pl, song)| self.library.track(pl, song))
+            .and_then(|t| t.video_id.as_deref());
+        let num_w = tracks.len().to_string().len();
+        let width = Self::track_text_width(list_body(body, tracks.len()));
+        let rows: Vec<Row> = tracks
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let is_playing =
+                    playing.is_some() && p.track.video_id.as_deref() == playing;
+                self.track_row(Some(&p.track), i + 1, num_w, is_playing, width)
+            })
+            .collect();
+
+        let n = rows.len();
+        frame.render_stateful_widget(
+            Self::track_table(rows, focused),
+            list_body(body, n),
+            &mut self.history_state,
+        );
+        render_scrollbar(frame, body, n, self.history_state.selected());
+    }
+
     fn render_queue(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.active_panel == Panel::Songs;
         let queue_pos = self.player.queue_position();
@@ -4442,7 +4735,16 @@ impl App {
         let status = {
             let volume = self.player.volume();
             let muted = self.player.is_muted();
-            vec![
+            let mut spans = Vec::with_capacity(5);
+            // Where in the queue, so how much is left is readable without `o`.
+            if let Some(pos) = self.player.queue_position() {
+                spans.push(Span::styled(
+                    format!("{}/{}", pos + 1, self.player.queue().len()),
+                    theme::DIM,
+                ));
+                spans.push(Span::styled(SEP, theme::DIM));
+            }
+            spans.extend([
                 Span::styled(self.player.mode().label().to_string(), theme::DIM),
                 Span::styled(SEP, theme::DIM),
                 if muted {
@@ -4450,7 +4752,8 @@ impl App {
                 } else {
                     Span::styled(format!("{volume}%"), theme::DIM)
                 },
-            ]
+            ]);
+            spans
         };
         let status_w: usize = status.iter().map(|s| width_of(&s.content)).sum();
 
@@ -5310,9 +5613,9 @@ mod tests {
         all.extend(App::search_hints(false));
         all.extend(App::lyrics_hints(true));
         all.extend(App::lyrics_hints(false));
-        for queue in [false, true] {
-            all.extend(App::browse_hints(Panel::Songs, queue));
-            all.extend(App::browse_hints(Panel::Playlists, queue));
+        for listing in [Listing::Songs, Listing::Queue, Listing::History] {
+            all.extend(App::browse_hints(Panel::Songs, listing));
+            all.extend(App::browse_hints(Panel::Playlists, listing));
         }
         all
     }
@@ -5362,9 +5665,10 @@ mod tests {
             App::picker_hints(),
             App::search_hints(false),
             App::lyrics_hints(true),
-            App::browse_hints(Panel::Songs, false),
-            App::browse_hints(Panel::Songs, true),
-            App::browse_hints(Panel::Playlists, false),
+            App::browse_hints(Panel::Songs, Listing::Songs),
+            App::browse_hints(Panel::Songs, Listing::Queue),
+            App::browse_hints(Panel::Songs, Listing::History),
+            App::browse_hints(Panel::Playlists, Listing::Songs),
         ] {
             let mut seen = std::collections::HashSet::new();
             for (key, _) in &context {
@@ -5381,9 +5685,10 @@ mod tests {
         for context in [
             App::search_hints(false),
             App::lyrics_hints(true),
-            App::browse_hints(Panel::Songs, false),
-            App::browse_hints(Panel::Songs, true),
-            App::browse_hints(Panel::Playlists, false),
+            App::browse_hints(Panel::Songs, Listing::Songs),
+            App::browse_hints(Panel::Songs, Listing::Queue),
+            App::browse_hints(Panel::Songs, Listing::History),
+            App::browse_hints(Panel::Playlists, Listing::Songs),
         ] {
             let shown = fit_hints(&context, 80);
             let text: String = shown.iter().map(|s| s.content.as_ref()).collect();

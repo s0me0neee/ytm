@@ -453,6 +453,20 @@ tools/           not a member and not shipped — see `macos-check` above
   not possible: a `TrackRef` is a position, so removing a track renumbers the rest and the
   queue quietly changes meaning. `clear_search_playlist` empties the tracks and keeps the
   playlist, for the same reason.
+- **`radio.rs`** — the source of a station, ready for the radio feature to be wired to. No
+  `get_watch_playlist` exists in `ytmusicapi 0.5`, so this is `search.rs`'s move again: the
+  web client's own `next` endpoint through `send_request`, asking for the seed's
+  auto-generated mix (`RDAMVM<videoId>`, `params: "wAEB"`). `parse` walks for
+  `playlistPanelVideoRenderer` rows rather than pathing to them — a continuation page nests
+  them under a different root and some rows arrive inside a `…WrapperRenderer` — skips
+  unplayable rows, the seed, repeats, and anything the caller's `skip` already holds, and
+  returns the continuation token for the next page, which goes back in the *body*
+  (`send_request` builds the query string itself). `spawn_fetch`/`RadioMsg` is the same
+  background shape as search. What a station does with its tracks is deliberately not here:
+  `Library::place_off_library` files a page under the search playlist in one indexing pass,
+  `Player::append_many` queues it as one revision, and `Player::remaining` against
+  `radio::needs_refill` says when to ask for the next page. Offline fixture tests cover the
+  parse; the live one is `#[ignore]`d.
 - **`cover.rs`** — fetches a thumbnail and decodes it to RGB. `at_size` rewrites the CDN's
   own resize parameters (`=w120-h120-l90-rj`) to ask for a bigger copy than the 120px a
   search row advertises, and the size asked for is the *terminal's*: `spawn_fetch` takes the
@@ -531,9 +545,11 @@ tools/           not a member and not shipped — see `macos-check` above
   of `i`'s down there to replace. Capped at `MAX_SAVED_TRANSLATIONS`, oldest written evicted
   first.
 
-  `history.json` is what has been played lately — the GUI's home page, though it lives here
-  rather than in `gui/` so the rules about atomic writes and private permissions stay in one
-  place and the TUI could grow the same page without a second format to reconcile. It stores
+  `history.json` is what has been played lately — the GUI's home page and the TUI's `H` view,
+  one file between them, so a song played in either shows in both. `played_from` (what to
+  record for the entry playing), `place_played` (where to play an entry from) and
+  `queue_to_save` (an emptied queue is written as empty) are the shared rules, so neither
+  frontend has its own copy of them. It stores
   whole `Track`s rather than references to them, because a `TrackRef` is a position and means
   nothing across a restart, and a song played from search belongs to no playlist that will
   exist next time — so a row draws with no library loaded at all, which is what a home page
@@ -784,6 +800,21 @@ time. Only `https` URLs on the artwork hosts are fetched, so the scheme is not a
 point anywhere. A 404 from `i.ytimg.com` carries a valid 120×90 grey JPEG body that an `img` would
 happily decode — passing the status through as a real 404 is what lets the size ladder step down.
 
+Under a rate limit the scheme does three things, because an `img` sees any failure as "this
+picture doesn't exist" and steps down to the small copy for good. **Two lanes**
+(`ROW_PERMITS`/`LARGE_PERMITS`, split by `is_large` on the URL's size), so the cover being
+looked at never queues behind a playlist's row thumbnails. **One shared `Gate`**: a 429 —
+`FetchError::RateLimited`, carrying `Retry-After` when the CDN sends one — pauses *every*
+fetch, doubling per 429 in a row up to 30s, and while recovering requests go one at a time
+until one succeeds, so the queue doesn't stampede back into the limit. **More patience for
+large covers** (6 attempts against 3), since the webview shows the small copy underneath
+while one waits. The cache is bounded by bytes (48MB), not entries. On the frontend,
+`Thumbnail` withholds `src` until the row is near the screen (one shared
+`IntersectionObserver`, since `loading="lazy"` defers nothing in WebKitGTK) — a 170-track
+playlist opens with ~24 requests, not 170 — `hdLadder` stops at the smallest frame that covers
+the size asked for, and the blurred backdrops use the advertised URL (`backdropUrl`), which
+always exists and is already cached.
+
 Commands that wait on the network — search, like, add-to-playlist, the three lyrics commands and
 translation — are `async` and run their body through `state::off_main` (`spawn_blocking`). A sync
 `#[tauri::command]` runs on the main thread, which on Linux also delivers every input event to the
@@ -823,6 +854,15 @@ the `layoutId` highlight with the playlists so the selection slides between them
 control. A companion list of recently played *playlists* was built and then removed — the
 `playlists` field went with it, and an older `history.json` still carrying one loads fine,
 since serde ignores what it no longer knows about.
+
+The window answers the TUI's letters wherever the action exists in both — `n`/`p`, `m`, `t`,
+`s` (focus search), `/` (focus filter), `o` (queue), `H` (home), `y` (now playing), `L` (like),
+and in now playing `c`/`i`/`I` — with `?` opening `KeymapOverlay`. They go through
+`keyActions`, a ref rebuilt every render and read by the one `keydown` listener, so each
+action sees current state without the listener being re-bound on the playback tick. Esc in a
+text field blurs it, so the letters work again without the mouse. `get_queue` is only asked
+for while the queue panel is open; the single next track (`get_up_next`) is fetched on the
+same triggers regardless, for the now-playing view's "Up next" line.
 
 `NowPlayingView` is Apple Music's split: two *halves* of the window, artwork and transport as
 one block centred in the left, the lyric sheet centred in the right. Half rather than "as wide
@@ -906,8 +946,12 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `m` | Mute / unmute |
 | `t` | Cycle play mode (Cycle → Single → Shuffle) |
 | `a` | Append selected song to queue |
+| `A` | Play the selected song next (also from `H`) |
 | `d` | Remove selected queue entry |
+| `D` | (in the queue) Clear the queue |
 | `o` | Toggle queue / songs view |
+| `H` | Recently played — `history.json`, shared with the GUI's home page |
+| `L` | Like the playing song |
 | `s` | Search YouTube Music (`↵` play, `a` add to a playlist, `/` edit query) |
 | `y` | Toggle lyrics panel |
 | `c` | (in lyrics mode) Choose a different lrclib record |

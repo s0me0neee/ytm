@@ -540,6 +540,43 @@ impl Player {
         }
     }
 
+    /// Appends a batch, as one revision — a radio page is twenty-odd entries
+    /// and each revision is a queue redraw in both frontends. Starts playing
+    /// the first of them when nothing is playing, as a single append does.
+    pub fn append_many(&mut self, library: &Library, refs: &[TrackRef]) {
+        let Some(&first) = refs.first() else { return };
+        let start = self.queue.len();
+        self.queue.extend_from_slice(refs);
+        self.revision += 1;
+        log::info!(
+            "append_many: {} entries, queue_len={}",
+            refs.len(),
+            self.queue.len()
+        );
+        if self.playing.is_none() {
+            self.queue_pos = Some(start);
+            self.do_play(library, first.0, first.1);
+        }
+    }
+
+    /// How many queue entries are left after the one playing. What a radio
+    /// reads to decide it is running low — see `radio::needs_refill`.
+    ///
+    /// Counts to the end of the queue, not round it: `Cycle` wraps, but a
+    /// station that has reached its end should grow rather than start over.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        remaining_after(self.queue.len(), self.queue_pos)
+    }
+
+    /// The entries after the one playing, at most `n` of them, in play order.
+    /// The "up next" line in both frontends' player bars.
+    #[must_use]
+    pub fn upcoming(&self, n: usize) -> &[TrackRef] {
+        let (from, to) = upcoming_range(self.queue.len(), self.queue_pos, n);
+        &self.queue[from..to]
+    }
+
     /// Empties the queue and stops playback. The queue is the only thing that
     /// says what to play next, so clearing it and carrying on playing would
     /// leave the player with a track it could not advance from.
@@ -794,9 +831,38 @@ impl Player {
     }
 }
 
+/// Entries after `pos` in a queue of `len`; all of them when nothing plays.
+fn remaining_after(len: usize, pos: Option<usize>) -> usize {
+    pos.map_or(len, |p| len.saturating_sub(p.saturating_add(1)))
+}
+
+/// The in-bounds slice range of at most `n` entries after `pos`.
+fn upcoming_range(len: usize, pos: Option<usize>, n: usize) -> (usize, usize) {
+    let from = pos.map_or(0, |p| p.saturating_add(1)).min(len);
+    (from, from.saturating_add(n).min(len))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remaining_counts_what_is_left_after_the_playing_entry() {
+        assert_eq!(remaining_after(10, Some(7)), 2);
+        assert_eq!(remaining_after(10, Some(9)), 0);
+        assert_eq!(remaining_after(10, None), 10);
+        // A position left past the end by a removal is not an underflow.
+        assert_eq!(remaining_after(3, Some(8)), 0);
+    }
+
+    #[test]
+    fn upcoming_stays_in_bounds_at_either_end() {
+        assert_eq!(upcoming_range(10, Some(2), 3), (3, 6));
+        assert_eq!(upcoming_range(10, Some(8), 3), (9, 10));
+        assert_eq!(upcoming_range(10, Some(9), 3), (10, 10));
+        assert_eq!(upcoming_range(10, None, 3), (0, 3));
+        assert_eq!(upcoming_range(0, None, 3), (0, 0));
+    }
 
     /// Only the decision is tested here: building a [`Player`] would boot
     /// libmpv, which is not something a unit test should need.

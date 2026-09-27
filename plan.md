@@ -1,6 +1,6 @@
 ---
 # yt-music-tui — feature plan
-Last updated: 2026-08-29
+Last updated: 2026-09-27
 
 Legend: ✅ done  🔄 in progress  ❌ not started
 
@@ -101,10 +101,14 @@ removed it from the auth path only.
 - Press `Enter` on an album entry to load tracks via `get_album(browse_id)`
 - Push a new songs view; `Backspace` pops back to the album list
 
-❌ **Radio / "Up next"** (`r` key)
-- `get_watch_playlist(video_id=current)` returns a "Up next" list
-- Append results to the queue automatically
-- Show "Radio seeded from <title>" in the notification bar
+🔄 **Radio / "Up next"**
+- ✅ Source: `ytm-core/src/radio.rs` — `ytmusicapi 0.5` has no `get_watch_playlist`, so the
+  `next` endpoint with the seed's `RDAMVM<id>` mix, paged by continuation token
+- ✅ Plumbing: `Library::place_off_library`, `Player::append_many` / `remaining` / `upcoming`,
+  `radio::needs_refill`; "Up next" shown in both frontends' now-playing views
+- ❌ Wiring: a key in each frontend (`r` is taken in lyrics mode — `R`?), a station state
+  (seed + continuation + seen ids) that tops the queue up when `needs_refill`, and a
+  "Radio seeded from <title>" notice
 
 ---
 
