@@ -247,10 +247,10 @@ pub struct PlayedTrack {
 
 /// What has been played lately, most recent first.
 ///
-/// Written by the GUI's home page and read by nothing else so far, but it lives
-/// here with the other saved state rather than in `gui/`: the rules about
-/// atomic writes and private permissions belong to one place, and the TUI is
-/// free to grow the same page later without a second format to reconcile.
+/// Written by both frontends — the GUI's home page and the TUI's `H` view read
+/// the same file — so it lives here with the other saved state: the rules
+/// about atomic writes and private permissions belong to one place, and a song
+/// played in either frontend is on the other's list next time it opens.
 ///
 /// Tracks only. A `playlists` list lived here too and was dropped once the home
 /// page stopped showing one — the file keeps whatever an older build wrote,
@@ -294,6 +294,48 @@ impl History {
     }
 }
 
+/// What [`History::note_track`] wants for the track at `playing`: the track
+/// itself and the playlist it came from.
+///
+/// Shared by both frontends so they record a play the same way. The synthetic
+/// search playlist exists for a single session and is nowhere to go back to,
+/// so a track played from search — or from a radio, which files its tracks
+/// there too — is recorded with no playlist at all.
+#[must_use]
+pub fn played_from(
+    library: &crate::library::Library,
+    playing: Option<crate::player::TrackRef>,
+) -> Option<(crate::library::Track, Option<String>)> {
+    let (pl, song) = playing?;
+    let track = library.track(pl, song)?.clone();
+    let playlist_id = (!library.is_search_playlist(pl))
+        .then(|| library.playlist(pl))
+        .flatten()
+        .map(|p| p.playlist_id.clone());
+    Some((track, playlist_id))
+}
+
+/// Where to play a history entry from.
+///
+/// The live library first: if the song is still where it was played from, it
+/// is played *there*, so the queue and the rest of that playlist behave exactly
+/// as from the library. Only when it cannot be found — the playlist is gone,
+/// the track was removed, or it came from search and never had one — is the
+/// stored copy filed under the search playlist. `None` for a track with no
+/// video id, which nothing could play.
+pub fn place_played(
+    library: &mut crate::library::Library,
+    entry: &PlayedTrack,
+) -> Option<crate::player::TrackRef> {
+    let video_id = entry.track.video_id.as_deref()?;
+    let found = entry
+        .playlist_id
+        .as_deref()
+        .and_then(|id| library.find_playlist_index(id))
+        .and_then(|pl| library.find_song_index(pl, video_id).map(|song| (pl, song)));
+    Some(found.unwrap_or_else(|| library.place_search_result(entry.track.clone())))
+}
+
 pub fn save_history(history: &History) -> Result<()> {
     write_private(&history_path(), &serde_json::to_string_pretty(history)?)
 }
@@ -321,6 +363,29 @@ fn follow_position(position: Option<usize>, kept: &[usize], len: usize) -> Optio
         return None;
     }
     Some(kept.iter().take_while(|&&i| i < p).count().min(len - 1))
+}
+
+/// What to write to `queue.json` on the way out, or `None` to leave the file
+/// alone.
+///
+/// An *empty* queue is written as an empty queue rather than skipped: both
+/// frontends can clear one now, and skipping it would bring back at the next
+/// launch what the user had just cleared. A queue that is not empty but
+/// resolves to nothing — a quit while the library was still loading — leaves
+/// the file alone, since that is not a deliberate clear.
+#[must_use]
+pub fn queue_to_save(
+    library: &crate::library::Library,
+    queue: &[crate::player::TrackRef],
+    position: Option<usize>,
+) -> Option<QueueState> {
+    if queue.is_empty() {
+        return Some(QueueState {
+            entries: Vec::new(),
+            position: None,
+        });
+    }
+    build_queue_state(library, queue, position)
 }
 
 /// Serialises a live queue into a [`QueueState`] ready for [`save_queue`].

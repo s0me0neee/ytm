@@ -143,7 +143,7 @@ impl SearchResult {
 /// ~340 rows, no row ever carried two different `videoId`s or two different
 /// `musicVideoType`s, so "the first hit inside this row" is always the row's
 /// own. `examples/search_verify.rs` is the check.
-fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
+pub(crate) fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     match v {
         Value::Object(map) => {
             for (k, val) in map {
@@ -158,7 +158,7 @@ fn find_all<'a>(v: &'a Value, key: &str, out: &mut Vec<&'a Value>) {
     }
 }
 
-fn first_str(v: &Value, key: &str) -> Option<String> {
+pub(crate) fn first_str(v: &Value, key: &str) -> Option<String> {
     let mut hits = Vec::new();
     find_all(v, key, &mut hits);
     hits.first().and_then(|h| h.as_str()).map(str::to_string)
@@ -213,7 +213,7 @@ fn is_duration(text: &str) -> bool {
 /// YouTube lists thumbnails smallest-first and every size is the same image, so
 /// the last is the one worth fetching — a 60px crop looks like porridge once a
 /// terminal scales it into a cell block.
-fn thumbnail(item: &Value) -> Option<String> {
+pub(crate) fn thumbnail(item: &Value) -> Option<String> {
     let mut lists = Vec::new();
     find_all(item, "thumbnails", &mut lists);
     lists

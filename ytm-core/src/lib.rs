@@ -69,6 +69,7 @@ pub mod media;
 pub mod persistence;
 pub mod playback;
 pub mod player;
+pub mod radio;
 pub mod search;
 pub mod session;
 pub mod shutdown;
@@ -82,6 +83,7 @@ pub use lyrics::{LyricsKind, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics}
 pub use media::{Host, MediaCmd, MediaControls, NowPlaying, PlayState, TrackInfo};
 pub use playback::AudioState;
 pub use player::{AppendOutcome, PlayMode, Player, RemoveOutcome, TrackRef};
+pub use radio::RadioMsg;
 pub use search::{ResultKind, SearchMsg, SearchResult};
 pub use session::{Browser, Reauth, Session};
 pub use translate::TranslateMsg;

@@ -24,6 +24,10 @@ pub struct PlaylistView {
     pub count: Option<u32>,
     pub loaded: bool,
     pub failed: bool,
+    /// The first track's cover, standing in for the playlist's own: the
+    /// library fetch carries no playlist art, and the first track is what
+    /// the service's own mosaic leads with. `None` until the tracks arrive.
+    pub thumbnail: Option<String>,
 }
 
 #[tauri::command]
@@ -40,6 +44,7 @@ pub fn get_playlists(state: State<'_, AppState>) -> Vec<PlaylistView> {
             count: e.playlist.count,
             loaded: e.loaded,
             failed: e.failed,
+            thumbnail: e.songs.iter().find_map(|t| t.thumbnail.clone()),
         })
         .collect()
 }

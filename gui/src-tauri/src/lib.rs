@@ -141,6 +141,7 @@ pub fn run() -> tauri::Result<()> {
             player::jump_to,
             player::prefetch,
             player::get_queue,
+            player::get_up_next,
             player::play_next,
             player::clear_queue,
             search::search,
