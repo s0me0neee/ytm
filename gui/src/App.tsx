@@ -23,6 +23,7 @@ import {
   Filter,
   Home,
   X,
+  Keyboard,
 } from "lucide-react";
 import { Slider } from "./Slider";
 import { Thumbnail } from "./Thumbnail";
@@ -39,6 +40,8 @@ interface PlaylistView {
   count: number | null;
   loaded: boolean;
   failed: boolean;
+  /** The first track's cover, standing in for the playlist's own. */
+  thumbnail: string | null;
 }
 
 interface Artist {
@@ -170,6 +173,11 @@ const SECTION_HEADING = "px-3 pb-3 text-[15px] font-semibold text-ink";
  * scroll to without ever looking short. */
 const HOME_SHELF = 12;
 
+/** Playlist tiles on the home page. The grid fits as many 14rem columns as the
+ * column has room for -- which the queue panel changes, so a fixed count left
+ * four truncated titles side by side. More than this is the sidebar's job. */
+const HOME_TILES = 8;
+
 /** macOS is the only platform where `titleBarStyle: "Overlay"` applies, so it
  * is the only one whose header has to leave room for the traffic lights. */
 const IS_MAC = navigator.userAgent.includes("Mac OS X");
@@ -196,6 +204,47 @@ const TRAFFIC_LIGHT_AXIS = "h-[54px]";
  * are both `m-3`/`mt-3`, so using the same 12px here is what makes the space
  * over the field and the space under it equal. */
 const HEADER_PAD_TOP = "pt-3";
+
+/** The synthetic playlist search results (and, later, radio tracks) are filed
+ * under. It is a place for the queue to point at, not one of the user's. */
+const SEARCH_PLAYLIST_ID = "__search__";
+
+/** The home page's heading. By the clock rather than a fixed "Home", because
+ * the page is the first thing on screen and a greeting is what makes it read
+ * as a place rather than as an empty list waiting for content. */
+function greeting(): string {
+  const h = new Date().getHours();
+  if (h < 5) return "Good night";
+  if (h < 12) return "Good morning";
+  if (h < 18) return "Good afternoon";
+  return "Good evening";
+}
+
+/** Every keyboard shortcut the window answers, for the `?` overlay. The same
+ * letters the TUI uses wherever the action exists in both, so moving between
+ * the two frontends costs nothing. */
+const GUI_KEYMAP: [string, string][] = [
+  ["Space", "Pause / resume"],
+  ["p / n", "Previous / next"],
+  ["← / →", "Seek ∓5s"],
+  ["↑ / ↓", "Volume ±5"],
+  ["m", "Mute / unmute"],
+  ["t", "Cycle play mode"],
+  ["L", "Like the playing song"],
+  ["", ""],
+  ["s", "Search YouTube Music"],
+  ["/", "Filter this playlist"],
+  ["o", "Toggle the queue"],
+  ["H", "Home · recently played"],
+  ["", ""],
+  ["y", "Now playing · lyrics"],
+  ["c", "Choose lyrics source"],
+  ["i", "Toggle translation"],
+  ["I", "Translate with the AI model"],
+  ["", ""],
+  ["?", "Show this help"],
+  ["Esc", "Close · back"],
+];
 
 function artistNames(t: Track): string {
   return t.artists.map((a) => a.name).join(", ");
@@ -469,6 +518,8 @@ interface HomeViewProps {
   currentTrackId: string | null | undefined;
   paused: boolean;
   onPlayTrack: (index: number) => void;
+  playlists: PlaylistView[];
+  onOpenPlaylist: (i: number) => void;
 }
 
 /** The home page: what has been played lately, and nothing else.
@@ -481,22 +532,61 @@ interface HomeViewProps {
  * Memoized for the same reason as `TrackList`: it is a child of `LibraryView`,
  * whose parent re-renders on the ~250ms playback tick. `history` changes once
  * per song and the rest only on a real action. */
-const HomeView = memo(function HomeView({ history, currentTrackId, paused, onPlayTrack }: HomeViewProps) {
+const HomeView = memo(function HomeView({
+  history,
+  currentTrackId,
+  paused,
+  onPlayTrack,
+  playlists,
+  onOpenPlaylist,
+}: HomeViewProps) {
   const tracks = history?.tracks ?? [];
   const shelf = tracks.slice(0, HOME_SHELF);
   const rest = tracks.slice(HOME_SHELF);
-
-  if (history && tracks.length === 0) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 text-center select-none">
-        <p className="text-[15px] text-ink-dim">Nothing played yet.</p>
-        <p className="text-[13px] text-ink-faint">Pick a playlist on the left to get started.</p>
-      </div>
-    );
-  }
+  /* The user's own playlists as a grid of tiles, Spotify's quick-access
+     block: the sidebar already lists them, but as words, and a page whose job
+     is "where to start" should offer the places to start as pictures. The
+     search playlist is a filing cabinet for the queue, not somewhere to go. */
+  const tiles = useMemo(
+    () =>
+      playlists
+        .map((p, i) => ({ p, i }))
+        .filter(({ p }) => p.playlist_id !== SEARCH_PLAYLIST_ID && !p.failed)
+        .slice(0, HOME_TILES),
+    [playlists],
+  );
 
   return (
     <div className="select-none">
+      <h1 className="px-3 pt-1 pb-5 text-[26px] leading-tight font-semibold tracking-tight text-ink">{greeting()}</h1>
+
+      {tiles.length > 0 && (
+        <div className="mb-8 grid grid-cols-[repeat(auto-fill,minmax(14rem,1fr))] gap-2 px-3">
+          {tiles.map(({ p, i }) => (
+            <button
+              key={p.playlist_id}
+              onClick={() => onOpenPlaylist(i)}
+              className="group flex min-w-0 items-center gap-3 overflow-hidden rounded-xl bg-surface pr-3 text-left transition-colors hover:bg-surface-2"
+            >
+              <Thumbnail srcs={[p.thumbnail]} className="h-12 w-12 flex-shrink-0" />
+              <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-ink">{p.title}</span>
+              <Play
+                size={14}
+                fill="currentColor"
+                className="flex-shrink-0 text-ink opacity-0 transition-opacity group-hover:opacity-100"
+              />
+            </button>
+          ))}
+        </div>
+      )}
+
+      {history && tracks.length === 0 && (
+        <div className="flex flex-col items-center gap-2 py-16 text-center">
+          <p className="text-[15px] text-ink-dim">Nothing played yet.</p>
+          <p className="text-[13px] text-ink-faint">Pick a playlist to get started — what you play shows up here.</p>
+        </div>
+      )}
+
       {shelf.length > 0 && (
         <>
           <h2 className={SECTION_HEADING}>Recently played</h2>
@@ -633,11 +723,15 @@ const PlaylistNav = memo(function PlaylistNav({
         )}
         <button
           onClick={() => onSelect(null)}
-          className={`relative flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-[13px] transition-colors ${
+          className={`relative flex w-full items-center gap-2.5 rounded-xl px-2 py-1.5 text-left text-[13px] transition-colors ${
             selected === null ? "text-ink" : "text-ink-dim hover:bg-surface hover:text-ink"
           }`}
         >
-          <Home size={14} className="flex-shrink-0" />
+          {/* The same 28px box the playlist covers sit in, so Home's label
+              lines up with theirs rather than hanging 14px to the left. */}
+          <span className="flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-md bg-surface-2">
+            <Home size={14} />
+          </span>
           <span className="min-w-0 flex-1 truncate">Home</span>
         </button>
       </div>
@@ -655,10 +749,11 @@ const PlaylistNav = memo(function PlaylistNav({
             )}
             <button
               onClick={() => onSelect(i)}
-              className={`relative flex w-full items-center gap-2 rounded-xl px-3 py-2 text-left text-[13px] transition-colors ${
+              className={`relative flex w-full items-center gap-2.5 rounded-xl px-2 py-1.5 text-left text-[13px] transition-colors ${
                 selected === i ? "text-ink" : "text-ink-dim hover:bg-surface hover:text-ink"
               }`}
             >
+              <Thumbnail srcs={[p.thumbnail]} className="h-7 w-7 flex-shrink-0 rounded-md" />
               <span className="min-w-0 flex-1 truncate">{p.title}</span>
               {p.count !== null && !p.failed && (
                 <span className="font-mono text-[11px] text-ink-ghost">{p.count}</span>
@@ -717,6 +812,19 @@ function App() {
   const [showQueue, setShowQueue] = useState(false);
   const [menu, setMenu] = useState<MenuState | null>(null);
   const [history, setHistory] = useState<HistoryView | null>(null);
+  const [upNext, setUpNext] = useState<Track | null>(null);
+  const [showKeymap, setShowKeymap] = useState(false);
+  /** A one-line confirmation -- "Added to Liked Music" -- the TUI's toast.
+   * Actions that land silently otherwise look like they did nothing. */
+  const [notice, setNotice] = useState<string | null>(null);
+  const noticeTimer = useRef<number | undefined>(undefined);
+  const notify = useCallback((msg: string) => {
+    setNotice(msg);
+    window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = window.setTimeout(() => setNotice(null), 2500);
+  }, []);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const filterRef = useRef<HTMLInputElement>(null);
 
   const playbackRef = useRef<PlaybackStateView | null>(null);
   useEffect(() => {
@@ -798,12 +906,25 @@ function App() {
     };
   }, []);
 
+  /* The TUI's letter keys, rebuilt on every render so each one sees current
+     state, and read through a ref by the one listener below -- which is
+     registered once rather than re-bound on every progress tick. */
+  const keyActions = useRef<Record<string, () => void>>({});
+
   // Standard media shortcuts. Registered once (via a ref for the latest
   // playback snapshot) rather than re-bound on every progress tick.
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName;
+      if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") {
+        // Esc leaves a text field rather than being swallowed by it, so the
+        // keys work again without reaching for the mouse.
+        if (e.key === "Escape") target?.blur();
+        return;
+      }
+      // Leave the platform's own chords (copy, reload, devtools) alone.
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
 
       const current = playbackRef.current;
       switch (e.key) {
@@ -827,6 +948,13 @@ function App() {
           e.preventDefault();
           if (current) invoke("set_volume", { volume: Math.max(0, current.volume - VOLUME_STEP) });
           break;
+        default: {
+          const action = keyActions.current[e.key];
+          if (action) {
+            e.preventDefault();
+            action();
+          }
+        }
       }
     }
     window.addEventListener("keydown", onKeyDown);
@@ -1091,11 +1219,43 @@ function App() {
   // The queue changes on transport events, not on the elapsed tick, so it is
   // re-read when the playing track or the queue's own length changes rather
   // than four times a second.
+  //
+  // Only while the panel is open: `get_queue` resolves and serialises every
+  // entry, and with the panel shut nothing reads the answer. Opening it is
+  // one of the dependencies, so it is never shown stale.
   useEffect(() => {
-    refreshQueue();
+    if (showQueue) refreshQueue();
     // `queue_revision` rather than the length: shuffling reorders the queue
     // without changing how long it is, and the panel has to follow that.
-  }, [playback?.track, playback?.queue_revision, playback?.queue_position, refreshQueue]);
+  }, [showQueue, playback?.track, playback?.queue_revision, playback?.queue_position, refreshQueue]);
+
+  /* The one track after this one, on the same triggers as the queue but
+     unconditionally -- it is a single row, and the now-playing view shows it
+     whether or not the panel is open. */
+  useEffect(() => {
+    if (!playback) return;
+    let cancelled = false;
+    invoke<Track | null>("get_up_next")
+      .then((t) => {
+        if (!cancelled) setUpNext(t);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [playback?.track, playback?.queue_revision, playback?.queue_position]);
+
+  /** Likes what is playing -- the TUI's `L`, and the heart in both bars. */
+  const likeCurrent = useCallback(() => {
+    const videoId = currentTrackRef.current?.video_id;
+    if (!videoId) return;
+    invoke("like_track", { videoId })
+      .then(() => {
+        notify("Added to Liked Music");
+        refreshPlaylists();
+      })
+      .catch((e) => setError(String(e)));
+  }, [notify]);
 
   const queueAction = useCallback(
     (cmd: string, args: Record<string, unknown>) => {
@@ -1120,7 +1280,10 @@ function App() {
     (qPos: number) => queueAction("remove_from_queue", { qPos }),
     [queueAction],
   );
-  const onClearQueue = useCallback(() => queueAction("clear_queue", {}), [queueAction]);
+  const onClearQueue = useCallback(() => {
+    queueAction("clear_queue", {});
+    notify("Queue cleared");
+  }, [queueAction, notify]);
 
   const retryPlaylist = useCallback((index: number) => {
     invoke("refetch_playlist", { index })
@@ -1344,6 +1507,39 @@ function App() {
     invoke("play_history_track", { index }).catch((e) => setError(String(e)));
   }, []);
 
+  const nowPlaying = view === "now-playing";
+  const hasLyrics = Boolean(lyrics && lyrics.lines.length > 0);
+  keyActions.current = {
+    n: () => invoke("next"),
+    p: () => invoke("prev"),
+    m: () => invoke("toggle_mute"),
+    t: () => invoke("cycle_mode"),
+    L: likeCurrent,
+    "?": () => setShowKeymap((v) => !v),
+    Escape: () => {
+      if (showKeymap) setShowKeymap(false);
+      else if (pickerOpen) setPickerOpen(false);
+      else if (nowPlaying) setView("library");
+      else if (results) setResults(null);
+    },
+    y: () => (nowPlaying ? setView("library") : onOpenNowPlaying()),
+    ...(nowPlaying
+      ? {
+          c: () => hasLyrics && openPicker(),
+          i: () => config?.translateTo && setTranslateMode((m) => (m === "free" ? "off" : "free")),
+          I: () => config?.aiAvailable && setTranslateMode((m) => (m === "ai" ? "off" : "ai")),
+        }
+      : {
+          s: () => searchRef.current?.focus(),
+          "/": () => filterRef.current?.focus(),
+          o: () => setShowQueue((v) => !v),
+          H: () => {
+            setResults(null);
+            setSelected(null);
+          },
+        }),
+  };
+
 
   return (
     <div className="fixed inset-0 overflow-hidden bg-bg text-ink">
@@ -1361,6 +1557,8 @@ function App() {
         songs={filteredSongs}
         history={history}
         onPlayHistory={onPlayHistory}
+        searchRef={searchRef}
+        filterRef={filterRef}
         filter={filter}
         setFilter={setFilter}
         query={query}
@@ -1398,10 +1596,26 @@ function App() {
           navOpen={!results}
           queueOpen={showQueue}
           onToggleQueue={() => setShowQueue((v) => !v)}
+          onLike={likeCurrent}
         />
       )}
 
       {menu && <ContextMenu state={menu} onClose={() => setMenu(null)} />}
+
+      <AnimatePresence>
+        {notice && (
+          <motion.div
+            key="notice"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8 }}
+            transition={{ duration: 0.2 }}
+            className="pointer-events-none fixed inset-x-0 bottom-[calc(var(--player-bar-h)+0.5rem)] z-40 flex justify-center"
+          >
+            <p className="rounded-full px-4 py-2 text-[13px] text-ink shadow-lg shadow-black/40 glass-heavy">{notice}</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {view === "now-playing" && playback && (
@@ -1423,10 +1637,55 @@ function App() {
             onOpenPicker={openPicker}
             onClosePicker={() => setPickerOpen(false)}
             onPickRecord={pickRecord}
+            upNext={upNext}
+            onLike={likeCurrent}
           />
         )}
       </AnimatePresence>
+
+      <AnimatePresence>{showKeymap && <KeymapOverlay onClose={() => setShowKeymap(false)} />}</AnimatePresence>
     </div>
+  );
+}
+
+/** The TUI's `?`: every shortcut, over everything, dismissed by any click or
+ * by `?`/Esc again. */
+function KeymapOverlay({ onClose }: { onClose: () => void }) {
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.15 }}
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 backdrop-blur-sm select-none"
+    >
+      <motion.div
+        initial={{ scale: 0.96, y: 8 }}
+        animate={{ scale: 1, y: 0 }}
+        exit={{ scale: 0.96, y: 8 }}
+        transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+        className="w-[26rem] max-w-[calc(100vw-2rem)] rounded-2xl border-[0.5px] border-hairline bg-[#16161a]/95 p-5 shadow-2xl shadow-black/60"
+      >
+        <h2 className="mb-3 flex items-center gap-2 text-[15px] font-semibold text-ink">
+          <Keyboard size={16} className="text-ink-dim" /> Keyboard shortcuts
+        </h2>
+        <dl className="grid grid-cols-[auto_1fr] gap-x-5 gap-y-1.5 text-[13px]">
+          {GUI_KEYMAP.map(([key, desc], i) =>
+            key ? (
+              <div key={key} className="contents">
+                <dt className="text-right">
+                  <kbd className="rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-[11px] text-ink">{key}</kbd>
+                </dt>
+                <dd className="text-ink-dim">{desc}</dd>
+              </div>
+            ) : (
+              <div key={`gap-${i}`} className="col-span-2 h-1.5" />
+            ),
+          )}
+        </dl>
+      </motion.div>
+    </motion.div>
   );
 }
 
@@ -1446,6 +1705,8 @@ interface LibraryViewProps {
       that came back empty, which is what the home page's empty state means. */
   history: HistoryView | null;
   onPlayHistory: (index: number) => void;
+  searchRef: RefObject<HTMLInputElement | null>;
+  filterRef: RefObject<HTMLInputElement | null>;
   filter: string;
   setFilter: (f: string) => void;
   query: string;
@@ -1495,6 +1756,8 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
     songs,
     history,
     onPlayHistory,
+    searchRef,
+    filterRef,
     filter,
     setFilter,
     query,
@@ -1525,6 +1788,7 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
   } = props;
 
   const playlistTitle = selected === null ? null : (playlists[selected]?.title ?? null);
+  const playlistCover = selected === null ? null : (playlists[selected]?.thumbnail ?? null);
 
   /* What the page's second line says, in the four states it has. A filter is
      the odd one: `songs` is already the filtered list, so its length is a
@@ -1567,6 +1831,7 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
             <div className="flex min-w-0 flex-1 items-center gap-2 rounded-full px-3.5 py-1.5 glass">
               <Search size={15} className="flex-shrink-0 text-ink-faint" />
               <input
+                ref={searchRef}
                 type="search"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
@@ -1653,6 +1918,8 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
                 currentTrackId={currentTrack?.video_id}
                 paused={paused}
                 onPlayTrack={onPlayHistory}
+                playlists={playlists}
+                onOpenPlaylist={setSelected}
               />
             ) : (
             <>
@@ -1670,12 +1937,27 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
                 from the sidebar's own data, so the line is answerable in the
                 moment between selecting a playlist and its tracks arriving --
                 which is exactly when a blank page reads as a broken one. */}
-            <header className="flex items-end justify-between gap-4 px-3 pt-1 pb-4 select-none">
-              <div className="min-w-0">
-                <h1 className="truncate text-[26px] leading-tight font-semibold tracking-tight text-ink">
-                  {results ? "Search results" : (playlistTitle ?? "Tracks")}
-                </h1>
-                {meta && <p className="mt-1 truncate text-[13px] text-ink-dim">{meta}</p>}
+            <header className="flex flex-wrap items-end justify-between gap-4 px-3 pt-1 pb-5 select-none">
+              <div className="flex min-w-0 items-end gap-5">
+                {/* The playlist's face: its first track's cover, as the
+                    service's own mosaic leads with. A page of rows with no
+                    picture at the top reads as a spreadsheet; this is what
+                    says which playlist it is before a word is read. */}
+                {!results && selected !== null && (
+                  <Thumbnail
+                    srcs={playlistCover ? coverCandidates(playlistCover, 320) : []}
+                    className="h-32 w-32 flex-shrink-0 rounded-2xl shadow-xl shadow-black/40"
+                  />
+                )}
+                <div className="min-w-0 pb-0.5">
+                  {!results && selected !== null && (
+                    <p className="mb-1 text-[11px] font-semibold tracking-wider text-ink-faint uppercase">Playlist</p>
+                  )}
+                  <h1 className="truncate text-[30px] leading-tight font-bold tracking-tight text-ink">
+                    {results ? "Search results" : (playlistTitle ?? "Tracks")}
+                  </h1>
+                  {meta && <p className="mt-1 truncate text-[13px] text-ink-dim">{meta}</p>}
+                </div>
               </div>
               <div className="flex flex-shrink-0 items-center gap-2">
                 {/* Play takes the list as it is shown -- filtered, sorted, or
@@ -1710,6 +1992,7 @@ const LibraryView = memo(function LibraryView(props: LibraryViewProps) {
                 <div className="flex min-w-0 max-w-56 flex-1 items-center gap-1.5 rounded-full bg-surface px-2.5 py-1">
                   <Filter size={12} className="flex-shrink-0 text-ink-ghost" />
                   <input
+                    ref={filterRef}
                     value={filter}
                     onChange={(e) => setFilter(e.target.value)}
                     onKeyDown={(e) => e.key === "Escape" && setFilter("")}
@@ -1785,6 +2068,7 @@ interface PlayerBarProps {
   navOpen: boolean;
   queueOpen: boolean;
   onToggleQueue: () => void;
+  onLike: () => void;
 }
 
 /** The one piece that genuinely has to redraw on every playback tick, kept as
@@ -1796,6 +2080,7 @@ function PlayerBar({
   navOpen,
   queueOpen,
   onToggleQueue,
+  onLike,
 }: PlayerBarProps) {
   const remaining = Math.max(0, playback.total - playback.elapsed);
   const album = currentTrack?.album?.name;
@@ -1894,6 +2179,15 @@ function PlayerBar({
         </div>
 
         <div className="flex min-w-0 flex-shrink-0 items-center justify-end gap-3">
+          <button
+            onClick={onLike}
+            disabled={!currentTrack?.video_id}
+            aria-label="Like"
+            title="Add to Liked Music (L)"
+            className="text-ink-dim transition-colors hover:text-accent disabled:opacity-30"
+          >
+            <Heart size={16} />
+          </button>
           <button
             onClick={onToggleQueue}
             aria-label="Up Next"
@@ -2206,6 +2500,9 @@ interface NowPlayingViewProps {
   onOpenPicker: () => void;
   onClosePicker: () => void;
   onPickRecord: (id: number) => void;
+  /** The track after this one, if the queue has one. */
+  upNext: Track | null;
+  onLike: () => void;
 }
 
 function NowPlayingView({
@@ -2226,6 +2523,8 @@ function NowPlayingView({
   onOpenPicker,
   onClosePicker,
   onPickRecord,
+  upNext,
+  onLike,
 }: NowPlayingViewProps) {
   // The configured offset shifts the clock handed to the active-line search,
   // never the cached records -- same rule as the TUI's `Config::lyric_time`.
@@ -2402,9 +2701,26 @@ function NowPlayingView({
                 />
               </div>
 
-              <div className="on-artwork mt-6">
-                <h2 className="text-2xl font-bold">{currentTrack?.title ?? "Nothing playing"}</h2>
-                {currentTrack && <p className="mt-1 text-[15px] text-white/70">{artistNames(currentTrack)}</p>}
+              {/* Title block with the heart beside it rather than in the
+                  transport: liking is about the song, not about playback, and
+                  Apple puts it in the same place for the same reason. */}
+              <div className="on-artwork mt-6 flex w-full items-center gap-3">
+                <span className="w-8 flex-shrink-0" aria-hidden />
+                <div className="min-w-0 flex-1">
+                  <h2 className="truncate text-2xl font-bold">{currentTrack?.title ?? "Nothing playing"}</h2>
+                  {currentTrack && (
+                    <p className="mt-1 truncate text-[15px] text-white/70">{artistNames(currentTrack)}</p>
+                  )}
+                </div>
+                <button
+                  onClick={onLike}
+                  disabled={!currentTrack?.video_id}
+                  aria-label="Like"
+                  title="Add to Liked Music (L)"
+                  className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full text-white/60 transition-colors hover:bg-white/10 hover:text-accent disabled:opacity-30"
+                >
+                  <Heart size={18} />
+                </button>
               </div>
 
               {/* Under the artwork rather than across the foot of the window.
@@ -2450,6 +2766,19 @@ function NowPlayingView({
                     {playback.muted ? <VolumeX size={18} /> : <Volume2 size={18} />}
                   </button>
                 </div>
+                {/* What the queue plays next -- the line a radio will keep
+                    topping up. Reserved even when empty, so the block above
+                    does not jump when the last track in the queue starts. */}
+                <p className="on-artwork mt-6 h-5 truncate text-[12px] text-white/55">
+                  {upNext && (
+                    <>
+                      <span className="font-semibold tracking-wider text-white/40 uppercase">Up next</span>
+                      <span className="mx-2 text-white/30">·</span>
+                      {upNext.title ?? "Untitled"}
+                      {artistNames(upNext) && <span className="text-white/40"> — {artistNames(upNext)}</span>}
+                    </>
+                  )}
+                </p>
               </div>
             </motion.div>
           </div>
