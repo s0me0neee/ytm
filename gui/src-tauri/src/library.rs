@@ -61,13 +61,17 @@ pub fn get_songs(state: State<'_, AppState>, index: usize) -> Vec<Track> {
 /// The mirror of `tui/src/app.rs`'s own `follow_tracks`, over the same shared
 /// `library::moved_indices`. `None` from it means nothing moved -- which is
 /// what appending to an ordinary playlist does -- and then nothing is touched.
-fn follow_tracks(state: &AppState, pl: usize, pending: &crate::state::PendingRefresh) {
+fn follow_tracks(
+    state: &AppState,
+    lib: &mut ytm_core::Library,
+    pl: usize,
+    pending: &crate::state::PendingRefresh,
+) {
     if pending.before.is_empty() {
         return;
     }
     // Library before player, matching the order every command and the ticker
     // take -- the opposite order here would be a lock-order inversion.
-    let Ok(mut lib) = state.library.lock() else { return };
     let Some(moved) = library::moved_indices(&pending.before, lib.songs(pl)) else {
         return;
     };
@@ -92,8 +96,8 @@ fn follow_tracks(state: &AppState, pl: usize, pending: &crate::state::PendingRef
     });
 }
 
-/// Refetches `pl` after an edit, recording what it held first so the queue can
-/// be carried across a reorder. Called by `add_to_playlist`.
+/// Refetches `pl`, recording what it held first so the queue can be carried
+/// across a reorder. Called by `add_to_playlist` and the sidebar's Refresh.
 pub fn refresh_after_edit(state: &AppState, pl: usize) -> Result<(), String> {
     // The two locks are taken one at a time rather than nested. Nesting would
     // have to be library-then-player to match every other caller, and holding
@@ -145,25 +149,16 @@ pub fn refresh_after_edit(state: &AppState, pl: usize) -> Result<(), String> {
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
 pub fn refetch_playlist(state: State<'_, AppState>, index: usize) -> Result<(), String> {
-    let playlist_id = {
+    {
         let mut lib = state.library.lock().map_err(|e| e.to_string())?;
-        let id = lib
-            .playlist(index)
-            .ok_or_else(|| "no such playlist".to_string())?
-            .playlist_id
-            .clone();
+        if lib.playlist(index).is_none() {
+            return Err("no such playlist".to_string());
+        }
         lib.mark_retrying(index);
-        id
-    };
-
-    state
-        .fetcher
-        .lock()
-        .map_err(|e| e.to_string())?
-        .as_ref()
-        .ok_or_else(|| "library not fetched yet".to_string())?
-        .fetch(index, &playlist_id);
-    Ok(())
+    }
+    // Through the edit path, since "Refresh" on a loaded playlist can bring it
+    // back reordered, and the queue's positions into it have to follow.
+    refresh_after_edit(&state, index)
 }
 
 /// Builds an authenticated client, kicks off a background cookie refresh
@@ -234,19 +229,19 @@ pub fn bootstrap(app: &AppHandle, state: &AppState) -> Result<(), String> {
     let app_handle = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         while let Ok((idx, songs)) = songs_rx.recv() {
+            // A refetch lands here like any other batch, so this is the only
+            // place the queue can be carried across it -- under the same lock
+            // as the batch, or a song ending in between plays the wrong entry.
             if let Ok(mut lib) = batch_state.library.lock() {
                 lib.apply_song_batch(idx, songs);
-            }
-            // A refetch asked for by `add_to_playlist` lands here like any
-            // other batch, so this is the only place the queue can be carried
-            // across it.
-            let pending = batch_state
-                .pending_refresh
-                .lock()
-                .ok()
-                .and_then(|mut p| p.remove(&idx));
-            if let Some(pending) = pending {
-                follow_tracks(&batch_state, idx, &pending);
+                let pending = batch_state
+                    .pending_refresh
+                    .lock()
+                    .ok()
+                    .and_then(|mut p| p.remove(&idx));
+                if let Some(pending) = pending {
+                    follow_tracks(&batch_state, &mut lib, idx, &pending);
+                }
             }
             // The only thing that can advance a saved queue towards resolving:
             // its entries name playlists, and this is where a playlist arrives.

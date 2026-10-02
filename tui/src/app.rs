@@ -2277,7 +2277,9 @@ impl App {
             }
             RestoreOutcome::Ready { queue, position } => {
                 self.pending_queue_restore = None;
-                self.player.restore(&self.library, queue, position);
+                if !self.player.restore(&self.library, queue, position) {
+                    return;
+                }
                 self.queue_view_state.select(position);
                 self.list_state
                     .select(self.player.playing().map(|(pl, _)| pl));
