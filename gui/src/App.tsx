@@ -232,6 +232,7 @@ const GUI_KEYMAP: [string, string][] = [
   ["t", "Cycle play mode"],
   ["L", "Like the playing song"],
   ["R", "Radio from the playing song"],
+  ["P", "Add the playing song to a playlist"],
   ["", ""],
   ["s", "Search YouTube Music"],
   ["/", "Filter this playlist"],
@@ -1536,6 +1537,12 @@ function App() {
     R: () => {
       const at = playbackRef.current?.playing;
       if (at) queueAction("start_radio", { playlist: at[0], song: at[1] });
+    },
+    // The right-click submenu, opened mid-window -- a key has no pointer.
+    P: () => {
+      const videoId = currentTrackRef.current?.video_id;
+      if (!videoId) return;
+      setMenu({ x: window.innerWidth / 2 - 104, y: window.innerHeight / 3, items: addToPlaylistItems(videoId) });
     },
     "?": () => setShowKeymap((v) => !v),
     Escape: () => {

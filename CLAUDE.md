@@ -334,6 +334,11 @@ tools/           not a member and not shipped — see `macos-check` above
   lines and lost on 2%. Any failure — rate limit, spent balance, bad model id, either
   alignment check — logs and falls through to the free path, so the feature never
   disappears, only its quality changes.
+  DeepSeek can't be held to the schema, and `deepseek-v4-flash` makes two slips in
+  otherwise correct replies: a stray quote after an index (`"index":9","source"`) and an
+  entry closed twice (`…"},"},{"index"…`). Between them they broke 5 replies in 8 on a
+  45-line song, which looked like the AI path barely working. `repair` puts both right, and
+  only on a reply that failed to parse, since neither can occur in one that parsed.
 
   The free path is policy over the `rust-translate` crate, which wraps Google's public
   `translate_a/single`. Two of the crate's flaws are handled here and both are silent if
@@ -343,7 +348,11 @@ tools/           not a member and not shipped — see `macos-check` above
   it can be *proved* complete — one line back per line sent. `translate_distinct` probes
   with the first batch: whole ⇒ the rest of the song goes the same way (Japanese comes back
   in one segment, so a song is a couple of requests); short ⇒ re-fetched a sentence at a
-  time via `sentence_pieces`, which the endpoint cannot segment further. Blank and repeated
+  time via `sentence_pieces`, which the endpoint cannot segment further. A probe that
+  *fails*, rather than coming back short, ends the song there: the endpoint rate-limits
+  with an HTTP 429 page, and treating that as "short" sent about forty more requests into
+  the limit. The crate parses that page as JSON without checking the status, so
+  `translate_group` reports a JSON error at 1:1 as a rate limit. Blank and repeated
   lines are never sent, so a chorus costs one request. Returns one entry per input line,
   empty where nothing could be translated.
 - **`media/`** — the OS's own media controls: the keyboard's media keys, *and* the panel the
@@ -690,8 +699,13 @@ tools/           not a member and not shipped — see `macos-check` above
   - **Search**: `s` opens it — a query line, then results. Songs are listed before videos and
     each row is marked `♪ song` or `▶ video` with its length, because the two are genuinely
     different things and the choice should be deliberate. `↵` plays (through
-    `place_search_result`, so it queues and gets lyrics like any other track), `a` opens a
-    modal listing the user's own playlists to add it to, `/` returns to the query line.
+    `place_search_result`, so it queues and gets lyrics like any other track), `a` queues it
+    as `a` does any song, `/` returns to the query line.
+  - **Add to playlist**: `P` opens a modal listing the user's own playlists, for whatever
+    song is selected — a search result, a row in songs, queue or history, or the playing
+    track in lyrics mode or from the playlists panel (`selected_song`, the same rule `R`
+    follows). `AddPicker` takes the song when it opens, so it belongs to no panel and moving
+    the selection underneath changes nothing. It used to be `a` in search alone.
     Liked Music is special-cased: its id is literally `LM` and it is the like button rather
     than a playlist items can be added to.
     An add that lands **refetches that playlist** (`refresh_playlist`), so the new track is
@@ -712,7 +726,7 @@ tools/           not a member and not shipped — see `macos-check` above
     kind and length off a short panel.
     `search_has_focus` is the one predicate deciding whether the panel owns the keyboard, and
     the key dispatch, the hint bar and the header colour all read it, so they cannot disagree.
-    Typing a query and the add modal take every key regardless of focus — `h` mid-word must
+    Typing a query takes every key regardless of focus (as the `P` modal does, ahead of it) — `h` mid-word must
     type an `h` — but once there are results to move through, `h`/`l` are the ordinary panel
     keys and focus returns to the playlists, exactly as in lyrics mode.
   - **Now playing card**: in lyrics mode the *playlists* column is given over to the playing
@@ -875,6 +889,7 @@ since serde ignores what it no longer knows about.
 The window answers the TUI's letters wherever the action exists in both — `n`/`p`, `m`, `t`,
 `s` (focus search), `/` (focus filter), `o` (queue), `H` (home), `y` (now playing), `L` (like),
 `R` (radio from the playing song; the track, result and queue menus offer it per row),
+`P` (the playing song's "Add to Playlist" menu, opened mid-window),
 and in now playing `c`/`i`/`I` — with `?` opening `KeymapOverlay`. They go through
 `keyActions`, a ref rebuilt every render and read by the one `keydown` listener, so each
 action sees current state without the listener being re-bound on the playback tick. Esc in a
@@ -971,7 +986,8 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `H` | Recently played — `history.json`, shared with the GUI's home page |
 | `L` | Like the playing song |
 | `R` | Radio: replace the queue with a station seeded from the highlighted song (or the playing one in lyrics mode or the playlists panel), topped up as it plays |
-| `s` | Search YouTube Music (`↵` play, `a` add to a playlist, `/` edit query) |
+| `P` | Add the selected song (or the playing one in lyrics mode or the playlists panel) to one of your playlists |
+| `s` | Search YouTube Music (`↵` play, `a` queue, `P` add to a playlist, `/` edit query) |
 | `y` | Toggle lyrics panel |
 | `c` | (in lyrics mode) Choose a different lrclib record |
 | `i` | (in lyrics mode) Toggle the translation under each line, from the free endpoint |
