@@ -83,7 +83,7 @@ pub use lyrics::{LyricsKind, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics}
 pub use media::{Host, MediaCmd, MediaControls, NowPlaying, PlayState, TrackInfo};
 pub use playback::AudioState;
 pub use player::{AppendOutcome, PlayMode, Player, RemoveOutcome, TrackRef};
-pub use radio::RadioMsg;
+pub use radio::{RadioMsg, Station};
 pub use search::{ResultKind, SearchMsg, SearchResult};
 pub use session::{Browser, Reauth, Session};
 pub use translate::TranslateMsg;

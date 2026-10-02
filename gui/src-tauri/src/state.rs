@@ -70,6 +70,9 @@ pub struct AppState {
     /// passing through four times a second records one play rather than a
     /// thousand. See `history::observe`.
     pub last_noted: Arc<Mutex<Option<String>>>,
+    /// The radio playing, if one is. Locked after library and player, never
+    /// before. See `radio.rs`.
+    pub station: Arc<Mutex<Option<ytm_core::Station>>>,
     /// Guards `library::bootstrap` against running twice concurrently -- e.g. a
     /// fast double-click on "Sign in" firing two `sign_in` commands before the
     /// first disables the button. Two concurrent bootstraps would each spawn

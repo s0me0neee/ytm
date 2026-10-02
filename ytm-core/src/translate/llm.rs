@@ -471,6 +471,39 @@ fn snippet(text: &str) -> String {
     }
 }
 
+/// `text` with the two slips `deepseek-v4-flash` makes in otherwise correct
+/// replies put right — measured, between them, in 5 replies of 8 on a 45-line
+/// song. Neither can occur in a reply that parses, so this is only tried on one
+/// that did not.
+fn repair(text: &str) -> String {
+    // An entry's closer written twice, `…"},"},{"index"…`, which reads as a
+    // string `"},{"` in the array. Inside a real string the quotes would be
+    // escaped, so the unescaped run is only ever this.
+    unquote_indices(text).replace(r#"},"},{"#, "},{")
+}
+
+/// `text` with the stray quote after an index — `"index":9","source"` — taken
+/// out.
+fn unquote_indices(text: &str) -> String {
+    const KEY: &str = "\"index\":";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(KEY) {
+        let (head, tail) = rest.split_at(at + KEY.len());
+        out.push_str(head);
+        let spaced = tail.trim_start();
+        let after = spaced.trim_start_matches(|c: char| c.is_ascii_digit());
+        let had_digits = after.len() < spaced.len();
+        out.push_str(&tail[..tail.len() - after.len()]);
+        rest = match after.strip_prefix('"') {
+            Some(unquoted) if had_digits => unquoted,
+            _ => after,
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
 /// One translation per line in `order`, or an error if the reply cannot be
 /// placed exactly: short, repeated, out of range, or echoing the wrong line.
 fn place(text: &str, order: &[&str]) -> Result<Vec<String>, String> {
@@ -485,7 +518,12 @@ fn place(text: &str, order: &[&str]) -> Result<Vec<String>, String> {
         lines: Vec<Entry>,
     }
 
-    let reply: Reply = serde_json::from_str(text).map_err(|e| format!("bad reply shape: {e}"))?;
+    let reply: Reply = match serde_json::from_str(text) {
+        Ok(reply) => reply,
+        Err(e) => serde_json::from_str(&repair(text))
+            .inspect(|_| log::debug!("translate: repaired a malformed reply"))
+            .map_err(|_| format!("bad reply shape: {e}"))?,
+    };
 
     let mut out = vec![String::new(); order.len()];
     let mut filled = vec![false; order.len()];
@@ -647,6 +685,26 @@ mod tests {
         let reply = r#"{"lines":[{"index":7,"source":"seven","text":"七"}]}"#;
         let err = place(reply, &["one"]).unwrap_err();
         assert!(err.contains("indexed line 7"), "{err}");
+    }
+
+    #[test]
+    fn a_stray_quote_after_an_index_is_repaired() {
+        // Verbatim shape from `deepseek-v4-flash`.
+        let reply = r#"{"lines":[{"index":0,"source":"one","text":"1"},{"index":1","source":"two","text":"2"}]}"#;
+        assert_eq!(place(reply, &["one", "two"]).expect("repaired"), ["1", "2"]);
+    }
+
+    #[test]
+    fn an_entry_closed_twice_is_repaired() {
+        // Verbatim shape from `deepseek-v4-flash`.
+        let reply = r#"{"lines":[{"index":0,"source":"one","text":"1"},"},{"index":1,"source":"two","text":"2"}]}"#;
+        assert_eq!(place(reply, &["one", "two"]).expect("repaired"), ["1", "2"]);
+    }
+
+    #[test]
+    fn a_quoted_index_or_a_quote_in_the_text_is_left_alone() {
+        let text = r#"{"index":"3","text":"say \"index\":4 aloud"}"#;
+        assert_eq!(unquote_indices(text), text);
     }
 
     #[test]

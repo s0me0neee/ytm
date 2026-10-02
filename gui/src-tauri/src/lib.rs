@@ -7,6 +7,7 @@ mod media;
 mod persist;
 mod player;
 mod profile;
+mod radio;
 mod search;
 mod state;
 mod translate;
@@ -50,6 +51,38 @@ fn init_logging() {
     }
 }
 
+/// Everything the commands share, before anything has been fetched.
+fn initial_state(
+    session: ytm_core::Session,
+    player: ytm_core::Player,
+    config: ytm_core::Config,
+) -> AppState {
+    AppState {
+        session,
+        library: Arc::new(Mutex::new(ytm_core::Library::default())),
+        player: Arc::new(Mutex::new(player)),
+        client: Arc::new(Mutex::new(None)),
+        fetcher: Arc::new(Mutex::new(None)),
+        config: Arc::new(config),
+        lyrics_overrides: Arc::new(Mutex::new(
+            ytm_core::persistence::load_lyrics_overrides(),
+        )),
+        translations: Arc::new(Mutex::new(ytm_core::persistence::load_translations())),
+        pending_refresh: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        last_emitted: Arc::new(Mutex::new(None)),
+        // Resolved by `persist::try_restore_queue` as the playlists it
+        // names arrive; nothing to do here but read the file.
+        pending_queue_restore: Arc::new(Mutex::new(
+            ytm_core::persistence::load_queue(),
+        )),
+        last_published: Arc::new(Mutex::new(None)),
+        history: Arc::new(Mutex::new(ytm_core::persistence::load_history())),
+        last_noted: Arc::new(Mutex::new(None)),
+        station: Arc::new(Mutex::new(None)),
+        bootstrapping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
+
 /// # Errors
 /// Returns an error if the Tauri runtime fails to start.
 // `generate_context!` expands to a `process::exit`; it is tauri's code, not ours.
@@ -74,29 +107,7 @@ pub fn run() -> tauri::Result<()> {
             // read the same way — see `persist.rs`.
             player.set_volume(ytm_core::persistence::load_settings().volume);
 
-            let state = AppState {
-                session: session.clone(),
-                library: Arc::new(Mutex::new(ytm_core::Library::default())),
-                player: Arc::new(Mutex::new(player)),
-                client: Arc::new(Mutex::new(None)),
-                fetcher: Arc::new(Mutex::new(None)),
-                config: Arc::new(config),
-                lyrics_overrides: Arc::new(Mutex::new(
-                    ytm_core::persistence::load_lyrics_overrides(),
-                )),
-                translations: Arc::new(Mutex::new(ytm_core::persistence::load_translations())),
-                pending_refresh: Arc::new(Mutex::new(std::collections::HashMap::new())),
-                last_emitted: Arc::new(Mutex::new(None)),
-                // Resolved by `persist::try_restore_queue` as the playlists it
-                // names arrive; nothing to do here but read the file.
-                pending_queue_restore: Arc::new(Mutex::new(
-                    ytm_core::persistence::load_queue(),
-                )),
-                last_published: Arc::new(Mutex::new(None)),
-                history: Arc::new(Mutex::new(ytm_core::persistence::load_history())),
-                last_noted: Arc::new(Mutex::new(None)),
-                bootstrapping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            };
+            let state = initial_state(session.clone(), player, config);
             app.manage(state.clone());
 
             // On the main thread, which is the one requirement: macOS delivers
@@ -158,6 +169,8 @@ pub fn run() -> tauri::Result<()> {
             profile::log_render_timing,
             history::get_history,
             history::play_history_track,
+            radio::start_radio,
+            radio::start_radio_from_search,
         ])
         .build(tauri::generate_context!())?
         // `build` + `run` rather than `run` alone, purely to get here. This is

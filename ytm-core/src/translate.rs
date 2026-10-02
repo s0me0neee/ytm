@@ -364,7 +364,20 @@ async fn translate_group(
         .await
         // The crate's error is a `Box<dyn Error>`, which is not `Send` and so
         // cannot cross a task boundary. Stringify it here, as `LyricsMsg` does.
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            // The crate parses whatever came back without looking at the
+            // status, so a 429's HTML page surfaces as a JSON error at 1:1.
+            let not_json = e
+                .downcast_ref::<serde_json::Error>()
+                .is_some_and(|j| j.line() == 1 && j.column() == 1);
+            if not_json {
+                "Google's free translator answered with a page, not a translation \
+                 — usually a rate limit"
+                    .to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
 
     let parts: Vec<String> = raw.split('\n').map(|p| p.trim().to_string()).collect();
     if parts.len() != lines.len() || parts.iter().any(String::is_empty) {
@@ -434,10 +447,10 @@ async fn translate_distinct(lines: &[&str], to: &str) -> (Vec<Option<String>>, O
             log::debug!("translate: the endpoint segments this source — falling back to sentences");
             false
         }
-        Err(e) => {
-            note(e);
-            false
-        }
+        // The probe failed outright rather than coming back short, so the
+        // endpoint is unreachable or limiting us. Splitting into a request per
+        // sentence would only send it forty more.
+        Err(e) => return (out, Some(e)),
     };
 
     if batched {

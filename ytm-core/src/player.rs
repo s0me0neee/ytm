@@ -540,6 +540,21 @@ impl Player {
         }
     }
 
+    /// Replaces the queue with one track and plays it — the start of a radio,
+    /// whose pages arrive afterwards through [`Player::append_many`]. A seed
+    /// already playing carries on rather than starting over.
+    pub fn play_seed(&mut self, library: &Library, pl_idx: usize, song_idx: usize) {
+        self.queue = vec![(pl_idx, song_idx)];
+        self.queue_pos = Some(0);
+        self.unshuffled = matches!(self.mode, PlayMode::Shuffle).then(|| self.queue.clone());
+        self.revision += 1;
+        log::info!("play_seed: pl={pl_idx} song={song_idx}");
+        if self.playing == Some((pl_idx, song_idx)) && self.playback_started {
+            return;
+        }
+        self.do_play(library, pl_idx, song_idx);
+    }
+
     /// Appends a batch, as one revision — a radio page is twenty-odd entries
     /// and each revision is a queue redraw in both frontends. Starts playing
     /// the first of them when nothing is playing, as a single append does.
@@ -582,6 +597,9 @@ impl Player {
     /// leave the player with a track it could not advance from.
     pub fn clear_queue(&mut self) {
         self.stop();
+        // Kept, it was a track with no queue entry: `a` queued without
+        // starting it, and Space played the cleared track back.
+        self.playing = None;
         self.queue.clear();
         self.queue_pos = None;
         self.unshuffled = None;
@@ -687,7 +705,21 @@ impl Player {
     /// queue and current position, and warms the CDN cache for the current
     /// track. Call [`Player::start_current`] (e.g. on the user's first
     /// play/pause keypress) to actually begin playback.
-    pub fn restore(&mut self, library: &Library, queue: Vec<TrackRef>, position: Option<usize>) {
+    ///
+    /// Declines, answering `false`, once the user has queued or played
+    /// anything: the saved queue resolves only as its playlists load, and
+    /// replacing what is playing by then left mpv on one song and the
+    /// interface on another.
+    pub fn restore(
+        &mut self,
+        library: &Library,
+        queue: Vec<TrackRef>,
+        position: Option<usize>,
+    ) -> bool {
+        if !self.queue.is_empty() || self.playing.is_some() {
+            log::info!("restore: declined, a queue was started before it resolved");
+            return false;
+        }
         self.queue = queue;
         self.revision += 1;
         // Saved as it was last seen, shuffled or not — that order is the one to
@@ -696,9 +728,8 @@ impl Player {
         self.queue_pos = position;
         self.playback_started = false;
 
-        let Some(pos) = position else { return };
-        let Some(&track) = self.queue.get(pos) else {
-            return;
+        let Some(&track) = position.and_then(|pos| self.queue.get(pos)) else {
+            return true;
         };
         self.playing = Some(track);
         if let Some(video_id) = library
@@ -708,6 +739,7 @@ impl Player {
             self.prefetch(video_id);
         }
         log::info!("restore: len={} pos={:?}", self.queue.len(), self.queue_pos);
+        true
     }
 
     /// Starts playback of the currently-selected track. Used after

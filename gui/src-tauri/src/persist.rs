@@ -49,10 +49,9 @@ pub fn try_restore_queue(app: &AppHandle, state: &AppState) {
             log::info!("saved queue abandoned: nothing in it still exists");
             None
         }
-        RestoreOutcome::Ready { queue, position } => {
-            player.restore(&library, queue, position);
-            Some((player.queue().len(), position))
-        }
+        RestoreOutcome::Ready { queue, position } => player
+            .restore(&library, queue, position)
+            .then(|| (player.queue().len(), position)),
     };
     drop(player);
     drop(library);

@@ -231,6 +231,8 @@ const GUI_KEYMAP: [string, string][] = [
   ["m", "Mute / unmute"],
   ["t", "Cycle play mode"],
   ["L", "Like the playing song"],
+  ["R", "Radio from the playing song"],
+  ["P", "Add the playing song to a playlist"],
   ["", ""],
   ["s", "Search YouTube Music"],
   ["/", "Filter this playlist"],
@@ -894,6 +896,8 @@ function App() {
     const unlistenHistory = listen("history-changed", () => {
       invoke<HistoryView>("get_history").then(setHistory);
     });
+    // A station's pages land in the background, so it reports through here.
+    const unlistenRadio = listen<string>("radio-notice", (e) => notify(e.payload));
     return () => {
       clearInterval(poll);
       clearTimeout(stopPolling);
@@ -903,6 +907,7 @@ function App() {
       unlistenError.then((f) => f());
       unlistenPlayback.then((f) => f());
       unlistenHistory.then((f) => f());
+      unlistenRadio.then((f) => f());
     };
   }, []);
 
@@ -1365,6 +1370,11 @@ function App() {
           { label: "Play", onSelect: () => playSong(shown) },
           { label: "Play Next", onSelect: () => queueAction("play_next", { playlist: selected, song }) },
           { label: "Play Last", onSelect: () => queueAction("append_to_queue", { playlist: selected, song }) },
+          {
+            label: "Start Radio",
+            disabled: !videoId,
+            onSelect: () => queueAction("start_radio", { playlist: selected, song }),
+          },
           { label: "Add to Playlist", separatorBefore: true, items: addToPlaylistItems(videoId), onSelect: () => {} },
           {
             label: "Like",
@@ -1399,6 +1409,10 @@ function App() {
             onSelect: () => queueAction("queue_search_result", { result: r, next: false }),
           },
           {
+            label: "Start Radio",
+            onSelect: () => queueAction("start_radio_from_search", { result: r }),
+          },
+          {
             label: "Add to Playlist",
             separatorBefore: true,
             items: addToPlaylistItems(r.video_id),
@@ -1426,6 +1440,11 @@ function App() {
         y: e.clientY,
         items: [
           { label: "Play", onSelect: () => queueAction("jump_to", { qPos: entry.qPos }) },
+          {
+            label: "Start Radio",
+            disabled: !entry.videoId,
+            onSelect: () => queueAction("start_radio", { playlist: entry.playlist, song: entry.song }),
+          },
           {
             label: "Add to Playlist",
             items: addToPlaylistItems(entry.videoId),
@@ -1515,6 +1534,16 @@ function App() {
     m: () => invoke("toggle_mute"),
     t: () => invoke("cycle_mode"),
     L: likeCurrent,
+    R: () => {
+      const at = playbackRef.current?.playing;
+      if (at) queueAction("start_radio", { playlist: at[0], song: at[1] });
+    },
+    // The right-click submenu, opened mid-window -- a key has no pointer.
+    P: () => {
+      const videoId = currentTrackRef.current?.video_id;
+      if (!videoId) return;
+      setMenu({ x: window.innerWidth / 2 - 104, y: window.innerHeight / 3, items: addToPlaylistItems(videoId) });
+    },
     "?": () => setShowKeymap((v) => !v),
     Escape: () => {
       if (showKeymap) setShowKeymap(false);
