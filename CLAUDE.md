@@ -453,20 +453,37 @@ tools/           not a member and not shipped — see `macos-check` above
   not possible: a `TrackRef` is a position, so removing a track renumbers the rest and the
   queue quietly changes meaning. `clear_search_playlist` empties the tracks and keeps the
   playlist, for the same reason.
-- **`radio.rs`** — the source of a station, ready for the radio feature to be wired to. No
+- **`radio.rs`** — a station: `R` in the TUI, "Start Radio" and `R` in the GUI. No
   `get_watch_playlist` exists in `ytmusicapi 0.5`, so this is `search.rs`'s move again: the
   web client's own `next` endpoint through `send_request`, asking for the seed's
-  auto-generated mix (`RDAMVM<videoId>`, `params: "wAEB"`). `parse` walks for
-  `playlistPanelVideoRenderer` rows rather than pathing to them — a continuation page nests
-  them under a different root and some rows arrive inside a `…WrapperRenderer` — skips
-  unplayable rows, the seed, repeats, and anything the caller's `skip` already holds, and
+  auto-generated mix (`RDAMVM<videoId>`, `params: "wAEB"`). `parse` walks for queue *slots*
+  rather than pathing to them, since a continuation page nests them under a different root.
+  Most slots (37 of 49, measured) are a `playlistPanelVideoWrapperRenderer` holding the music
+  video and, as its `counterpart`, the art track of the same song — two video ids for one
+  entry, which is the web client's song/video toggle. Queuing every renderer played nearly
+  every song twice, so one version is taken per slot, the song where there is one (a real
+  album, and the release length lyrics are ranked on), and the other goes in
+  `Page::alternates` so the station skips it on later pages. A slot is dropped when *either*
+  version is already had, which is what keeps the seed out when the mix serves it as the
+  other version. It also skips unplayable rows, repeats, and anything in the caller's `skip`, and
   returns the continuation token for the next page, which goes back in the *body*
   (`send_request` builds the query string itself). `spawn_fetch`/`RadioMsg` is the same
-  background shape as search. What a station does with its tracks is deliberately not here:
-  `Library::place_off_library` files a page under the search playlist in one indexing pass,
-  `Player::append_many` queues it as one revision, and `Player::remaining` against
-  `radio::needs_refill` says when to ask for the next page. Offline fixture tests cover the
-  parse; the live one is `#[ignore]`d.
+  background shape as search.
+  `Station` is the state both frontends hold, and the rules over it live here so neither has
+  its own copy. Starting one is `Player::play_seed` — the queue becomes the seed alone, and
+  a seed already playing carries on — and from then on each frontend calls `begin_refill`
+  once per tick (the TUI's event loop, the GUI's ticker). That asks for a page only when the
+  station is **live** — the playing track is one it queued, which is how playing anything
+  else ends it without a hook on every path that starts a song — no page is in flight, and
+  `Player::remaining` is under `REFILL_BELOW`. So the first page is no special case: a fresh
+  station has nothing after the seed. `accept_page` keeps only tracks the station hasn't
+  queued, and a page with none ends it, since paging further would only page through
+  repeats. A failure waits `RETRY_AFTER` and the third in a row ends the station. A page
+  that lands is filed by `Library::place_off_library` and queued by `Player::append_many`,
+  and an answer for a station since replaced is dropped by its seed. Radio tracks live in
+  the search playlist, so a radio queue is not restored at the next start, like any other
+  search track. Offline fixture tests cover the parse and the rules; the live one, which
+  fetches a second page too, is `#[ignore]`d.
 - **`cover.rs`** — fetches a thumbnail and decodes it to RGB. `at_size` rewrites the CDN's
   own resize parameters (`=w120-h120-l90-rj`) to ask for a bigger copy than the 120px a
   search row advertises, and the size asked for is the *terminal's*: `spawn_fetch` takes the
@@ -857,6 +874,7 @@ since serde ignores what it no longer knows about.
 
 The window answers the TUI's letters wherever the action exists in both — `n`/`p`, `m`, `t`,
 `s` (focus search), `/` (focus filter), `o` (queue), `H` (home), `y` (now playing), `L` (like),
+`R` (radio from the playing song; the track, result and queue menus offer it per row),
 and in now playing `c`/`i`/`I` — with `?` opening `KeymapOverlay`. They go through
 `keyActions`, a ref rebuilt every render and read by the one `keydown` listener, so each
 action sees current state without the listener being re-bound on the playback tick. Esc in a
@@ -952,6 +970,7 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `o` | Toggle queue / songs view |
 | `H` | Recently played — `history.json`, shared with the GUI's home page |
 | `L` | Like the playing song |
+| `R` | Radio: replace the queue with a station seeded from the highlighted song (or the playing one in lyrics mode or the playlists panel), topped up as it plays |
 | `s` | Search YouTube Music (`↵` play, `a` add to a playlist, `/` edit query) |
 | `y` | Toggle lyrics panel |
 | `c` | (in lyrics mode) Choose a different lrclib record |

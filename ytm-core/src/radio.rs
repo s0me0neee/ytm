@@ -7,19 +7,23 @@
 //! auto-generated mix, `RDAMVM<videoId>`, and gets back the first page of it
 //! plus a continuation token for the next.
 //!
-//! This module is only the *source* of a station. What a frontend does with the
-//! tracks — which synthetic playlist they are filed under, when the queue asks
-//! for more — goes through [`crate::Library::place_off_library`] and
-//! [`crate::Player::remaining`], which both frontends already share.
+//! The source of a station, and its state: [`Station`] and the rules over it
+//! ([`begin_refill`], [`accept_page`]) decide when to ask for more, so both
+//! frontends top the queue up the same way. Where the tracks go is
+//! [`crate::Library::place_off_library`] and [`crate::Player::append_many`].
 //!
-//! Parsing walks for `playlistPanelVideoRenderer` rows rather than pathing to
-//! them, for the reason `search` gives: the queue panel has been served under
-//! at least two wrappers (`playlistPanelVideoWrapperRenderer` around some rows)
-//! and a continuation page nests it under a different root altogether.
+//! Parsing walks for queue slots rather than pathing to them, for the reason
+//! `search` gives: a continuation page nests them under a different root. A slot
+//! is a bare `playlistPanelVideoRenderer`, or a `playlistPanelVideoWrapperRenderer`
+//! holding the music video *and* its `counterpart`, the art track of the same
+//! song — two video ids for one entry, which is the web client's song/video
+//! toggle. Measured, most slots of a station are wrapped, so taking every
+//! renderer queued nearly every song twice. [`parse`] takes one per slot.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use ytmusicapi::YTMusicClient;
@@ -47,6 +51,9 @@ pub fn needs_refill(remaining: usize) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct Page {
     pub tracks: Vec<Track>,
+    /// The versions of those tracks not taken — a wrapped slot's other video —
+    /// so a later page serving one cannot queue the song again.
+    pub alternates: Vec<String>,
     /// Where the next page starts. `None` once YouTube has nothing more, which
     /// in practice is never for a radio but is for a finite mix.
     pub continuation: Option<String>,
@@ -100,8 +107,8 @@ fn is_not_album(part: &str) -> bool {
         || parse_duration(part).is_some()
 }
 
-/// One queue row as a track, or `None` for a row there is nothing to play in.
-fn parse_row(row: &Value) -> Option<Track> {
+/// One queue row, or `None` for a row there is nothing to play in.
+fn parse_row(row: &Value) -> Option<SearchResult> {
     // A greyed-out row (region-locked, taken down) still has a video id.
     if row.get("unplayableText").is_some() {
         return None;
@@ -128,7 +135,7 @@ fn parse_row(row: &Value) -> Option<Track> {
     let duration = text_of(row.get("lengthText")).unwrap_or_default();
     let video_type = first_str(row, "musicVideoType").unwrap_or_default();
 
-    let hit = SearchResult {
+    Some(SearchResult {
         video_id,
         title,
         artist,
@@ -141,31 +148,74 @@ fn parse_row(row: &Value) -> Option<Track> {
         kind: ResultKind::from_video_type(&video_type).unwrap_or(ResultKind::Video),
         video_type,
         thumbnail: thumbnail(row),
-    };
-    Some(hit.to_track())
+    })
 }
 
-/// Every playable row in a `next` response, in order, without repeats, and the
-/// continuation for the page after it.
+/// Every queue slot in `v`, in order, each as the renderers of its versions.
+fn find_slots<'a>(v: &'a Value, out: &mut Vec<Vec<&'a Value>>) {
+    match v {
+        Value::Object(map) => {
+            for (k, val) in map {
+                match k.as_str() {
+                    "playlistPanelVideoRenderer" => out.push(vec![val]),
+                    "playlistPanelVideoWrapperRenderer" => {
+                        let mut versions = Vec::new();
+                        find_all(val, "playlistPanelVideoRenderer", &mut versions);
+                        out.push(versions);
+                    }
+                    _ => find_slots(val, out),
+                }
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|i| find_slots(i, out)),
+        _ => {}
+    }
+}
+
+/// The version of a slot to queue: the song where there is one, since an art
+/// track has a real album and the release length lyrics are matched against.
+fn pick(versions: &[SearchResult]) -> Option<&SearchResult> {
+    versions
+        .iter()
+        .find(|v| v.kind == ResultKind::Song)
+        .or_else(|| versions.first())
+}
+
+/// One playable track per slot in a `next` response, in order, without
+/// repeats, and the continuation for the page after it.
 ///
 /// `skip` answers for what the caller already has — the seed, and whatever
-/// earlier pages delivered. YouTube's first page leads with the seed itself, and a
-/// continuation sometimes re-serves the row it broke on.
+/// earlier pages delivered. A slot is dropped when *any* of its versions is
+/// skipped: YouTube's first page leads with the seed, which may be served as
+/// the other version of the one that was played, and a continuation sometimes
+/// re-serves the row it broke on.
 #[must_use]
 pub fn parse(response: &Value, skip: impl Fn(&str) -> bool) -> Page {
-    let mut rows = Vec::new();
-    find_all(response, "playlistPanelVideoRenderer", &mut rows);
+    let mut slots = Vec::new();
+    find_slots(response, &mut slots);
 
     let mut seen = HashSet::new();
-    let tracks = rows
-        .into_iter()
-        .filter_map(parse_row)
-        .filter(|t| {
-            t.video_id
-                .as_deref()
-                .is_some_and(|id| !skip(id) && seen.insert(id.to_string()))
-        })
-        .collect();
+    let mut tracks = Vec::new();
+    let mut alternates = Vec::new();
+    for slot in slots {
+        let versions: Vec<SearchResult> = slot.into_iter().filter_map(parse_row).collect();
+        if versions
+            .iter()
+            .any(|v| skip(&v.video_id) || seen.contains(&v.video_id))
+        {
+            continue;
+        }
+        let Some(chosen) = pick(&versions) else {
+            continue;
+        };
+        for v in &versions {
+            seen.insert(v.video_id.clone());
+            if v.video_id != chosen.video_id {
+                alternates.push(v.video_id.clone());
+            }
+        }
+        tracks.push(chosen.to_track());
+    }
 
     let mut tokens = Vec::new();
     find_all(response, "nextRadioContinuationData", &mut tokens);
@@ -177,6 +227,7 @@ pub fn parse(response: &Value, skip: impl Fn(&str) -> bool) -> Page {
 
     Page {
         tracks,
+        alternates,
         continuation,
     }
 }
@@ -222,6 +273,116 @@ pub fn spawn_fetch(
             .map_err(|e| e.to_string());
         let _ = tx.send(RadioMsg { seed, result });
     });
+}
+
+/// After a page fails, how long to wait before asking again.
+const RETRY_AFTER: Duration = Duration::from_secs(10);
+
+/// Failures in a row that end a station, so a dead link is not asked forever.
+const MAX_FAILURES: u32 = 3;
+
+/// A station in progress, shared in shape by both frontends. Plain data: the
+/// rules over it are the free functions below, so neither frontend has its own
+/// copy of when to ask for more.
+#[derive(Debug, Clone)]
+pub struct Station {
+    pub seed: String,
+    pub seed_title: String,
+    pub continuation: Option<String>,
+    /// Every video id the station has queued, the seed included — the `skip`
+    /// for the next page, and the test for whether the station still plays.
+    pub seen: HashSet<String>,
+    pub fetching: bool,
+    /// YouTube had no next page, or stopped answering.
+    pub ended: bool,
+    pub pages: u32,
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+/// What to ask [`fetch`] for, taken out of a [`Station`] by [`begin_refill`].
+pub struct Request {
+    pub seed: String,
+    pub continuation: Option<String>,
+    pub skip: HashSet<String>,
+}
+
+#[must_use]
+pub fn new_station(seed_video_id: &str, seed_title: &str) -> Station {
+    Station {
+        seed: seed_video_id.to_string(),
+        seed_title: seed_title.to_string(),
+        continuation: None,
+        seen: HashSet::from([seed_video_id.to_string()]),
+        fetching: false,
+        ended: false,
+        pages: 0,
+        failures: 0,
+        retry_at: None,
+    }
+}
+
+/// Whether the station is still what is playing. Anything played from
+/// elsewhere replaces the queue, and the station stops with it.
+#[must_use]
+pub fn is_live(station: &Station, playing_video_id: Option<&str>) -> bool {
+    playing_video_id.is_some_and(|id| station.seen.contains(id))
+}
+
+/// The next page to fetch, if one is due — marking it in flight, so a caller
+/// that asks every tick sends one request rather than one per tick.
+pub fn begin_refill(
+    station: &mut Station,
+    playing_video_id: Option<&str>,
+    remaining: usize,
+    now: Instant,
+) -> Option<Request> {
+    let due = !station.fetching
+        && !station.ended
+        && station.retry_at.is_none_or(|at| now >= at)
+        && is_live(station, playing_video_id)
+        && needs_refill(remaining);
+    if !due {
+        return None;
+    }
+    station.fetching = true;
+    Some(Request {
+        seed: station.seed.clone(),
+        continuation: station.continuation.clone(),
+        skip: station.seen.clone(),
+    })
+}
+
+/// Records a page that landed and returns the tracks in it the station has
+/// not queued yet. A page with none ends the station: asking again past it
+/// would only page through repeats.
+pub fn accept_page(station: &mut Station, page: Page) -> Vec<Track> {
+    station.fetching = false;
+    station.failures = 0;
+    station.retry_at = None;
+    station.pages += 1;
+    station.seen.extend(page.alternates);
+    let fresh: Vec<Track> = page
+        .tracks
+        .into_iter()
+        .filter(|t| {
+            t.video_id
+                .as_ref()
+                .is_some_and(|id| station.seen.insert(id.clone()))
+        })
+        .collect();
+    station.ended = page.continuation.is_none() || fresh.is_empty();
+    station.continuation = page.continuation;
+    fresh
+}
+
+/// Records a page that failed. Answers whether that ended the station.
+pub fn page_failed(station: &mut Station, now: Instant) -> bool {
+    station.fetching = false;
+    station.failures += 1;
+    station.retry_at = Some(now + RETRY_AFTER);
+    station.ended = station.failures >= MAX_FAILURES;
+    station.ended
 }
 
 #[cfg(test)]
@@ -343,6 +504,130 @@ mod tests {
         assert!(!needs_refill(REFILL_BELOW));
     }
 
+    fn station_with(seed: &str) -> Station {
+        new_station(seed, "Seed")
+    }
+
+    fn page_of(ids: &[&str], more: bool) -> Page {
+        Page {
+            tracks: ids
+                .iter()
+                .map(|id| Track {
+                    video_id: Some((*id).to_string()),
+                    title: None,
+                    artists: Vec::new(),
+                    album: None,
+                    duration: None,
+                    duration_seconds: None,
+                    thumbnail: None,
+                })
+                .collect(),
+            alternates: Vec::new(),
+            continuation: more.then(|| "NEXT".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_station_asks_once_and_only_while_it_is_playing() {
+        let now = Instant::now();
+        let mut st = station_with("seed");
+        assert!(begin_refill(&mut st, Some("other"), 0, now).is_none());
+        let req = begin_refill(&mut st, Some("seed"), 0, now).expect("first page");
+        assert!(req.continuation.is_none() && req.skip.contains("seed"));
+        // In flight: the next tick must not send a second request.
+        assert!(begin_refill(&mut st, Some("seed"), 0, now).is_none());
+    }
+
+    #[test]
+    fn a_page_queues_only_what_is_new_and_carries_its_continuation() {
+        let now = Instant::now();
+        let mut st = station_with("seed");
+        let _ = begin_refill(&mut st, Some("seed"), 0, now);
+        let fresh = accept_page(&mut st, page_of(&["seed", "a", "b"], true));
+        assert_eq!(fresh.len(), 2);
+        assert!(!st.ended && st.continuation.is_some());
+        assert!(begin_refill(&mut st, Some("a"), REFILL_BELOW, now).is_none());
+        let req = begin_refill(&mut st, Some("a"), 1, now).expect("refill");
+        assert_eq!(req.continuation.as_deref(), Some("NEXT"));
+    }
+
+    #[test]
+    fn a_station_ends_on_its_last_page_or_a_page_of_repeats() {
+        let mut st = station_with("seed");
+        let _ = accept_page(&mut st, page_of(&["a"], false));
+        assert!(st.ended);
+        let mut st = station_with("seed");
+        let _ = accept_page(&mut st, page_of(&["seed"], true));
+        assert!(st.ended);
+    }
+
+    #[test]
+    fn failures_wait_before_retrying_and_end_the_station_eventually() {
+        let now = Instant::now();
+        let mut st = station_with("seed");
+        let _ = begin_refill(&mut st, Some("seed"), 0, now);
+        assert!(!page_failed(&mut st, now));
+        assert!(begin_refill(&mut st, Some("seed"), 0, now).is_none());
+        assert!(begin_refill(&mut st, Some("seed"), 0, now + RETRY_AFTER).is_some());
+        assert!(!page_failed(&mut st, now));
+        assert!(page_failed(&mut st, now));
+    }
+
+    /// A wrapped slot as the web client receives it: the video, and the song
+    /// version of it as its counterpart.
+    fn wrapped(video: Value, song: Value) -> Value {
+        json!({ "playlistPanelVideoWrapperRenderer": {
+            "primaryRenderer": video,
+            "counterpart": [{ "counterpartRenderer": song }],
+        }})
+    }
+
+    #[test]
+    fn a_wrapped_slot_queues_its_song_once() {
+        let resp = first_page(vec![
+            wrapped(
+                row("vid", "Sunflower (MV)", "A", "4:00", "MUSIC_VIDEO_TYPE_OMV"),
+                row("song", "Sunflower", "A", "3:58", "MUSIC_VIDEO_TYPE_ATV"),
+            ),
+            row("bare", "Bare", "A", "3:00", "MUSIC_VIDEO_TYPE_OMV"),
+        ]);
+        let page = parse(&resp, |_| false);
+        assert_eq!(ids(&page), ["song", "bare"]);
+        assert_eq!(page.alternates, ["vid"]);
+    }
+
+    #[test]
+    fn a_slot_is_skipped_when_either_version_is_already_had() {
+        // The seed was played as the video; the mix leads with its song.
+        let resp = first_page(vec![
+            wrapped(
+                row("seed", "Seed (MV)", "A", "4:00", "MUSIC_VIDEO_TYPE_OMV"),
+                row("seed-song", "Seed", "A", "3:58", "MUSIC_VIDEO_TYPE_ATV"),
+            ),
+            row("next", "Next", "A", "3:00", "MUSIC_VIDEO_TYPE_ATV"),
+        ]);
+        assert_eq!(ids(&parse(&resp, |id| id == "seed")), ["next"]);
+    }
+
+    #[test]
+    fn an_alternate_from_one_page_keeps_the_song_off_the_next() {
+        let mut st = station_with("seed");
+        let first = first_page(vec![wrapped(
+            row("vid", "Song (MV)", "A", "4:00", "MUSIC_VIDEO_TYPE_OMV"),
+            row("song", "Song", "A", "3:58", "MUSIC_VIDEO_TYPE_ATV"),
+        )]);
+        let page = parse(&first, |id| st.seen.contains(id));
+        let _ = accept_page(&mut st, page);
+        let again = first_page(vec![row(
+            "vid",
+            "Song (MV)",
+            "A",
+            "4:00",
+            "MUSIC_VIDEO_TYPE_OMV",
+        )]);
+        assert!(parse(&again, |id| st.seen.contains(id)).tracks.is_empty());
+    }
+
     /// The live endpoint. Needs a signed-in `browser.json`.
     #[tokio::test]
     #[ignore = "network: needs a live session"]
@@ -355,6 +640,33 @@ mod tests {
             .await
             .expect("fetch");
         assert!(page.tracks.len() > 5, "{} tracks", page.tracks.len());
-        assert!(page.continuation.is_some());
+        // Most slots are wrapped as video + song; one of each is queued.
+        assert!(!page.alternates.is_empty());
+        assert!(
+            page.tracks
+                .iter()
+                .all(|t| !page.alternates.contains(t.video_id.as_ref().expect("id")))
+        );
+        let titles: Vec<_> = page
+            .tracks
+            .iter()
+            .filter_map(|t| t.title.as_deref())
+            .collect();
+        eprintln!(
+            "{} tracks, {} alternates: {titles:?}",
+            titles.len(),
+            page.alternates.len()
+        );
+
+        // The refill path: the next page, past everything the first delivered.
+        let mut station = new_station("fHI8X4OXluQ", "Blinding Lights");
+        let fresh = accept_page(&mut station, page);
+        assert!(!station.ended);
+        let next = fetch(&yt, "fHI8X4OXluQ", station.continuation.as_deref(), |id| {
+            station.seen.contains(id)
+        })
+        .await
+        .expect("second page");
+        assert!(!next.tracks.is_empty(), "first page had {}", fresh.len());
     }
 }

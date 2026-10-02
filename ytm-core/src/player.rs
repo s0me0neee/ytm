@@ -540,6 +540,21 @@ impl Player {
         }
     }
 
+    /// Replaces the queue with one track and plays it — the start of a radio,
+    /// whose pages arrive afterwards through [`Player::append_many`]. A seed
+    /// already playing carries on rather than starting over.
+    pub fn play_seed(&mut self, library: &Library, pl_idx: usize, song_idx: usize) {
+        self.queue = vec![(pl_idx, song_idx)];
+        self.queue_pos = Some(0);
+        self.unshuffled = matches!(self.mode, PlayMode::Shuffle).then(|| self.queue.clone());
+        self.revision += 1;
+        log::info!("play_seed: pl={pl_idx} song={song_idx}");
+        if self.playing == Some((pl_idx, song_idx)) && self.playback_started {
+            return;
+        }
+        self.do_play(library, pl_idx, song_idx);
+    }
+
     /// Appends a batch, as one revision — a radio page is twenty-odd entries
     /// and each revision is a queue redraw in both frontends. Starts playing
     /// the first of them when nothing is playing, as a single append does.

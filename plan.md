@@ -101,14 +101,14 @@ removed it from the auth path only.
 - Press `Enter` on an album entry to load tracks via `get_album(browse_id)`
 - Push a new songs view; `Backspace` pops back to the album list
 
-🔄 **Radio / "Up next"**
+✅ **Radio / "Up next"**
 - ✅ Source: `ytm-core/src/radio.rs` — `ytmusicapi 0.5` has no `get_watch_playlist`, so the
   `next` endpoint with the seed's `RDAMVM<id>` mix, paged by continuation token
 - ✅ Plumbing: `Library::place_off_library`, `Player::append_many` / `remaining` / `upcoming`,
   `radio::needs_refill`; "Up next" shown in both frontends' now-playing views
-- ❌ Wiring: a key in each frontend (`r` is taken in lyrics mode — `R`?), a station state
-  (seed + continuation + seen ids) that tops the queue up when `needs_refill`, and a
-  "Radio seeded from <title>" notice
+- ✅ Wiring: `R` in both frontends plus "Start Radio" in the GUI's track, result and queue
+  menus; `radio::Station` + `begin_refill`/`accept_page` top the queue up from each
+  frontend's tick; a notice when the first page lands
 
 ---
 

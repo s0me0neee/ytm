@@ -19,6 +19,7 @@ use throbber_widgets_tui::{Throbber, ThrobberState};
 use ytm_core::library::{LibraryFetcher, SongBatch, moved_indices};
 use ytm_core::lyrics::{self, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 use ytm_core::persistence::{self, LyricsOverrides, QueueState, RestoreOutcome};
+use ytm_core::radio::{self, RadioMsg, Station};
 use ytm_core::search::{self, ResultKind, SearchMsg, SearchResult};
 use ytm_core::{
     AppendOutcome, AudioState, Cover, CoverMsg, Library, MediaCmd, MediaControls, NowPlaying,
@@ -975,6 +976,11 @@ pub struct App {
     search: Option<SearchState>,
     search_tx: std::sync::mpsc::Sender<SearchMsg>,
     search_rx: std::sync::mpsc::Receiver<SearchMsg>,
+    // radio
+    /// The station `R` started, while what it queued is still playing.
+    station: Option<Station>,
+    radio_tx: std::sync::mpsc::Sender<RadioMsg>,
+    radio_rx: std::sync::mpsc::Receiver<RadioMsg>,
     // cover art
     /// Decoded covers by video id, bounded — each is a few hundred kilobytes
     /// of pixels and a long search session would otherwise keep every one.
@@ -1023,6 +1029,7 @@ impl App {
         let (translate_tx, translate_rx) = std::sync::mpsc::channel();
         let (search_tx, search_rx) = std::sync::mpsc::channel();
         let (cover_tx, cover_rx) = std::sync::mpsc::channel();
+        let (radio_tx, radio_rx) = std::sync::mpsc::channel();
 
         // Decided once: it depends on the terminal the app was launched in,
         // which cannot change under it.
@@ -1090,6 +1097,9 @@ impl App {
             search: None,
             search_tx,
             search_rx,
+            station: None,
+            radio_tx,
+            radio_rx,
             covers: std::collections::HashMap::new(),
             cover_order: Vec::new(),
             cover_pending: std::collections::HashSet::new(),
@@ -1320,6 +1330,7 @@ impl App {
             KeyCode::Char('l') => self.active_panel = Panel::Songs,
             KeyCode::Enter => self.play_search_result(),
             KeyCode::Char('a') => self.open_add_picker(),
+            KeyCode::Char('R') => self.start_radio(),
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(s) = self.search.as_mut() {
                     let n = s.results.len();
@@ -2355,6 +2366,7 @@ impl App {
             self.drain_translations();
             self.drain_media();
             self.drain_search();
+            self.drain_radio();
             self.drain_covers();
             self.ensure_cover();
             self.prune_search_history();
@@ -2385,6 +2397,8 @@ impl App {
             if self.player.handle_song_end(&self.library) {
                 self.sync_queue_view();
             }
+            // After the advance, which is what most often leaves the queue short.
+            self.refill_radio();
             // After the auto-advance above, so a track change reaches the
             // desktop on the same tick the UI shows it.
             self.update_media();
@@ -2586,6 +2600,7 @@ impl App {
                             }
                             KeyCode::Char('H') => self.toggle_history(),
                             KeyCode::Char('L') => self.like_playing(),
+                            KeyCode::Char('R') => self.start_radio(),
                             KeyCode::Char('d')
                                 if self.active_panel == Panel::Songs && self.show_queue =>
                             {
@@ -2763,6 +2778,131 @@ impl App {
         match self.player.insert_next(&self.library, pl_idx, song_idx) {
             AppendOutcome::StartedPlaying { .. } => self.notify(format!("Playing: {title}")),
             AppendOutcome::Queued { .. } => self.notify(format!("Next up: {title}")),
+        }
+    }
+
+    // ── radio ─────────────────────────────────────────────────────────────────
+
+    /// What `R` seeds a station from: the highlighted row where a list has
+    /// one, the playing track otherwise.
+    fn radio_seed(&mut self) -> Option<(usize, usize)> {
+        if self.search_has_focus() {
+            let hit = self
+                .search
+                .as_ref()
+                .and_then(SearchState::selected)
+                .cloned()?;
+            return Some(self.library.place_search_result(hit.to_track()));
+        }
+        if self.lyrics_mode || self.active_panel == Panel::Playlists {
+            return self.player.playing();
+        }
+        match self.listing() {
+            Listing::History => {
+                let idx = self.history_state.selected()?;
+                self.locate_history(idx)
+            }
+            Listing::Queue => {
+                let shown = self.queue_view_state.selected()?;
+                let q_pos = self.filtered_queue_positions().get(shown).copied()?;
+                self.player.queue().get(q_pos).copied()
+            }
+            Listing::Songs => {
+                let pl = self.list_state.selected()?;
+                let shown = self.songs_state.selected()?;
+                let song = self.filtered_songs(pl).get(shown).copied()?;
+                Some((pl, song))
+            }
+        }
+    }
+
+    /// `R`: replaces the queue with a station seeded from a song, which then
+    /// tops itself up as it plays — see [`Self::refill_radio`].
+    fn start_radio(&mut self) {
+        let seed = self.radio_seed().and_then(|(pl, song)| {
+            let t = self.library.track(pl, song)?;
+            Some((
+                pl,
+                song,
+                t.video_id.clone()?,
+                t.title.clone().unwrap_or_default(),
+            ))
+        });
+        let Some((pl, song, video_id, title)) = seed else {
+            self.notify("Nothing to start a radio from");
+            return;
+        };
+        self.player.play_seed(&self.library, pl, song);
+        self.sync_queue_view();
+        self.station = Some(radio::new_station(&video_id, &title));
+        self.notify(format!("Radio: finding songs like {title}…"));
+        self.refill_radio();
+    }
+
+    /// Asks for the station's next page once the queue runs low, and drops the
+    /// station once something it didn't queue is playing. Every tick, since a
+    /// song ending, a skip and a queue edit all move what is left.
+    fn refill_radio(&mut self) {
+        if self.station.is_none() {
+            return;
+        }
+        let playing = self.current_video_id();
+        let Some(station) = self.station.as_mut() else {
+            return;
+        };
+        if !radio::is_live(station, playing.as_deref()) {
+            log::info!(
+                "radio: {} is no longer playing, station dropped",
+                station.seed
+            );
+            self.station = None;
+            return;
+        }
+        let remaining = self.player.remaining();
+        if let Some(req) =
+            radio::begin_refill(station, playing.as_deref(), remaining, Instant::now())
+        {
+            radio::spawn_fetch(
+                &self.lyrics_handle,
+                std::sync::Arc::clone(&self.yt),
+                req.seed,
+                req.continuation,
+                req.skip,
+                self.radio_tx.clone(),
+            );
+        }
+    }
+
+    /// Queues the pages that have landed. One for a station since replaced is
+    /// dropped by its seed.
+    fn drain_radio(&mut self) {
+        while let Ok(msg) = self.radio_rx.try_recv() {
+            let Some(station) = self.station.as_mut().filter(|s| s.seed == msg.seed) else {
+                continue;
+            };
+            let notice = match msg.result {
+                Ok(page) => {
+                    let first = station.pages == 0;
+                    let tracks = radio::accept_page(station, page);
+                    let title = station.seed_title.clone();
+                    let n = tracks.len();
+                    let refs = self.library.place_off_library(tracks);
+                    self.player.append_many(&self.library, &refs);
+                    match (first, n) {
+                        (true, 0) => Some(format!("No radio for {title}")),
+                        (true, n) => Some(format!("Radio from {title}: {n} songs queued")),
+                        _ => None,
+                    }
+                }
+                Err(e) => {
+                    log::warn!("radio: page for {} failed: {e}", msg.seed);
+                    radio::page_failed(station, Instant::now())
+                        .then(|| "Radio stopped: YouTube isn't answering".to_string())
+                }
+            };
+            if let Some(notice) = notice {
+                self.notify(notice);
+            }
         }
     }
 
@@ -3204,6 +3344,7 @@ impl App {
             // below it. `the_way_to_the_full_keymap_survives_a_narrow_terminal`
             // is what says how early that is.
             ("?", "keys"),
+            ("R", "radio"),
             ("j/k", "scroll"),
             ("PgUp/PgDn", "page"),
             ("Esc", "re-centre"),
@@ -3234,6 +3375,7 @@ impl App {
             ("s", "close"),
             ("Esc", "back"),
             ("?", "keys"),
+            ("R", "radio"),
             ("j/k", "select"),
             ("h/l", "panel"),
             ("spc", "pause"),
@@ -3257,6 +3399,7 @@ impl App {
                 ("?", "keys"),
                 ("y", "lyrics"),
                 ("s", "search"),
+                ("R", "radio"),
             ],
             (Panel::Songs, Listing::Songs) => vec![
                 ("↵", "play"),
@@ -3266,6 +3409,7 @@ impl App {
                 ("o", "queue"),
                 ("?", "keys"),
                 ("A", "play next"),
+                ("R", "radio"),
                 ("y", "lyrics"),
                 ("s", "search"),
                 ("H", "recent"),
@@ -3282,6 +3426,7 @@ impl App {
                 ("y", "lyrics"),
                 ("?", "keys"),
                 ("D", "clear"),
+                ("R", "radio"),
                 ("s", "search"),
                 ("H", "recent"),
                 ("L", "like"),
@@ -3298,6 +3443,7 @@ impl App {
                 ("o", "queue"),
                 ("?", "keys"),
                 ("A", "play next"),
+                ("R", "radio"),
                 ("y", "lyrics"),
                 ("s", "search"),
                 ("L", "like"),
@@ -3379,6 +3525,7 @@ impl App {
         ("o", "Toggle queue / songs"),
         ("H", "Recently played"),
         ("L", "Like the playing song"),
+        ("R", "Radio from the selected song"),
         ("", ""),
         ("s", "Search YouTube Music"),
         ("a", "In search: add the result to a playlist"),

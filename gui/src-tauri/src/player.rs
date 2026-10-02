@@ -218,6 +218,8 @@ pub fn spawn_ticker(app: AppHandle, state: AppState) {
                 // costs nothing (nothing is being added to it either way).
                 player.prune_search_history(&mut library);
             }
+            // After the advance, which is what most often leaves a station short.
+            crate::radio::refill(&app, &state);
 
             /* Two schedules, because the snapshot carries two kinds of news.
                A track change, a pause, a load finishing or an error goes out
