@@ -787,6 +787,10 @@ impl Player {
         log::info!("do_play: pl={pl_idx} song={song_idx} videoId={video_id:?}");
         match video_id {
             Some(id) if !id.is_empty() => {
+                log::info!(
+                    "playing: {} — https://music.youtube.com/watch?v={id}",
+                    track.title.as_deref().unwrap_or("(untitled)")
+                );
                 // Before the command, not with it: the caller reads the audio
                 // state again within microseconds and the audio thread will
                 // not have woken. See [`AudioEngine::begin_track`].

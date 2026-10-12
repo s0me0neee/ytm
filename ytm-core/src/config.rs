@@ -443,7 +443,10 @@ impl Config {
             Self::default().audio.headroom_db
         };
         if fixed > 0.0 {
-            log::warn!("config: audio.headroom-db {db} is above full scale — reading it as {}", -fixed);
+            log::warn!(
+                "config: audio.headroom-db {db} is above full scale — reading it as {}",
+                -fixed
+            );
             fixed = -fixed;
         }
         // After the flip, never as a branch beside it: `headroom-db = 40` is
@@ -460,7 +463,10 @@ impl Config {
         self.audio.headroom_db = fixed;
 
         if self.audio.limiter {
-            log::info!("config: audio limiter on at {} dBFS", self.audio.headroom_db);
+            log::info!(
+                "config: audio limiter on at {} dBFS",
+                self.audio.headroom_db
+            );
         } else {
             log::info!("config: audio limiter off — a loud master can clip the output");
         }
@@ -794,7 +800,10 @@ mod tests {
         assert_eq!(parse("[audio]\nheadroom-db = -3\n").audio.headroom_db, -3.0);
         // Integer as well as float, via `Seconds` -- `-2` is how a person
         // writes it and serde would otherwise reject it.
-        assert_eq!(parse("[audio]\nheadroom-db = -2.5\n").audio.headroom_db, -2.5);
+        assert_eq!(
+            parse("[audio]\nheadroom-db = -2.5\n").audio.headroom_db,
+            -2.5
+        );
     }
 
     #[test]
@@ -802,12 +811,24 @@ mod tests {
         // Past `alimiter`'s floor the filter is *rejected*, which would leave
         // mpv with no limiter at all -- the one outcome worse than a badly
         // chosen one.
-        assert_eq!(parse("[audio]\nheadroom-db = -90\n").audio.headroom_db, -24.0);
+        assert_eq!(
+            parse("[audio]\nheadroom-db = -90\n").audio.headroom_db,
+            -24.0
+        );
         // Not clamped: a value that is not a number names no depth at all, so
         // the default is a better answer than the floor.
-        assert_eq!(parse("[audio]\nheadroom-db = nan\n").audio.headroom_db, -1.0);
-        assert_eq!(parse("[audio]\nheadroom-db = -inf\n").audio.headroom_db, -1.0);
-        assert_eq!(parse("[audio]\nheadroom-db = inf\n").audio.headroom_db, -1.0);
+        assert_eq!(
+            parse("[audio]\nheadroom-db = nan\n").audio.headroom_db,
+            -1.0
+        );
+        assert_eq!(
+            parse("[audio]\nheadroom-db = -inf\n").audio.headroom_db,
+            -1.0
+        );
+        assert_eq!(
+            parse("[audio]\nheadroom-db = inf\n").audio.headroom_db,
+            -1.0
+        );
         for src in [
             "",
             "[audio]\nheadroom-db = -90\n",
