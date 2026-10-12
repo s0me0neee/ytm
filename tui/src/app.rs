@@ -5242,6 +5242,7 @@ mod tests {
                     duration: None,
                     duration_seconds: None,
                     thumbnail: None,
+                    set_video_id: None,
                 })
                 .collect()
         }
@@ -5309,6 +5310,7 @@ mod tests {
                 duration: None,
                 duration_seconds: None,
                 thumbnail: None,
+                set_video_id: None,
             }
         }
 

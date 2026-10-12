@@ -27,6 +27,9 @@ pub struct Track {
     /// this field existed has none.
     #[serde(default)]
     pub thumbnail: Option<String>,
+    /// This row's own id within its playlist, which removing it needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_video_id: Option<String>,
 }
 
 impl Track {
@@ -142,6 +145,7 @@ pub async fn get_songs(yt: &YTMusicClient, playlist_id: &str) -> Option<Vec<Trac
                             duration: t.duration,
                             duration_seconds: t.duration_seconds,
                             thumbnail: largest_thumbnail(&t.thumbnails),
+                            set_video_id: t.set_video_id,
                         })
                         .collect(),
                 );
@@ -443,6 +447,19 @@ impl Library {
         }
     }
 
+    /// Appends a playlist created during the session, unloaded, and answers its
+    /// index. Appended rather than inserted, since every index is a position.
+    pub fn push_playlist(&mut self, playlist: Playlist) -> usize {
+        self.entries.push(PlaylistEntry {
+            playlist,
+            songs: Vec::new(),
+            loaded: false,
+            failed: false,
+            total_duration_secs: 0,
+        });
+        self.entries.len() - 1
+    }
+
     /// Whether `idx` is the search playlist rather than one of the user's.
     #[must_use]
     pub fn is_search_playlist(&self, idx: usize) -> bool {
@@ -486,6 +503,7 @@ mod tests {
             duration: None,
             duration_seconds: Some(100),
             thumbnail: None,
+            set_video_id: None,
         }
     }
 

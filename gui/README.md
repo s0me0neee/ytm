@@ -1,7 +1,12 @@
-# Tauri + React + Typescript
+# ytm — desktop
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+The Tauri frontend for ytm: the same engine as the terminal app (`ytm-core`), with a window.
 
-## Recommended IDE Setup
+```bash
+pnpm install
+pnpm tauri dev     # a dev build, with hot reload of the frontend
+pnpm tauri build   # a release bundle
+```
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+`src/` is the React app (`views/` per page, `components/` shared); `src-tauri/` the Rust side.
+The architecture notes live in the repository's top-level `CLAUDE.md`, under `gui/`.

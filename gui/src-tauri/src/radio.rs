@@ -2,14 +2,13 @@
 //! page is `ytm_core::radio`'s rule, shared with the TUI; this holds the
 //! station and does the fetching.
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter};
 use ytm_core::radio::{self, Page};
-use ytm_core::SearchResult;
 
 use crate::state::AppState;
 
 /// Replaces the queue with `(playlist, song)` and starts a station from it.
-fn start(app: &AppHandle, state: &AppState, playlist: usize, song: usize) -> Result<(), String> {
+pub fn start(app: &AppHandle, state: &AppState, playlist: usize, song: usize) -> Result<(), String> {
     let title = {
         let library = state.library.lock().map_err(|e| e.to_string())?;
         let track = library.track(playlist, song).ok_or("no such track")?;
@@ -114,27 +113,4 @@ fn land(app: &AppHandle, state: &AppState, seed: &str, result: Result<Page, Stri
     if let Some(notice) = notice {
         let _ = app.emit("radio-notice", notice);
     }
-}
-
-#[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn start_radio(app: AppHandle, state: State<'_, AppState>, playlist: usize, song: usize) -> Result<(), String> {
-    start(&app, &state, playlist, song)
-}
-
-/// [`start_radio`] for a search hit, which has to be filed before it has a
-/// `(playlist, song)` pair.
-#[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn start_radio_from_search(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    result: SearchResult,
-) -> Result<(), String> {
-    let (playlist, song) = state
-        .library
-        .lock()
-        .map_err(|e| e.to_string())?
-        .place_search_result(result.to_track());
-    start(&app, &state, playlist, song)
 }

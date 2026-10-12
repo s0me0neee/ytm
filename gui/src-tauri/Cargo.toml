@@ -26,6 +26,9 @@ percent-encoding = "2.3.2"
 # terminal to have printed them to instead.
 log = "0.4.33"
 simplelog = "0.12.2"
+# "Open in YouTube Music" and "Copy Link", driven from our own commands only.
+tauri-plugin-opener = "2.7.1"
+tauri-plugin-clipboard-manager = "2.4.2"
 
 [lints]
 workspace = true

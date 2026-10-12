@@ -60,6 +60,7 @@
 #![allow(clippy::unused_self)] // 1
 #![allow(clippy::duration_suboptimal_units)] // 1
 #![allow(clippy::case_sensitive_file_extension_comparisons)] // 1
+pub mod browse;
 pub mod config;
 pub mod cover;
 pub mod error;

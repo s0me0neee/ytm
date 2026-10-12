@@ -510,6 +510,7 @@ mod tests {
             duration: None,
             duration_seconds: Some(100),
             thumbnail: None,
+            set_video_id: None,
         }
     }
 

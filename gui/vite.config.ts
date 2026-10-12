@@ -39,6 +39,9 @@ export default defineConfig(async () => ({
   // not in the shipped bundle at all -- not merely unreachable in it.
   define: { __YTM_PROFILE__: JSON.stringify(profiling) },
 
+  // The bundle is read from disk by the app, never downloaded, so its size costs nothing to split.
+  build: { chunkSizeWarningLimit: 1024 },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

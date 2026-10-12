@@ -190,12 +190,10 @@ The browser that worked is written to `config.toml` as `auth.cookie-browser`, so
 expiry renews itself by re-running yt-dlp rather than prompting — set `auth.auto-reauth =
 false` to always be asked.
 
-The `gui/` Tauri app (below) has no local browser to borrow cookies from, so it uses
-`Session::setup_with_webview_cookies` instead — a cookie header read straight out of its own
-login webview. `.yt-tui-authmethod` records which path a session used, so refresh knows
-whether to call `wants_webview_refresh`/`refresh_with_webview_cookies` or the yt-dlp path
-above. Both write the same `browser.json` shape, so nothing downstream of auth can tell which
-frontend signed a session in.
+The `gui/` Tauri app (below) signs in the same way without the prompts:
+`Session::setup_with_browser` reads the chosen browser's cookies, writes the same
+`browser.json` and the same `auth.cookie-browser`, so the two frontends share one session and
+nothing downstream of auth can tell which of them signed it in.
 
 `Session::reauth` returns with a working session either way —
 silently from the browser on record, or through the prompts — so every caller carries
@@ -462,6 +460,17 @@ tools/           not a member and not shipped — see `macos-check` above
   not possible: a `TrackRef` is a position, so removing a track renumbers the rest and the
   queue quietly changes meaning. `clear_search_playlist` empties the tracks and keeps the
   playlist, for the same reason.
+  Each result also carries the artists and album its byline *links* (`artists` with channel
+  ids, `album_id`), read from the runs' `browseEndpoint`s by `links`, which `radio.rs` shares;
+  `to_track` keeps them, so a played result can still go to its album or artist.
+- **`browse.rs`** — album and artist pages, which `ytmusicapi 0.5` lacks: one `browse`
+  request each, walked for renderers. An album is its `musicResponsiveHeaderRenderer` (title,
+  `Album · 2013`, the strapline's artist) and its shelf's rows, each a full `Track` with the
+  album's cover. An artist is its header, the "Top songs" shelf — whose "more" link is a
+  playlist `artist` then fetches, since the shelf holds five rows without durations — and its
+  carousels reduced to album and artist `Card`s; playlist and video carousels are dropped,
+  there being no page to open them on. Fixture tests cover both shapes; the live one is
+  `#[ignore]`d.
 - **`radio.rs`** — a station: `R` in the TUI, "Start Radio" and `R` in the GUI. No
   `get_watch_playlist` exists in `ytmusicapi 0.5`, so this is `search.rs`'s move again: the
   web client's own `next` endpoint through `send_request`, asking for the seed's
@@ -785,21 +794,68 @@ tools/           not a member and not shipped — see `macos-check` above
 
 ### `gui/`
 
-A Tauri desktop frontend, in progress — `gui/src-tauri` is the fourth workspace member,
-`gui/src` a Vite + React shell (still close to the template; only sign-in is wired up).
-Answers the question the `ytm-core`/`tui` split set up for: `state.rs`'s `AppState` just
-holds a `ytm_core::Session`, and the one thing the GUI needed that `Session` didn't already
-have was `setup_with_webview_cookies` (see Credential Setup above).
+The Tauri desktop frontend — `gui/src-tauri` is the fourth workspace member, `gui/src` a
+Vite + React app. Answers the question the `ytm-core`/`tui` split set up for: `state.rs`'s
+`AppState` holds the same `Session`, `Library` and `Player` the TUI does.
 
-`auth.rs`'s `sign_in` opens a `WebviewWindow` at `music.youtube.com` and reads its cookies
-back on every navigation, since Google's login is multi-page and "reached
-music.youtube.com" fires more than once before the user is actually signed in — a
-`SIGNED_IN_MARKER_COOKIE` (`SAPISID=`) is what tells a finished login apart from a loaded
-page. `LOGIN_USER_AGENT` overrides the webview's default UA, since YouTube Music rejects
-WKWebView's and WebKitGTK's own strings outright before a login form even appears.
-`window.cookies()` deadlocks on Windows when called from the navigation callback, hence the
-`spawn_blocking`; the completion `oneshot` is wrapped in `Arc<Mutex<Option<_>>>` (`finish`)
-since navigation can fire more than once but only the first hit should consume it.
+`auth.rs`'s `sign_in` is `Session::setup_with_browser` behind the sign-in screen's browser
+picker (see Credential Setup above), then the same `library::bootstrap` an already-signed-in
+start runs.
+
+The frontend is laid out by what it is: `App.tsx` holds state, navigation and the menu
+builders; `views/` is one file per page (`HomeView`, `PlaylistPage`, `SearchPage`,
+`AlbumView`, `ArtistView`, `NowPlayingView` with `LyricsPanel`/`LyricsPicker`);
+`components/` the shared pieces (`TrackList`, `PlayerBar`, `Transport`, `PlaylistNav`,
+`QueuePanel`, `Menu`, `Modal`, `Tip`, …); `types.ts` mirrors the backend's views; `api.ts`'s
+`call` is `invoke` with a toast on failure, which is how every error reaches the user — there is
+no error box. `context.ts` is two contexts: `ActionsContext` (`navigate`, `toggleLike`, the
+menu builders — never changes) and `StateContext` (playlists, the liked set, the playing track,
+the route — changes on real events, never on the 250ms tick). They are split so that a link or
+a heart, which only needs an action, is not re-rendered by a like or a track change.
+`App`'s middle column is a memoised `Content` for the same reason.
+
+**Interaction is instant, on purpose.** No hover or press effect has a CSS transition: a 120ms
+fade on a row's hover background read as the highlight lagging the pointer, on the way in and
+on the way out, and Tailwind's `transition` utility put 150ms on every button. The rule in
+`App.css` is that transitions are for things that *move* (the queue panel sliding the player,
+the lyric sheet), never for feedback. A click is kept cheap the same way: `TrackRow` is
+memoised on plain values (`play`, `liked`, `number`) behind handlers that read the list's
+latest state through a ref, and selection is a `data-selected` attribute moved on the DOM, so
+clicking a row in a 190-row playlist re-renders nothing. Measured click-to-frame went from a
+63ms median to 16ms (two frames, the measurement's floor). Hover prefetch waits 250ms on a row
+before asking, since sweeping the pointer down a list was an IPC call per row on the main
+thread.
+
+Navigation is a route stack (`Route`: home, playlist, search, album, artist) with back and
+forward in the header and `⌘[`/`⌘]`. Album and artist pages come from `ytm_core::browse`
+(the web client's `browse` endpoint, walked the way `search.rs` walks its response); an
+artist's "Top songs" follows the shelf's own "more" playlist for durations and the rest of
+the list. Search, album and artist answers are cached per session in their views, so going
+back is instant.
+
+**The right-click menu** is one Radix `ContextMenu` for the whole window (`MenuProvider`). A
+row's `onContextMenu` calls `menu.show(e, items)`, which fills the menu in the same event the
+Radix trigger opens it in; a right-click that no row claimed is suppressed, and text fields
+call `nativeMenu` to keep the platform's cut/copy/paste. "…" buttons dispatch a synthetic
+`contextmenu` at themselves (`openMenuFrom`), so there is one menu, not two. The row the menu
+belongs to is marked `data-menu-open` directly on the DOM (no re-render) and drawn filled in
+the accent, as Apple's is. Every action goes through `actions.rs`, which takes a `Target` — a
+library row by position, a loose `Track` (search, album, artist), or a history index — and
+files a loose one under the search playlist before acting, so Play / Play Next / Play Last /
+Start Radio are one command each whatever the row came from. Lists played as a whole (an
+album, a result list) go through `play_tracks`, which is `Player::play_list` over the filed
+refs. Liking is a toggle now: `set_liked` likes or unlikes and refetches Liked Music, whose
+video ids (`liked_ids`) are the frontend's liked set; the heart updates optimistically and
+rolls back on failure. "Remove from Playlist" needs the row's `set_video_id`, which
+`Track` now carries from the playlist fetch (`#[serde(default)]`, so older `queue.json` and
+`history.json` load). "Copy Link" and "Open in YouTube Music" are our own commands over the
+clipboard and opener plugins, and build `music.youtube.com` URLs from an id the backend
+validates — the page cannot open anything else through them.
+
+Track lists (`TrackList`) follow Apple's conventions: a click selects, a double-click or Enter
+plays, and hovering the number shows a play button. Columns are chosen by **container
+queries** on the list's own width (`@2xl:`, `@4xl:`), not the window's, since the queue panel
+takes room without the window changing size.
 
 `persist.rs` is the queue and the volume, through the same `ytm_core::persistence` functions
 `tui/src/app.rs` calls — so `queue.json` and `settings.json` are *one* saved state and not two:
@@ -875,25 +931,24 @@ added later. `last_noted` is what makes it once per *song* rather than once per 
 the ticker passes through here four times a second with the same id. The file is written per
 song rather than at exit — three minutes apart, and a history a crash can erase is one nobody
 trusts — on a blocking task, so neither the ticker nor a command waits on it.
-`play_history_track` prefers the *live* library over the stored copy: if the song is still
-where it was played from it is played there, so the queue and the rest of that playlist behave
-exactly as from the library, and only a playlist that is gone (or a search track that never
-had one) falls back to `place_search_result`. The frontend's home page is `HomeView`, shown
-when no playlist is selected — which is the state the app starts in, so it fills what used to
-be an empty "Tracks" heading over nothing. Its sidebar entry is `selected === null`, sharing
-the `layoutId` highlight with the playlists so the selection slides between them as one
-control. A companion list of recently played *playlists* was built and then removed — the
+A history row is played as `Target::History`, which prefers the *live* library over the
+stored copy: if the song is still where it was played from it is played there, so the queue
+and the rest of that playlist behave exactly as from the library, and only a playlist that is
+gone (or a search track that never had one) falls back to `place_search_result`. The
+frontend's home page is `HomeView`, the route the app starts on; its sidebar entry is
+highlighted like a playlist's, instantly (it used to slide, which read as lag). A companion list of recently played *playlists* was built and then removed — the
 `playlists` field went with it, and an older `history.json` still carrying one loads fine,
 since serde ignores what it no longer knows about.
 
 The window answers the TUI's letters wherever the action exists in both — `n`/`p`, `m`, `t`,
-`s` (focus search), `/` (focus filter), `o` (queue), `H` (home), `y` (now playing), `L` (like),
-`R` (radio from the playing song; the track, result and queue menus offer it per row),
-`P` (the playing song's "Add to Playlist" menu, opened mid-window),
-and in now playing `c`/`i`/`I` — with `?` opening `KeymapOverlay`. They go through
-`keyActions`, a ref rebuilt every render and read by the one `keydown` listener, so each
-action sees current state without the listener being re-bound on the playback tick. Esc in a
-text field blurs it, so the letters work again without the mouse. `get_queue` is only asked
+`s` (focus search), `/` (focus filter), `o` (queue), `H` (home), `y` (now playing), `L` (like
+or unlike), `R` (radio from the playing song), `P` (the "Add to Playlist" dialog for the
+playing song, with "New Playlist…" in it), and in now playing `c`/`i`/`I` — with `?` opening
+`KeymapOverlay`. They go through `keyActions`, a ref rebuilt every render and read by the one
+`keydown` listener, so each action sees current state without the listener being re-bound on
+the playback tick. The listener stands aside while a dialog or menu is open, since those own
+the keyboard. Esc closes, in order, now playing, the queue panel, then goes back a page; in a
+text field it blurs it, so the letters work again without the mouse. `get_queue` is only asked
 for while the queue panel is open; the single next track (`get_up_next`) is fetched on the
 same triggers regardless, for the now-playing view's "Up next" line.
 
@@ -924,8 +979,8 @@ tick, 170ms frames during playback.
 The window's own title bar is hidden on the two platforms that have been looked at, and
 each gets there differently. macOS keeps its decorations and hides the bar with
 `titleBarStyle: "Overlay"`, which is what leaves the traffic lights floating over the
-app's own header (`IS_MAC` and `TRAFFIC_LIGHT_SPAN` in `App.tsx` are the space reserved
-for them). Linux has no equivalent — GTK either draws a title bar or it doesn't — so
+app's own header (`IS_MAC` and the `pl-20` beside it in `App.tsx` are the space reserved
+for them; the header is 54px tall so its contents centre on the lights' y = 27). Linux has no equivalent — GTK either draws a title bar or it doesn't — so
 `tauri.linux.conf.json` sets `decorations: false`, and the header carrying
 `data-tauri-drag-region` becomes the only way to move the window. Resizing still works:
 tao hit-tests a 5px border on an undecorated GTK window and starts the drag itself. What
@@ -936,15 +991,14 @@ cannot go in `tauri.conf.json` alongside the macOS keys, because on macOS it mea
 RFC 7396, which replaces the whole `app.windows` array rather than merging into it, so
 the Linux file has to repeat the window's size and title. Keep the two in step.
 
-**`App.css` beats Tailwind, and that is a trap.** The file opens with `@import "tailwindcss"`,
-so every class it declares afterwards is *later in source order* than the utilities — and
-against a utility they are the same specificity, one class each. So a property set in
-`App.css` silently wins over the utility for it on the same element. `.slider-root`'s
-`position: relative` overrode `absolute` on the player bar's seek line, which then sat in flow
-as the footer's first child, drew across the *top* of the bar and pushed the row below it out
-of the window; its `width: 100%` overrode the volume slider's `w-20` in the same breath. Both
-are now said in `App.css` instead, and a component class there should declare only what no
-caller will ever want to set from the markup.
+**`App.css` component classes live in `@layer components`.** Declared bare after
+`@import "tailwindcss"` they were later in source order than the utilities at the same
+specificity, so they silently beat any utility on the same element — `.slider-root`'s
+`position: relative` once overrode `absolute` on the seek line and drew it across the top of
+the bar. Inside the layer a utility always wins, which is what markup expects. Keep new
+classes in it. The design tokens are in `@theme`: colours, and a type scale (`text-label`
+11px, `text-meta` 12, `text-body` 13, `text-heading` 15, `text-title` 24, `text-display` 30,
+`text-lyric`/`text-lyric-sub`) that every size in the app is one of — no `text-[13px]`.
 
 `init_logging` opens `app.log` in the config directory, truncating, at the level and in the
 format `tui/src/main.rs` uses. Without it every `log::` line in `ytm-core` is discarded, and a
@@ -1116,8 +1170,15 @@ and pin.
 **`tauri 2`** (`gui/src-tauri` only) is what pulls GTK into `Cargo.lock` on Linux — `atk`,
 `cairo-rs` and the rest arrive because Tauri's Linux backend is WebKitGTK, not because
 `ytm-core`/`tui` gained a dependency on them. It shares the workspace's `tokio`
-(`features = ["sync"]`, just enough for `sign_in`'s completion `oneshot`), same reasoning as
-the `reqwest` version note above.
+(`features = ["time", "sync"]`), same reasoning as the `reqwest` version note above.
+`tauri-plugin-opener` and `tauri-plugin-clipboard-manager` are used from Rust only, through
+`actions.rs`'s own commands; no capability grants the page their JS commands, so the page
+can open and copy only what those commands validate.
+
+The frontend's libraries: Radix (`react-context-menu`, `react-dialog`, `react-tooltip`,
+`react-slider`) for the parts with real keyboard and focus behaviour to get right — menus with
+submenus and typeahead, modal focus traps — and `sonner` for toasts. All are styled from
+`App.css`; none brings a theme of its own.
 
 **Workspace clippy lints** (`[workspace.lints.clippy]`, `clippy.toml`) went in ahead of a
 planned split into separate `ytm-core`/`ytm-tui`/`lrclib` repos, so each would start life

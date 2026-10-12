@@ -555,6 +555,23 @@ impl Player {
         self.do_play(library, pl_idx, song_idx);
     }
 
+    /// Replaces the queue with `refs` and plays the one at `start` — an album
+    /// or a list of results played from one of its rows. Shuffles as
+    /// [`Player::play`] does.
+    pub fn play_list(&mut self, library: &Library, refs: Vec<TrackRef>, start: usize) {
+        let Some(&first) = refs.get(start) else { return };
+        self.queue = refs;
+        self.revision += 1;
+        self.unshuffled = None;
+        if matches!(self.mode, PlayMode::Shuffle) {
+            self.unshuffled = Some(self.queue.clone());
+            self.queue.shuffle(&mut rand::rng());
+        }
+        self.queue_pos = self.queue.iter().position(|&r| r == first);
+        log::info!("play_list: n={} start={start}", self.queue.len());
+        self.do_play(library, first.0, first.1);
+    }
+
     /// Appends a batch, as one revision — a radio page is twenty-odd entries
     /// and each revision is a queue redraw in both frontends. Starts playing
     /// the first of them when nothing is playing, as a single append does.

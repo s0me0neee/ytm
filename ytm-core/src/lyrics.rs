@@ -1270,6 +1270,7 @@ mod tests {
             duration: None,
             duration_seconds: Some(245),
             thumbnail: None,
+            set_video_id: None,
         }
     }
 

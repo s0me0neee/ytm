@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 use ytmusicapi::YTMusicClient;
 
 use crate::error::Result;
+use crate::library::Track;
 
 /// The opaque `params` blobs YouTube Music's own UI sends to filter a search.
 /// Verified against the live API; see the module docs.
@@ -104,6 +105,28 @@ pub struct SearchResult {
     pub video_type: String,
     /// Cover art URL, largest first. Empty when the row carries none.
     pub thumbnail: Option<String>,
+    /// The credited artists with their channel ids, where the row links them.
+    #[serde(default)]
+    pub artists: Vec<ytmusicapi::Artist>,
+    /// The album's browse id (`MPREb_…`), where the row links it.
+    #[serde(default)]
+    pub album_id: Option<String>,
+}
+
+/// The artists and the album a byline's runs link to.
+pub(crate) fn links(runs: Option<&Value>) -> (Vec<ytmusicapi::Artist>, Option<String>) {
+    let mut artists = Vec::new();
+    let mut album = None;
+    for run in runs.and_then(Value::as_array).into_iter().flatten() {
+        let Some(id) = first_str(run, "browseId") else { continue };
+        let name = run.get("text").and_then(Value::as_str).unwrap_or_default().trim();
+        if id.starts_with("MPRE") {
+            album = Some(id);
+        } else if id.starts_with("UC") && !name.is_empty() {
+            artists.push(ytmusicapi::Artist { name: name.to_string(), id: Some(id) });
+        }
+    }
+    (artists, album)
 }
 
 impl SearchResult {
@@ -111,25 +134,30 @@ impl SearchResult {
     /// through exactly the same path as a library one.
     #[must_use]
     pub fn to_track(&self) -> crate::library::Track {
-        crate::library::Track {
-            video_id: Some(self.video_id.clone()),
-            title: Some(self.title.clone()),
-            artists: self
-                .artist
+        let artists = if self.artists.is_empty() {
+            self.artist
                 .split(',')
                 .map(|name| ytmusicapi::Artist {
                     name: name.trim().to_string(),
                     id: None,
                 })
                 .filter(|a| !a.name.is_empty())
-                .collect(),
+                .collect()
+        } else {
+            self.artists.clone()
+        };
+        crate::library::Track {
+            video_id: Some(self.video_id.clone()),
+            title: Some(self.title.clone()),
+            artists,
             album: (!self.album.is_empty()).then(|| ytmusicapi::Album {
                 name: self.album.clone(),
-                id: None,
+                id: self.album_id.clone(),
             }),
             duration: (!self.duration.is_empty()).then(|| self.duration.clone()),
             duration_seconds: self.duration_seconds,
             thumbnail: self.thumbnail.clone(),
+            set_video_id: None,
         }
     }
 }
@@ -185,6 +213,16 @@ fn columns(item: &Value) -> Vec<String> {
             (!text.is_empty()).then_some(text)
         })
         .collect()
+}
+
+/// The raw `runs` of a row's `n`th display column.
+pub(crate) fn column_runs(item: &Value, n: usize) -> Option<&Value> {
+    let mut arrays = Vec::new();
+    find_all(item, "flexColumns", &mut arrays);
+    let column = arrays.first()?.as_array()?.get(n)?;
+    let mut runs = Vec::new();
+    find_all(column, "runs", &mut runs);
+    runs.first().copied()
 }
 
 /// `"3:12"` → 192. Also handles `"1:02:03"`.
@@ -272,6 +310,7 @@ fn parse(response: &Value, limit: usize) -> Vec<SearchResult> {
             .filter(|p| !is_duration(p) && !p.ends_with("views") && !p.ends_with("plays"))
             .cloned()
             .unwrap_or_default();
+        let (artists, album_id) = links(column_runs(item, 1));
 
         out.push(SearchResult {
             video_id,
@@ -283,6 +322,8 @@ fn parse(response: &Value, limit: usize) -> Vec<SearchResult> {
             kind,
             video_type,
             thumbnail: thumbnail(item),
+            artists,
+            album_id,
         });
         if out.len() >= limit {
             break;
@@ -344,6 +385,39 @@ pub async fn add_to_playlist(yt: &YTMusicClient, playlist_id: &str, video_id: &s
 pub async fn like(yt: &YTMusicClient, video_id: &str) -> Result<()> {
     yt.like_song(video_id).await?;
     Ok(())
+}
+
+/// Takes a like back, which also takes the track out of Liked Music.
+pub async fn unlike(yt: &YTMusicClient, video_id: &str) -> Result<()> {
+    yt.unlike_song(video_id).await?;
+    Ok(())
+}
+
+/// Removes one row of a playlist, named by its `set_video_id`.
+pub async fn remove_from_playlist(yt: &YTMusicClient, playlist_id: &str, track: &Track) -> Result<()> {
+    let row = ytmusicapi::PlaylistTrack {
+        video_id: track.video_id.clone(),
+        title: track.title.clone(),
+        artists: Vec::new(),
+        album: None,
+        duration: None,
+        duration_seconds: None,
+        thumbnails: Vec::new(),
+        is_available: true,
+        is_explicit: false,
+        set_video_id: track.set_video_id.clone(),
+        video_type: None,
+    };
+    yt.remove_playlist_items(playlist_id, &[row]).await?;
+    Ok(())
+}
+
+/// Creates a private playlist and answers its id.
+pub async fn create_playlist(yt: &YTMusicClient, title: &str) -> Result<String> {
+    let created = yt
+        .create_playlist(title, None, ytmusicapi::Privacy::Private)
+        .await?;
+    Ok(created.playlist_id)
 }
 
 // ── background work ──────────────────────────────────────────────────────────
@@ -592,6 +666,27 @@ mod tests {
         );
         // And a cover to show.
         assert!(songs.iter().all(|h| h.thumbnail.is_some()));
+    }
+
+    #[test]
+    fn a_rows_links_carry_artist_and_album_ids() {
+        let mut item = row("MUSIC_VIDEO_TYPE_ATV", "Get Lucky", "");
+        let link = |text: &str, id: &str| json!({ "text": text,
+            "navigationEndpoint": { "browseEndpoint": { "browseId": id } } });
+        item["musicResponsiveListItemRenderer"]["flexColumns"][1] = json!({
+            "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [
+                link("Daft Punk", "UCdaft"), { "text": " & " }, link("Nile Rodgers", "UCnile"),
+                { "text": " • " }, link("Random Access Memories", "MPREb_ram"),
+                { "text": " • " }, { "text": "6:10" }
+            ] } }
+        });
+        let hit = &parse(&item, 20)[0];
+        assert_eq!(hit.artists.len(), 2);
+        assert_eq!(hit.artists[1].id.as_deref(), Some("UCnile"));
+        assert_eq!(hit.album_id.as_deref(), Some("MPREb_ram"));
+        let track = hit.to_track();
+        assert_eq!(track.artist_names(), "Daft Punk, Nile Rodgers");
+        assert_eq!(track.album.and_then(|a| a.id).as_deref(), Some("MPREb_ram"));
     }
 
     #[test]

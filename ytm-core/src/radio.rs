@@ -30,7 +30,9 @@ use ytmusicapi::YTMusicClient;
 
 use crate::error::Result;
 use crate::library::Track;
-use crate::search::{ResultKind, SearchResult, find_all, first_str, parse_duration, thumbnail};
+use crate::search::{
+    ResultKind, SearchResult, find_all, first_str, links, parse_duration, thumbnail,
+};
 
 /// The `params` blob the web client sends with a radio request. Without it
 /// the endpoint answers with the seed's own watch page and no mix.
@@ -134,6 +136,11 @@ fn parse_row(row: &Value) -> Option<SearchResult> {
         .unwrap_or_default();
     let duration = text_of(row.get("lengthText")).unwrap_or_default();
     let video_type = first_str(row, "musicVideoType").unwrap_or_default();
+    let (artists, album_id) = links(
+        row.get("longBylineText")
+            .or_else(|| row.get("shortBylineText"))
+            .and_then(|b| b.get("runs")),
+    );
 
     Some(SearchResult {
         video_id,
@@ -148,6 +155,8 @@ fn parse_row(row: &Value) -> Option<SearchResult> {
         kind: ResultKind::from_video_type(&video_type).unwrap_or(ResultKind::Video),
         video_type,
         thumbnail: thumbnail(row),
+        artists,
+        album_id,
     })
 }
 
@@ -520,6 +529,7 @@ mod tests {
                     duration: None,
                     duration_seconds: None,
                     thumbnail: None,
+                    set_video_id: None,
                 })
                 .collect(),
             alternates: Vec::new(),

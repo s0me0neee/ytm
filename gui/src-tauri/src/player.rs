@@ -279,17 +279,6 @@ pub fn current_track(state: State<'_, AppState>) -> Option<Track> {
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn play(app: AppHandle, state: State<'_, AppState>, playlist: usize, song: usize) -> Result<(), String> {
-    {
-        let library = state.library.lock().map_err(|e| e.to_string())?;
-        state.player.lock().map_err(|e| e.to_string())?.play(&library, playlist, song);
-    }
-    push(&app, &state);
-    Ok(())
-}
-
-#[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
 pub fn play_pause(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     {
         let library = state.library.lock().map_err(|e| e.to_string())?;
@@ -381,21 +370,6 @@ pub fn set_mode(app: AppHandle, state: State<'_, AppState>, mode: &str) -> Resul
     Ok(())
 }
 
-#[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn append_to_queue(app: AppHandle, state: State<'_, AppState>, playlist: usize, song: usize) -> Result<(), String> {
-    {
-        let library = state.library.lock().map_err(|e| e.to_string())?;
-        state
-            .player
-            .lock()
-            .map_err(|e| e.to_string())?
-            .append_to_queue(&library, playlist, song);
-    }
-    push(&app, &state);
-    Ok(())
-}
-
 /// One row of the Up Next panel: a queue entry resolved to the track it
 /// names, since the queue itself holds only `(playlist, song)` positions.
 #[derive(Serialize)]
@@ -412,6 +386,8 @@ pub struct QueueEntryView {
     pub video_id: Option<String>,
     /// Whether this is the entry currently playing.
     pub current: bool,
+    /// The whole track, for the row's menu.
+    pub track: Option<Track>,
 }
 
 /// The track after the one playing, for the "up next" line.
@@ -452,26 +428,10 @@ pub fn get_queue(state: State<'_, AppState>) -> Vec<QueueEntryView> {
                 thumbnail: track.and_then(|t| t.thumbnail.clone()),
                 video_id: track.and_then(|t| t.video_id.clone()),
                 current: Some(q_pos) == playing,
+                track: track.cloned(),
             }
         })
         .collect()
-}
-
-/// Inserts directly after what is playing -- "Play Next" -- against
-/// `append_to_queue`'s "Play Last".
-#[tauri::command]
-#[allow(clippy::needless_pass_by_value)] // tauri::command requires State by value
-pub fn play_next(app: AppHandle, state: State<'_, AppState>, playlist: usize, song: usize) -> Result<(), String> {
-    {
-        let library = state.library.lock().map_err(|e| e.to_string())?;
-        state
-            .player
-            .lock()
-            .map_err(|e| e.to_string())?
-            .insert_next(&library, playlist, song);
-    }
-    push(&app, &state);
-    Ok(())
 }
 
 #[tauri::command]

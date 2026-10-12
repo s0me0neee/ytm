@@ -1,3 +1,4 @@
+mod actions;
 mod auth;
 mod cover;
 mod history;
@@ -91,6 +92,8 @@ fn initial_state(
 pub fn run() -> tauri::Result<()> {
     init_logging();
     tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .register_asynchronous_uri_scheme_protocol("cover", |_ctx, request, responder| {
             cover::handle(&request, responder);
         })
@@ -137,7 +140,6 @@ pub fn run() -> tauri::Result<()> {
             library::refetch_playlist,
             player::playback_state,
             player::current_track,
-            player::play,
             player::play_pause,
             player::next,
             player::prev,
@@ -147,19 +149,28 @@ pub fn run() -> tauri::Result<()> {
             player::toggle_mute,
             player::cycle_mode,
             player::set_mode,
-            player::append_to_queue,
             player::remove_from_queue,
             player::jump_to,
             player::prefetch,
             player::get_queue,
             player::get_up_next,
-            player::play_next,
             player::clear_queue,
             search::search,
             search::add_to_playlist,
-            search::like_track,
-            search::play_search_result,
-            search::queue_search_result,
+            actions::play_target,
+            actions::play_tracks,
+            actions::queue_target,
+            actions::queue_tracks,
+            actions::queue_playlist,
+            actions::radio_target,
+            actions::liked_ids,
+            actions::set_liked,
+            actions::remove_from_playlist,
+            actions::create_playlist,
+            actions::get_album,
+            actions::get_artist,
+            actions::open_in_browser,
+            actions::copy_link,
             lyrics::get_lyrics,
             lyrics::get_lyrics_choices,
             lyrics::choose_lyrics,
@@ -168,9 +179,6 @@ pub fn run() -> tauri::Result<()> {
             translate::translate_lyrics,
             profile::log_render_timing,
             history::get_history,
-            history::play_history_track,
-            radio::start_radio,
-            radio::start_radio_from_search,
         ])
         .build(tauri::generate_context!())?
         // `build` + `run` rather than `run` alone, purely to get here. This is
