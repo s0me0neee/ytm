@@ -31,11 +31,11 @@ cargo run -p ytm-core --example cover_audit        # whole library
 cargo run -p ytm-core --example cover_audit 300    # first 300 tracks
 
 # gui/ — the Tauri desktop frontend, in progress (see Architecture below).
-# pnpm drives the frontend half; cargo alone builds gui/src-tauri but won't
-# produce a running app without pnpm's build having populated frontendDist.
-cd gui && pnpm install
-cd gui && pnpm tauri dev     # dev build, opens a window
-cd gui && pnpm tauri build   # release bundle
+# bun drives the frontend half; cargo alone builds gui/src-tauri but won't
+# produce a running app without bun's build having populated frontendDist.
+cd gui && bun install
+cd gui && bun tauri dev     # dev build, opens a window
+cd gui && bun tauri build   # release bundle
 
 # Releases are cut by `dist` (cargo-dist) from a pushed tag: `v1.0.0` builds both
 # binaries for five targets and publishes one GitHub Release. Nothing is released
@@ -53,8 +53,8 @@ dist generate             # rewrite .github/workflows/release.yml from the confi
 #   * devtools are gated on `debug_assertions`, so `tauri dev --release`
 #     produces a webview Safari's inspector cannot see at all. Profile from a
 #     debug build, or add tauri's `devtools` feature.
-cd gui && pnpm devtools       # the profiler UI, listens on 8097
-cd gui && pnpm dev:profile    # the app, with the backend script injected
+cd gui && bun devtools       # the profiler UI, listens on 8097
+cd gui && bun dev:profile    # the app, with the backend script injected
 # `YTM_PROFILE=1` is what injects <script src="localhost:8097"> ahead of the
 # module script (the `reactDevtools` plugin in vite.config.ts) — React has to
 # be hooked before it loads. Never in `index.html` itself: that would ship a
@@ -62,9 +62,10 @@ cd gui && pnpm dev:profile    # the app, with the backend script injected
 #
 # `react-devtools` drags in Electron, and getting it to run took two fixes
 # that both fail *silently*:
-#   * pnpm 11 blocks postinstall scripts. `pnpm-workspace.yaml`'s `allowBuilds`
-#     is where electron is approved; without it the wrapper installs and the
-#     binary does not.
+#   * bun runs no dependency's postinstall unless it is trusted. `package.json`'s
+#     `trustedDependencies` is where electron is approved; without it the
+#     wrapper installs and the binary does not. Setting that list replaces
+#     bun's built-in one, so anything else needing a script has to be named too.
 #   * electron's own `install.js` then extracts the zip to 252K instead of
 #     208M and still prints "Done", leaving no `Electron Framework.framework`
 #     and no `path.txt`. The cached zip in `~/Library/Caches/electron/` is
@@ -140,10 +141,11 @@ beside the workflows rather than in them because GitHub parses anything under
   generated there.
 - **The GUI's frontend.** `tauri::generate_context!()` embeds `frontendDist` at *compile*
   time, and `beforeBuildCommand` is run by the tauri CLI — which dist is not, it builds with
-  plain cargo. So `pnpm build` has to have run before `dist build`, on every runner, or
+  plain cargo. So `bun run build` has to have run before `dist build`, on every runner, or
   `ytm-gui` compiles against a `gui/dist` that does not exist. `--ignore-scripts` on the
   install is deliberate: `react-devtools` drags in electron, whose postinstall downloads
-  ~100MB and fails silently (above), and nothing in `pnpm build` touches it.
+  ~100MB and fails silently (above), and nothing in `bun run build` touches it. Node is
+  still set up beside bun: `vite` and `tsc` carry a `node` shebang, which `bun run` honours.
 
 Everything else is `[dist.dependencies]`: `libmpv-dev` plus Tauri's WebKitGTK set on apt,
 `mpv` on Homebrew. Every target has a native runner, so none of this is cross-compiled. Any
@@ -1007,8 +1009,8 @@ its own auth, playback and media backends.
 
 Its own crate (`ytm-gui`) rather than folded into `tui`, since the two frontends share
 nothing but `ytm-core` and Tauri's build artifacts have no reason to touch the ratatui
-binary. `pnpm` drives the frontend half; `cargo` alone builds `gui/src-tauri` but won't
-produce a running app without a `pnpm` build behind it (`tauri.conf.json`'s `frontendDist`).
+binary. `bun` drives the frontend half; `cargo` alone builds `gui/src-tauri` but won't
+produce a running app without a `bun` build behind it (`tauri.conf.json`'s `frontendDist`).
 
 ### Event loop cadence
 

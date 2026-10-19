@@ -60,11 +60,13 @@
 #
 # `--ignore-scripts` is not tidiness: `react-devtools` drags in electron, whose
 # postinstall downloads ~100MB and, per CLAUDE.md, can fail silently. It is a
-# dev-only profiler and nothing in `pnpm build` touches it.
-- name: Set up pnpm
-  uses: pnpm/action-setup@v4
+# dev-only profiler and nothing in `bun run build` touches it.
+#
+# Node stays: `vite` and `tsc` carry a `node` shebang, which `bun run` honours.
+- name: Set up Bun
+  uses: oven-sh/setup-bun@v2
   with:
-    version: 11
+    bun-version: 1.4.3
 - name: Set up Node
   uses: actions/setup-node@v4
   with:
@@ -72,5 +74,5 @@
 - name: Build the GUI frontend
   run: |
     cd gui
-    pnpm install --frozen-lockfile --ignore-scripts
-    pnpm build
+    bun install --frozen-lockfile --ignore-scripts
+    bun run build

@@ -9,7 +9,7 @@ const host = process.env.TAURI_DEV_HOST;
 const profiling = Boolean(process.env.YTM_PROFILE);
 
 /**
- * Injects React DevTools' standalone backend, and only when `pnpm profile`
+ * Injects React DevTools' standalone backend, and only when `bun dev:profile`
  * asked for it.
  *
  * The browser extension cannot load in a WKWebView, so the standalone build
