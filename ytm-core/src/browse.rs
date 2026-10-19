@@ -60,8 +60,11 @@ pub struct Card {
 }
 
 fn text(v: Option<&Value>) -> String {
-    v.and_then(|v| v.get("runs"))
-        .and_then(Value::as_array)
+    runs_text(v.and_then(|v| v.get("runs")))
+}
+
+fn runs_text(runs: Option<&Value>) -> String {
+    runs.and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|r| r.get("text").and_then(Value::as_str))
@@ -229,16 +232,43 @@ fn top_song(row: &Value) -> Option<Track> {
     })
 }
 
+fn card_kind(id: &str) -> Option<CardKind> {
+    if id.starts_with("MPRE") {
+        Some(CardKind::Album)
+    } else if id.starts_with("UC") {
+        Some(CardKind::Artist)
+    } else {
+        None
+    }
+}
+
+/// A search or suggestion row that opens an album or artist page rather than playing anything.
+pub(crate) fn list_card(item: &Value) -> Option<Card> {
+    let id = item.get("navigationEndpoint")?.get("browseEndpoint")?.get("browseId")?.as_str()?.to_string();
+    let kind = card_kind(&id)?;
+    let title = runs_text(column_runs(item, 0));
+    if title.is_empty() {
+        return None;
+    }
+    let detail = runs_text(column_runs(item, 1));
+    let mut parts: Vec<&str> = detail.split('•').map(str::trim).filter(|p| !p.is_empty()).collect();
+    // `Artist • 238M monthly audience`: every artist row opens with the same word, so it says nothing.
+    if kind == CardKind::Artist && parts.len() > 1 {
+        parts.remove(0);
+    }
+    Some(Card {
+        kind,
+        id,
+        title,
+        subtitle: parts.join(" • "),
+        thumbnail: thumbnail(item),
+    })
+}
+
 fn card(item: &Value) -> Option<Card> {
     let endpoint = item.get("navigationEndpoint")?.get("browseEndpoint")?;
     let id = endpoint.get("browseId")?.as_str()?.to_string();
-    let kind = if id.starts_with("MPRE") {
-        CardKind::Album
-    } else if id.starts_with("UC") {
-        CardKind::Artist
-    } else {
-        return None;
-    };
+    let kind = card_kind(&id)?;
     Some(Card {
         kind,
         id,

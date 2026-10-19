@@ -465,6 +465,20 @@ tools/           not a member and not shipped — see `macos-check` above
   Each result also carries the artists and album its byline *links* (`artists` with channel
   ids, `album_id`), read from the runs' `browseEndpoint`s by `links`, which `radio.rs` shares;
   `to_track` keeps them, so a played result can still go to its album or artist.
+  `search` is the TUI's and stays songs-then-videos in one list. The GUI's results page uses
+  `search_page`, which adds **albums and artists** as two more filtered requests and sends all
+  four at once with `tokio::join!` — ~0.56s warm for the lot, where songs and videos alone
+  had gone one after the other. The filter blobs differ only in one protobuf field (1 songs,
+  2 videos, 3 albums, 4 artists), which is how `ALBUMS_FILTER`/`ARTISTS_FILTER` were made from
+  the songs one, then checked live. Their rows have no video id; `browse::list_card` reads
+  them into the same `Card` the artist page's carousels use. One section failing costs only
+  that section; all four failing is an error. `suggestions` is the search box's dropdown,
+  from the `music/get_search_suggestions` endpoint: completions, then artist/album rows, then
+  songs. A suggested song's byline is `Song • artist • plays` with the album in a *third*
+  column, so `parse`'s reading of the second column would have named the artist "Song" —
+  hence `suggested_song`. `Library::search` is the local half: every word of the query in a
+  track's title, artists or album, one row per video id (Liked Music and a playlist often hold
+  the same song), title matches first.
 - **`browse.rs`** — album and artist pages, which `ytmusicapi 0.5` lacks: one `browse`
   request each, walked for renderers. An album is its `musicResponsiveHeaderRenderer` (title,
   `Album · 2013`, the strapline's artist) and its shelf's rows, each a full `Track` with the
@@ -808,7 +822,7 @@ The frontend is laid out by what it is: `App.tsx` holds state, navigation and th
 builders; `views/` is one file per page (`HomeView`, `PlaylistPage`, `SearchPage`,
 `AlbumView`, `ArtistView`, `NowPlayingView` with `LyricsPanel`/`LyricsPicker`);
 `components/` the shared pieces (`TrackList`, `PlayerBar`, `Transport`, `PlaylistNav`,
-`QueuePanel`, `Menu`, `Modal`, `Tip`, …); `types.ts` mirrors the backend's views; `api.ts`'s
+`QueuePanel`, `SearchBox`, `Shelf`, `SongGrid`, `CardActions`, `Menu`, `Modal`, `Tip`, …); `types.ts` mirrors the backend's views; `api.ts`'s
 `call` is `invoke` with a toast on failure, which is how every error reaches the user — there is
 no error box. `context.ts` is two contexts: `ActionsContext` (`navigate`, `toggleLike`, the
 menu builders — never changes) and `StateContext` (playlists, the liked set, the playing track,
@@ -833,7 +847,31 @@ forward in the header and `⌘[`/`⌘]`. Album and artist pages come from `ytm_c
 (the web client's `browse` endpoint, walked the way `search.rs` walks its response); an
 artist's "Top songs" follows the shelf's own "more" playlist for durations and the rest of
 the list. Search, album and artist answers are cached per session in their views, so going
-back is instant.
+back is instant. The header's search field follows the route, so Back through two searches
+shows the query whose results are on screen.
+
+**Search** is laid out after Apple Music's. `SearchBox` is the header field and its dropdown:
+recent searches when it's empty (`recent.ts`, the webview's own `localStorage` — a per-device
+convenience nothing else reads, so not a file in the config directory), and while typing,
+`search_suggestions` debounced 150ms and cached per input, so backspacing asks for nothing
+twice. ↑/↓ move through it, wrapping through the field itself; Enter takes the highlighted
+line or searches what was typed; the first Esc closes the list and only the second leaves
+the field. The list is the field's *sibling*, not its child: a `backdrop-filter` ancestor
+makes itself the backdrop root, and a nested blur would see only the field. `SearchPage`
+shows Top Results (the artist the query names, an album it names, then the best songs —
+`topResults`, compared with case and punctuation stripped), In Your Library
+(`search_library`, local and instant, so it is asked again as playlists finish loading and
+plays from the playlist rather than as a loose track), Artists, Albums, then Songs and Videos
+as `SongGrid`s.
+
+Sideways rows go through `Shelf`: arrows on the row's edges, shown while the shelf is
+hovered, paging by whole items — the one cut off at the edge becomes the first in view —
+since a hidden scrollbar is no way across without a horizontal wheel. `SongGrid` is Apple's
+compact song grid, four rows deep and paged sideways, its columns sized to tile the row
+exactly at each container width so a page never ends mid-column; the artist page's Top songs
+and the search sections use it. `CardActions` lays play and "…" over a card's artwork as a
+*sibling* of the card's button (a button can't hold another), with the menu on the card's
+wrapper so the "…"'s synthetic `contextmenu` bubbles to it.
 
 **The right-click menu** is one Radix `ContextMenu` for the whole window (`MenuProvider`). A
 row's `onContextMenu` calls `menu.show(e, items)`, which fills the menu in the same event the
@@ -904,8 +942,8 @@ playlist opens with ~24 requests, not 170 — `hdLadder` stops at the smallest f
 the size asked for, and the blurred backdrops use the advertised URL (`backdropUrl`), which
 always exists and is already cached.
 
-Commands that wait on the network — search, like, add-to-playlist, the three lyrics commands and
-translation — are `async` and run their body through `state::off_main` (`spawn_blocking`). A sync
+Commands that wait on the network — search and its suggestions, like, add-to-playlist, the three
+lyrics commands and translation — are `async` and run their body through `state::off_main` (`spawn_blocking`). A sync
 `#[tauri::command]` runs on the main thread, which on Linux also delivers every input event to the
 webview, so a lyrics lookup there froze the whole window for the ~2s lrclib took on every track
 change. `spawn_blocking` rather than `.await` for the reason `library::bootstrap` gives. A command
@@ -1143,6 +1181,9 @@ own — its `reqwest 0.12.4` resolves to the 0.12 `ytmusicapi` pulls in, which i
 0.12 is in the graph whatever this workspace's own crates ask for. It does ask for tokio's
 `full` feature set, which unifies across the workspace; that costs build time, nothing at
 runtime. See `ytm-core/src/translate.rs` for what it gets wrong and how that is handled.
+`ytm-core` names tokio's `macros` itself all the same, for `search_page`'s `join!`: the
+unification is an accident of this crate's dependencies, and the split into separate repos
+would end it.
 
 The AI path in `translate/llm.rs` calls the Anthropic Messages API over the workspace's own
 `reqwest` — no SDK, since there is no official Rust one, and no new HTTP stack. DeepSeek

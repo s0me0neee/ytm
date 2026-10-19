@@ -198,6 +198,32 @@ body {
     @apply hover:bg-surface;
   }
 
+  /* A shelf's paging arrow, on the row's edge: there only while the shelf is pointed at, as Apple's is. */
+  .shelf-arrow {
+    @apply flex h-14 w-7 items-center justify-center rounded-lg text-ink opacity-0 group-hover/shelf:opacity-100 focus-visible:opacity-100;
+    background: var(--glass-bg-strong);
+    backdrop-filter: var(--glass-blur);
+    -webkit-backdrop-filter: var(--glass-blur);
+    border: 0.5px solid var(--glass-stroke);
+  }
+  .shelf-arrow:hover {
+    background: rgba(255, 255, 255, 0.16);
+  }
+
+  /* Play and "…" laid over a card's artwork, shown on hover; play stays while its card is the one playing. */
+  .card-action {
+    @apply pointer-events-auto flex h-8 w-8 items-center justify-center rounded-full text-white opacity-0 shadow-md shadow-black/30 group-hover:opacity-100 focus-visible:opacity-100;
+    background: rgba(0, 0, 0, 0.5);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+  }
+  .card-action:hover {
+    background: rgba(0, 0, 0, 0.7);
+  }
+  .card-action.is-playing {
+    opacity: 1;
+  }
+
   /* An artist or album name inside a row: a link, without looking like one until pointed at. */
   .link {
     display: inline;
@@ -338,6 +364,39 @@ body {
     font-size: var(--text-label);
     font-weight: 600;
     color: rgba(255, 255, 255, 0.45);
+  }
+
+  /* The search box's suggestions: the context menu's glass, hung under the field. */
+  .search-pop {
+    position: absolute;
+    top: calc(100% + 0.375rem);
+    right: 0;
+    left: 0;
+    z-index: 60;
+    max-height: min(70vh, 32rem);
+    overflow-y: auto;
+    padding: 0.25rem;
+    border-radius: 12px;
+    background: rgba(40, 40, 40, 0.72);
+    backdrop-filter: blur(60px) saturate(2.2);
+    -webkit-backdrop-filter: blur(60px) saturate(2.2);
+    box-shadow:
+      0 8px 40px rgba(0, 0, 0, 0.55),
+      inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+    animation: pop-in 0.12s ease-out;
+  }
+  .search-option {
+    @apply flex items-center gap-3 rounded-lg px-3 py-1.5 text-body text-ink select-none;
+    cursor: default;
+  }
+  .search-option[data-active] {
+    background: rgba(255, 255, 255, 0.12);
+  }
+  .search-forget {
+    opacity: 0;
+  }
+  .search-option[data-active] .search-forget {
+    opacity: 1;
   }
 
   .tip {
@@ -532,10 +591,13 @@ body {
   .player-bar-clock {
     opacity: 0;
   }
-  .player-island-lcd:has(.slider-seekbar:hover) .player-bar-info {
+  /* Scrubbing too: a drag can leave the line, and the clock is what it is aiming by. */
+  .player-island-lcd:has(.slider-seekbar:hover) .player-bar-info,
+  .player-island-lcd.is-scrubbing .player-bar-info {
     opacity: 0;
   }
-  .player-island-lcd:has(.slider-seekbar:hover) .player-bar-clock {
+  .player-island-lcd:has(.slider-seekbar:hover) .player-bar-clock,
+  .player-island-lcd.is-scrubbing .player-bar-clock {
     opacity: 1;
   }
   .slider-thumb {

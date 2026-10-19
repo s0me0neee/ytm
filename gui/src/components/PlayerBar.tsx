@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Heart, ListMusic } from "lucide-react";
 import { send } from "../api";
 import { useActions, useAppState } from "../context";
@@ -22,7 +23,9 @@ export function PlayerBar({ playback, currentTrack, onOpenNowPlaying, queueOpen,
   const { liked } = useAppState();
   const { toggleLike, menus } = useActions();
   const menu = useMenu();
-  const remaining = Math.max(0, playback.total - playback.elapsed);
+  const [scrub, setScrub] = useState<number | null>(null);
+  const at = scrub ?? playback.elapsed;
+  const remaining = Math.max(0, playback.total - at);
   const album = currentTrack?.album?.name;
   const isLiked = Boolean(currentTrack?.video_id && liked.has(currentTrack.video_id));
   const target = playback.playing ? { kind: "library" as const, playlist: playback.playing[0], song: playback.playing[1] } : null;
@@ -38,7 +41,7 @@ export function PlayerBar({ playback, currentTrack, onOpenNowPlaying, queueOpen,
         </div>
 
         <div
-          className="player-island-lcd flex min-w-0 items-center"
+          className={`player-island-lcd flex min-w-0 items-center ${scrub !== null ? "is-scrubbing" : ""}`}
           onContextMenu={(e) => {
             if (currentTrack && target) menu.show(e, menus.track(currentTrack, target));
           }}
@@ -62,7 +65,7 @@ export function PlayerBar({ playback, currentTrack, onOpenNowPlaying, queueOpen,
           </button>
           {/* Remaining rather than total: it answers "can I start something else yet". */}
           <div className="player-bar-clock pointer-events-none absolute inset-x-0 flex items-center justify-between font-mono text-label text-ink tabular-nums">
-            <span>{formatTime(playback.elapsed)}</span>
+            <span>{formatTime(at)}</span>
             <span>−{formatTime(remaining)}</span>
           </div>
           <Slider
@@ -71,6 +74,7 @@ export function PlayerBar({ playback, currentTrack, onOpenNowPlaying, queueOpen,
             value={playback.elapsed}
             max={playback.total}
             onCommit={(v) => send("seek_to", { secs: v })}
+            onScrub={setScrub}
           />
         </div>
 

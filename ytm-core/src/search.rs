@@ -39,6 +39,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use ytmusicapi::YTMusicClient;
 
+use crate::browse::{Card, list_card};
 use crate::error::Result;
 use crate::library::Track;
 
@@ -46,6 +47,9 @@ use crate::library::Track;
 /// Verified against the live API; see the module docs.
 const SONGS_FILTER: &str = "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D";
 const VIDEOS_FILTER: &str = "EgWKAQIQAWoKEAkQChAFEAMQBA%3D%3D";
+/// The same blob with the filter field swapped: 3 is albums, 4 artists. Measured against the live API.
+const ALBUMS_FILTER: &str = "EgWKAQIYAWoKEAkQBRAKEAMQBA%3D%3D";
+const ARTISTS_FILTER: &str = "EgWKAQIgAWoKEAkQBRAKEAMQBA%3D%3D";
 
 /// How many results to keep per filter. YouTube returns 20 a page and the list
 /// is a picker, not a catalogue — past this it is quicker to refine the query.
@@ -374,6 +378,143 @@ pub async fn search(yt: &YTMusicClient, query: &str) -> Result<Vec<SearchResult>
     Ok(out)
 }
 
+/// Everything a query finds, by kind: what a results page lays out as sections.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SearchPage {
+    pub songs: Vec<SearchResult>,
+    pub videos: Vec<SearchResult>,
+    pub albums: Vec<Card>,
+    pub artists: Vec<Card>,
+}
+
+async fn run_cards(yt: &YTMusicClient, query: &str, params: &str) -> Result<Vec<Card>> {
+    let body = json!({ "query": query, "params": params });
+    let response = yt.send_request("search", body).await?;
+    let mut rows = Vec::new();
+    find_all(&response, "musicResponsiveListItemRenderer", &mut rows);
+    Ok(rows.into_iter().filter_map(list_card).take(PER_FILTER).collect())
+}
+
+/// Songs, videos, albums and artists, sent together; one failing costs only its own section.
+pub async fn search_page(yt: &YTMusicClient, query: &str) -> Result<SearchPage> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(SearchPage::default());
+    }
+    let (songs, videos, albums, artists) = tokio::join!(
+        run_filter(yt, query, SONGS_FILTER),
+        run_filter(yt, query, VIDEOS_FILTER),
+        run_cards(yt, query, ALBUMS_FILTER),
+        run_cards(yt, query, ARTISTS_FILTER),
+    );
+    if songs.is_err() && videos.is_err() && albums.is_err() && artists.is_err() {
+        return songs.map(|_| SearchPage::default());
+    }
+    fn or_empty<T>(section: &str, r: Result<Vec<T>>) -> Vec<T> {
+        r.unwrap_or_else(|e| {
+            log::warn!("search: the {section} results failed ({e})");
+            Vec::new()
+        })
+    }
+
+    // As in `search`: a video the songs already list is the same track, and the type decides the section.
+    let mut seen = std::collections::HashSet::new();
+    let (songs, videos): (Vec<_>, Vec<_>) = or_empty("song", songs)
+        .into_iter()
+        .chain(or_empty("video", videos))
+        .filter(|r| seen.insert(r.video_id.clone()))
+        .partition(|r| r.kind == ResultKind::Song);
+    let page = SearchPage {
+        songs,
+        videos,
+        albums: or_empty("album", albums),
+        artists: or_empty("artist", artists),
+    };
+    log::info!(
+        "search: {query:?} → {} songs, {} videos, {} albums, {} artists",
+        page.songs.len(),
+        page.videos.len(),
+        page.albums.len(),
+        page.artists.len()
+    );
+    Ok(page)
+}
+
+/// What the search box offers while a query is being typed.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Suggestions {
+    /// Completions of the query, to search for as they are.
+    pub queries: Vec<String>,
+    /// Artists and albums to go straight to.
+    pub cards: Vec<Card>,
+    /// Songs to play straight away.
+    pub songs: Vec<SearchResult>,
+}
+
+/// A suggested song: its byline is `Song • artist • plays`, which `parse` would read "Song" out of as the artist.
+fn suggested_song(item: &Value) -> Option<SearchResult> {
+    let video_id = first_str(item, "videoId")?;
+    let video_type = first_str(item, "musicVideoType").unwrap_or_default();
+    let kind = ResultKind::from_video_type(&video_type)?;
+    let cols = columns(item);
+    let title = cols.first()?.clone();
+    let (artists, _) = links(column_runs(item, 1));
+    let (_, album_id) = links(column_runs(item, 2));
+    let artist = if artists.is_empty() {
+        cols.get(1)
+            .and_then(|byline| byline.split('•').nth(1))
+            .map(|a| a.trim().to_string())
+            .unwrap_or_default()
+    } else {
+        artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
+    };
+    Some(SearchResult {
+        video_id,
+        title,
+        artist,
+        album: cols.get(2).cloned().unwrap_or_default(),
+        duration: String::new(),
+        duration_seconds: None,
+        kind,
+        video_type,
+        thumbnail: thumbnail(item),
+        artists,
+        album_id,
+    })
+}
+
+fn parse_suggestions(response: &Value) -> Suggestions {
+    let mut texts = Vec::new();
+    find_all(response, "searchSuggestionRenderer", &mut texts);
+    let queries = texts
+        .iter()
+        .filter_map(|s| s.get("navigationEndpoint")?.get("searchEndpoint")?.get("query")?.as_str())
+        .map(str::to_string)
+        .collect();
+
+    let mut rows = Vec::new();
+    find_all(response, "musicResponsiveListItemRenderer", &mut rows);
+    let mut out = Suggestions { queries, ..Suggestions::default() };
+    for row in rows {
+        if let Some(card) = list_card(row) {
+            out.cards.push(card);
+        } else if let Some(song) = suggested_song(row) {
+            out.songs.push(song);
+        }
+    }
+    out
+}
+
+/// YouTube Music's own suggestions for a partly typed query.
+pub async fn suggestions(yt: &YTMusicClient, input: &str) -> Result<Suggestions> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(Suggestions::default());
+    }
+    let response = yt.send_request("music/get_search_suggestions", json!({ "input": input })).await?;
+    Ok(parse_suggestions(&response))
+}
+
 /// Adds a track to one of the user's playlists.
 pub async fn add_to_playlist(yt: &YTMusicClient, playlist_id: &str, video_id: &str) -> Result<()> {
     yt.add_playlist_items(playlist_id, &[video_id.to_string()], false)
@@ -538,6 +679,66 @@ mod tests {
 
     /// One row, shaped like the real thing: the fields this parser needs, at
     /// the depths YouTube puts them.
+    fn column(runs: &Value) -> Value {
+        json!({ "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": runs } } })
+    }
+
+    fn browse_row(id: &str, title: &str, detail: &Value) -> Value {
+        json!({ "musicResponsiveListItemRenderer": {
+            "navigationEndpoint": { "browseEndpoint": { "browseId": id } },
+            "flexColumns": [ column(&json!([{ "text": title }])), column(detail) ]
+        } })
+    }
+
+    // Shaped after a live `get_search_suggestions` reply for "the weekn".
+    #[test]
+    fn suggestions_split_into_queries_pages_and_songs() {
+        let response = json!({ "contents": [
+            { "searchSuggestionsSectionRenderer": { "contents": [
+                { "searchSuggestionRenderer": {
+                    "suggestion": { "runs": [ { "text": "the weekn" }, { "text": "d" } ] },
+                    "navigationEndpoint": { "searchEndpoint": { "query": "the weeknd" } } } },
+                { "searchSuggestionRenderer": {
+                    "navigationEndpoint": { "searchEndpoint": { "query": "the weeknd the hills" } } } }
+            ] } },
+            { "searchSuggestionsSectionRenderer": { "contents": [
+                browse_row("UCweeknd", "The Weeknd", &json!([
+                    { "text": "Artist" }, { "text": " • " }, { "text": "238M monthly audience" } ])),
+                { "musicResponsiveListItemRenderer": {
+                    "playlistItemData": { "videoId": "GfiJowcJiVw" },
+                    "flexColumns": [
+                        column(&json!([{ "text": "The Hills" }])),
+                        column(&json!([
+                            { "text": "Song" }, { "text": " • " },
+                            { "text": "The Weeknd", "navigationEndpoint": { "browseEndpoint": { "browseId": "UCweeknd" } } },
+                            { "text": " • " }, { "text": "2.8B plays" } ])),
+                        column(&json!([{ "text": "Beauty Behind The Madness",
+                            "navigationEndpoint": { "browseEndpoint": { "browseId": "MPREbbtm" } } }]))
+                    ],
+                    "menu": { "musicVideoType": "MUSIC_VIDEO_TYPE_ATV" } } }
+            ] } }
+        ] });
+        let s = parse_suggestions(&response);
+        assert_eq!(s.queries, ["the weeknd", "the weeknd the hills"]);
+        assert_eq!(s.cards.len(), 1);
+        assert_eq!((s.cards[0].id.as_str(), s.cards[0].subtitle.as_str()), ("UCweeknd", "238M monthly audience"));
+        assert_eq!(s.songs.len(), 1);
+        let song = &s.songs[0];
+        assert_eq!((song.title.as_str(), song.artist.as_str()), ("The Hills", "The Weeknd"));
+        assert_eq!((song.album.as_str(), song.album_id.as_deref()), ("Beauty Behind The Madness", Some("MPREbbtm")));
+    }
+
+    #[test]
+    fn an_album_row_keeps_its_byline_and_an_unknown_page_is_dropped() {
+        let album = browse_row("MPREstarboy", "Starboy", &json!([
+            { "text": "Album" }, { "text": " • " }, { "text": "The Weeknd" }, { "text": " • " }, { "text": "2016" } ]));
+        let card = list_card(&album["musicResponsiveListItemRenderer"]).unwrap();
+        assert_eq!(card.kind, crate::browse::CardKind::Album);
+        assert_eq!(card.subtitle, "Album • The Weeknd • 2016");
+        let playlist = browse_row("VLPL123", "Some playlist", &json!([{ "text": "Playlist" }]));
+        assert!(list_card(&playlist["musicResponsiveListItemRenderer"]).is_none());
+    }
+
     fn row(video_type: &str, title: &str, detail: &str) -> Value {
         json!({
             "musicResponsiveListItemRenderer": {
@@ -625,6 +826,18 @@ mod tests {
     }
 
     /// Hits the real API with the user's session.
+    #[tokio::test]
+    #[ignore = "network + a set-up session"]
+    async fn live_a_search_page_finds_every_kind_and_suggests() {
+        let yt = crate::Session::new().expect("session").build_client().expect("client");
+        let page = search_page(&yt, "the weeknd").await.expect("searched");
+        assert!(!page.songs.is_empty() && !page.videos.is_empty());
+        assert!(page.artists.iter().any(|a| a.title == "The Weeknd"), "{:?}", page.artists);
+        assert!(page.albums.iter().all(|a| a.kind == crate::browse::CardKind::Album));
+        let s = suggestions(&yt, "the weekn").await.expect("suggested");
+        assert!(s.queries.iter().any(|q| q == "the weeknd"), "{:?}", s.queries);
+    }
+
     /// `cargo test -p ytm-core search -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "network + a set-up session"]

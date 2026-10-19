@@ -4,27 +4,27 @@ import { Radio, RotateCw } from "lucide-react";
 import { call } from "../api";
 import { CardShelf } from "../components/CardShelf";
 import { PageHeader } from "../components/PageHeader";
-import { TrackList, TrackSkeleton } from "../components/TrackList";
+import { SongGrid } from "../components/SongGrid";
+import { TrackSkeleton } from "../components/TrackList";
 import { useActions } from "../context";
-import { errorText } from "../format";
-import type { ArtistPage, Target } from "../types";
+import { artistNames, errorText } from "../format";
+import type { ArtistPage, Target, Track } from "../types";
 
 const cache = new Map<string, ArtistPage>();
-// Ten is a glance; the rest are a click away.
-const FOLDED = 10;
+
+// The artist is the page's own name, so the album is what tells one top song from the next.
+const albumOrArtist = (t: Track) => t.album?.name ?? artistNames(t);
 
 export const ArtistView = memo(function ArtistView({ id }: { id: string }) {
   const { menus } = useActions();
   const [artist, setArtist] = useState<ArtistPage | null>(() => cache.get(id) ?? null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
-  const [allSongs, setAllSongs] = useState(false);
   const [aboutOpen, setAboutOpen] = useState(false);
 
   useEffect(() => {
     let live = true;
     setError(null);
-    setAllSongs(false);
     setAboutOpen(false);
     const hit = cache.get(id);
     setArtist(hit ?? null);
@@ -41,7 +41,6 @@ export const ArtistView = memo(function ArtistView({ id }: { id: string }) {
   }, [id, attempt]);
 
   const songs = artist?.songs ?? [];
-  const shown = allSongs ? songs : songs.slice(0, FOLDED);
   const targetOf = useCallback((i: number): Target => ({ kind: "track", track: songs[i] }), [songs]);
   const play = useCallback((i: number) => void call("play_tracks", { tracks: songs, start: i }), [songs]);
   const shuffle = useCallback(async () => {
@@ -97,19 +96,7 @@ export const ArtistView = memo(function ArtistView({ id }: { id: string }) {
         )}
       </PageHeader>
 
-      {songs.length > 0 && (
-        <section className="mb-8">
-          <div className="flex items-baseline justify-between pr-3">
-            <h2 className="section-heading">Top songs</h2>
-            {songs.length > FOLDED && (
-              <button onClick={() => setAllSongs((v) => !v)} className="text-meta text-ink-dim hover:text-ink">
-                {allSongs ? "Show fewer" : `Show all ${songs.length}`}
-              </button>
-            )}
-          </div>
-          <TrackList tracks={shown} variant="plain" onPlay={play} targetOf={targetOf} />
-        </section>
-      )}
+      <SongGrid title="Top songs" tracks={songs} subtitle={albumOrArtist} onPlay={play} targetOf={targetOf} />
 
       {artist.shelves.map((s) => (
         <CardShelf key={s.title} title={s.title} cards={s.cards} />

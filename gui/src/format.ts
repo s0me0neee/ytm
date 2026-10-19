@@ -33,6 +33,15 @@ export function greeting(): string {
   return "Good evening";
 }
 
+/** `zh` as "Chinese", in the UI's own language; the code itself where the engine doesn't know it. */
+export function languageName(code: string): string {
+  try {
+    return new Intl.DisplayNames([], { type: "language" }).of(code) ?? code;
+  } catch {
+    return code;
+  }
+}
+
 /** A search hit as the `Track` every list and menu speaks. */
 export function resultTrack(r: SearchResult): Track {
   return {

@@ -20,20 +20,21 @@ import {
   Plus,
   Radio,
   RotateCw,
-  Search,
   Shuffle,
 } from "lucide-react";
 import { call, send } from "./api";
 import { AddToPlaylistDialog, type AddRequest } from "./components/AddToPlaylistDialog";
 import { KeymapOverlay } from "./components/KeymapOverlay";
-import { MenuProvider, SEPARATOR, nativeMenu, type MenuEntry } from "./components/Menu";
+import { MenuProvider, SEPARATOR, type MenuEntry } from "./components/Menu";
 import { PlayerBar } from "./components/PlayerBar";
 import { PlaylistNav } from "./components/PlaylistNav";
 import { QueuePanel } from "./components/QueuePanel";
+import { SearchBox } from "./components/SearchBox";
 import { SignIn } from "./components/SignIn";
 import { Tip } from "./components/Tip";
 import { ActionsContext, StateContext, type AppActions, type AppState, type Menus, type TrackMenuExtras } from "./context";
 import { errorText } from "./format";
+import { rememberSearch } from "./recent";
 import type {
   ConfigView,
   HistoryView,
@@ -126,7 +127,16 @@ function App() {
   const [showKeymap, setShowKeymap] = useState(false);
   const [liked, setLiked] = useState<Set<string>>(() => new Set());
   const [addRequest, setAddRequest] = useState<AddRequest | null>(null);
+  // Here rather than in Now Playing, so hiding lyrics outlasts closing the view.
+  const [showLyrics, setShowLyrics] = useState(true);
+  const toggleLyrics = useCallback(() => setShowLyrics((v) => !v), []);
   const route = nav.stack[nav.at];
+
+  // Back and forward through searches carry the field with them, so it names the results under it.
+  const routeQuery = route.kind === "search" ? route.query : null;
+  useEffect(() => {
+    if (routeQuery !== null) setQuery(routeQuery);
+  }, [routeQuery]);
 
   // Read by stable callbacks, so the menus and keys see current state without re-binding per tick.
   const latest = useRef({ playback, currentTrack, playlists, liked, route });
@@ -681,11 +691,13 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [back, forward]);
 
-  const onSearch = (e: React.FormEvent) => {
-    e.preventDefault();
-    const q = query.trim();
-    if (q) navigate({ kind: "search", query: q });
-  };
+  const searchFor = useCallback(
+    (q: string) => {
+      rememberSearch(q);
+      navigate({ kind: "search", query: q });
+    },
+    [navigate],
+  );
 
   return (
     <Tooltip.Provider delayDuration={500} skipDelayDuration={200}>
@@ -707,19 +719,7 @@ function App() {
                     </button>
                   </Tip>
                   <div data-tauri-drag-region className="flex flex-1 justify-center">
-                    <form role="search" onSubmit={onSearch} className="flex w-full max-w-sm min-w-0 items-center gap-2 rounded-full px-3.5 py-1.5 glass">
-                      <Search size={15} className="flex-shrink-0 text-ink-faint" />
-                      <input
-                        id={SEARCH_INPUT_ID}
-                        type="search"
-                        value={query}
-                        onChange={(e) => setQuery(e.target.value)}
-                        onContextMenu={nativeMenu}
-                        placeholder="Search YouTube Music (s)"
-                        aria-label="Search YouTube Music"
-                        className="w-full bg-transparent text-body outline-none placeholder:text-ink-faint"
-                      />
-                    </form>
+                    <SearchBox id={SEARCH_INPUT_ID} value={query} onChange={setQuery} onSearch={searchFor} />
                   </div>
                   {/* Balances the arrows, so the search field sits at the window's centre. */}
                   <span className="w-16 flex-shrink-0" />
@@ -786,6 +786,8 @@ function App() {
                   choices={choices}
                   pickerOpen={pickerOpen}
                   upNext={upNext}
+                  showLyrics={showLyrics}
+                  onToggleLyrics={toggleLyrics}
                   onClose={() => setView("library")}
                   onSetTranslateMode={setTranslateMode}
                   onRetryLyrics={loadLyrics}

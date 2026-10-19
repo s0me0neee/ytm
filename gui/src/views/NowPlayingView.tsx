@@ -10,7 +10,7 @@ import { ArtistLinks } from "../components/TrackList";
 import { Transport, Volume } from "../components/Transport";
 import { useActions, useAppState } from "../context";
 import { backdropUrl, coverCandidates } from "../cover";
-import { artistNames, formatTime } from "../format";
+import { artistNames, formatTime, languageName } from "../format";
 import { useActiveLyric } from "../hooks/useActiveLyric";
 import type { ConfigView, LyricsChoice, LyricsView, PlaybackStateView, Track, TranslateMode } from "../types";
 import { LyricsPanel } from "./LyricsPanel";
@@ -32,6 +32,8 @@ interface NowPlayingViewProps {
   choices: LyricsChoice[] | null;
   pickerOpen: boolean;
   upNext: Track | null;
+  showLyrics: boolean;
+  onToggleLyrics: () => void;
   onClose: () => void;
   onSetTranslateMode: (m: TranslateMode) => void;
   onRetryLyrics: () => void;
@@ -56,7 +58,9 @@ export function NowPlayingView(props: NowPlayingViewProps) {
     },
     [offset, lyricSeeked],
   );
-  const [showLyrics, setShowLyrics] = useState(true);
+  const { showLyrics, onToggleLyrics } = props;
+  const [scrub, setScrub] = useState<number | null>(null);
+  const clock = scrub ?? playback.elapsed;
   const coverRef = useRef<HTMLDivElement>(null);
 
   // The cover's own shape (square art, 16:9 video), keyed by track so a stale ratio is never applied.
@@ -66,6 +70,7 @@ export function NowPlayingView(props: NowPlayingViewProps) {
   const onCoverAspect = useCallback((ratio: number) => setCover({ id: trackId, ratio }), [trackId]);
   const hasLyrics = Boolean(lyrics && lyrics.lines.length > 0);
   const canTranslate = Boolean(config?.translateTo) && hasLyrics;
+  const language = languageName(config?.translateTo ?? "");
   // One predicate for the column and the cover's width, so they never disagree mid-fetch.
   const lyricsColumn = showLyrics && (hasLyrics || lyricsLoading || lyricsError);
   const isLiked = Boolean(trackId && liked.has(trackId));
@@ -199,10 +204,11 @@ export function NowPlayingView(props: NowPlayingViewProps) {
                   value={playback.elapsed}
                   max={playback.total}
                   onCommit={(v) => send("seek_to", { secs: v })}
+                  onScrub={setScrub}
                 />
                 <div className="on-artwork mt-1.5 flex justify-between font-mono text-label text-ink-dim tabular-nums select-none">
-                  <span>{formatTime(playback.elapsed)}</span>
-                  <span>−{formatTime(Math.max(0, playback.total - playback.elapsed))}</span>
+                  <span>{formatTime(clock)}</span>
+                  <span>−{formatTime(Math.max(0, playback.total - clock))}</span>
                 </div>
                 <div className="mt-5 flex justify-center select-none">
                   <Transport playback={playback} large />
@@ -255,7 +261,7 @@ export function NowPlayingView(props: NowPlayingViewProps) {
         <div className="absolute right-4 bottom-4 z-20 flex items-center gap-2 select-none">
           {canTranslate && showLyrics && (
             <>
-              <Tip label={`Translate to ${config?.translateTo} (i)`}>
+              <Tip label={`Translate to ${language} (i)`}>
                 <button
                   onClick={() => props.onSetTranslateMode(translateMode === "free" ? "off" : "free")}
                   aria-pressed={translateMode === "free"}
@@ -265,7 +271,7 @@ export function NowPlayingView(props: NowPlayingViewProps) {
                 </button>
               </Tip>
               {config?.aiAvailable && (
-                <Tip label={`Translate to ${config.translateTo} with the AI model (I)`}>
+                <Tip label={`Translate to ${language} with the AI model (I)`}>
                   <button
                     onClick={() => props.onSetTranslateMode(translateMode === "ai" ? "off" : "ai")}
                     aria-pressed={translateMode === "ai"}
@@ -289,7 +295,7 @@ export function NowPlayingView(props: NowPlayingViewProps) {
           {hasLyrics && (
             <Tip label={showLyrics ? "Hide lyrics" : "Show lyrics"}>
               <button
-                onClick={() => setShowLyrics((v) => !v)}
+                onClick={onToggleLyrics}
                 aria-pressed={showLyrics}
                 className={`round-control ${showLyrics ? "is-on" : ""}`}
               >

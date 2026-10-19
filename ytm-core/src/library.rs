@@ -480,11 +480,67 @@ impl Library {
             .iter()
             .position(|t| t.video_id.as_deref() == Some(video_id))
     }
+
+    /// Library tracks with every word of `query` in their title, artists or album; title matches first.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<(usize, usize)> {
+        let whole = query.trim().to_lowercase();
+        let words: Vec<&str> = whole.split_whitespace().collect();
+        if words.is_empty() {
+            return Vec::new();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut hits = Vec::new();
+        for (pl, entry) in self.entries.iter().enumerate() {
+            if entry.playlist.playlist_id == Self::SEARCH_PLAYLIST_ID {
+                continue;
+            }
+            for (song, t) in entry.songs.iter().enumerate() {
+                let title = t.title.as_deref().unwrap_or_default().to_lowercase();
+                let album = t.album.as_ref().map_or("", |a| a.name.as_str());
+                let hay = format!("{title} {} {}", t.artist_names(), album).to_lowercase();
+                if !words.iter().all(|w| hay.contains(w)) {
+                    continue;
+                }
+                // Liked Music and a playlist often both hold a song, and it is one result.
+                if !seen.insert(t.video_id.clone().unwrap_or(hay)) {
+                    continue;
+                }
+                hits.push((!title.contains(&whole), pl, song));
+            }
+        }
+        hits.sort_by_key(|h| h.0);
+        hits.into_iter().take(limit).map(|(_, pl, song)| (pl, song)).collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_search_needs_every_word_and_lists_a_song_once() {
+        let track = |id: &str, title: &str, artist: &str| Track {
+            video_id: Some(id.to_string()),
+            title: Some(title.to_string()),
+            artists: vec![Artist { name: artist.to_string(), id: None }],
+            album: None,
+            duration: None,
+            duration_seconds: None,
+            thumbnail: None,
+            set_video_id: None,
+        };
+        let mut lib = Library::new(vec![
+            Playlist { playlist_id: "LM".into(), title: "Liked".into(), count: None },
+            Playlist { playlist_id: "PL".into(), title: "Mine".into(), count: None },
+        ]);
+        lib.entries[0].songs = vec![track("a", "Starboy", "The Weeknd"), track("b", "Blinding Lights", "The Weeknd")];
+        lib.entries[1].songs = vec![track("c", "Weekend", "Someone"), track("a", "Starboy", "The Weeknd")];
+
+        assert_eq!(lib.search("weeknd starboy", 10), vec![(0, 0)]);
+        // "Weekend" is in a title; the two by The Weeknd only match on the artist, so they follow it.
+        assert_eq!(lib.search("week", 10), vec![(1, 0), (0, 0), (0, 1)]);
+        assert_eq!(lib.search("  ", 10), []);
+    }
 
     fn library() -> Library {
         Library::new(vec![Playlist {
