@@ -20,7 +20,7 @@ log = "0.4.33"
 simplelog = "0.12.2"
 throbber-widgets-tui = "0.11.1"
 ctrlc = { version = "3.5.2", features = ["termination"] }
-hotpath = "0.23.2"
+hotpath = "0.28.6"
 
 # Profiling — zero overhead unless one of these is enabled.
 #   cargo run --features hotpath            # wall-clock timing

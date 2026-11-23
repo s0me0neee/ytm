@@ -4810,8 +4810,8 @@ impl App {
     fn render_history(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.active_panel == Panel::Songs;
         let tracks = self.history.tracks();
-        let status = (!tracks.is_empty())
-            .then(|| Line::styled(format!("{}", tracks.len()), theme::DIM));
+        let status =
+            (!tracks.is_empty()).then(|| Line::styled(format!("{}", tracks.len()), theme::DIM));
         let body = section(frame, area, "Recently played", status, focused);
 
         if tracks.is_empty() {
@@ -4838,8 +4838,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let is_playing =
-                    playing.is_some() && p.track.video_id.as_deref() == playing;
+                let is_playing = playing.is_some() && p.track.video_id.as_deref() == playing;
                 self.track_row(Some(&p.track), i + 1, num_w, is_playing, width)
             })
             .collect();
@@ -4978,9 +4977,11 @@ impl App {
             let icon = if ast.loading {
                 "⋯ "
             } else if ast.paused {
-                "⏸ "
+                // "⏸ "
+                "▶"
             } else if ast.total > 0.0 {
-                "♫ "
+                // "♫ "
+                "⏸"
             } else {
                 "  "
             };
