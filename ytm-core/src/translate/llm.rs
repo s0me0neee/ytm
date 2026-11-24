@@ -408,9 +408,7 @@ pub async fn translate(lines: &[String], to: &str, ai: &Ai) -> Result<Vec<String
     Ok(lines
         .iter()
         .map(|line| {
-            seen.get(line.trim())
-                .map(|i| done[*i].clone())
-                .unwrap_or_default()
+            seen.get(line.trim()).map_or_default(|i| done[*i].clone())
         })
         .collect())
 }

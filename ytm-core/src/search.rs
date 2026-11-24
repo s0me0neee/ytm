@@ -299,8 +299,7 @@ fn parse(response: &Value, limit: usize) -> Vec<SearchResult> {
         // middle, and the duration is only sometimes present.
         let detail: Vec<String> = cols
             .get(1)
-            .map(|s| s.split('•').map(|p| p.trim().to_string()).collect())
-            .unwrap_or_default();
+            .map_or_default(|s| s.split('•').map(|p| p.trim().to_string()).collect());
         let duration = detail
             .iter()
             .rev()
@@ -463,8 +462,7 @@ fn suggested_song(item: &Value) -> Option<SearchResult> {
     let artist = if artists.is_empty() {
         cols.get(1)
             .and_then(|byline| byline.split('•').nth(1))
-            .map(|a| a.trim().to_string())
-            .unwrap_or_default()
+            .map_or_default(|a| a.trim().to_string())
     } else {
         artists.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(", ")
     };

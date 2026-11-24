@@ -933,7 +933,7 @@ mod tests {
         // On by default, but inert until a browser is on record — there is
         // nothing to run yt-dlp against until then.
         assert!(c.auth.auto_reauth);
-        assert!(c.auth.cookie_browser.is_empty());
+        assert_eq!(c.auth.cookie_browser, "");
         assert_eq!(parse("").auth.cookie_browser, "");
         assert!(parse("").auth.auto_reauth);
     }

@@ -999,7 +999,7 @@ mod tests {
     fn a_queue_that_never_shuffled_is_left_exactly_as_it_is() {
         let built = vec![(2, 7), (0, 1)];
         assert_eq!(reorder_to(&built, built.clone()), built);
-        assert!(reorder_to(&[], vec![]).is_empty());
+        assert_eq!(reorder_to(&[], vec![]), []);
     }
 
     // ── following a queue across a playlist that came back reordered ──────
@@ -1046,7 +1046,7 @@ mod tests {
     #[test]
     fn a_queue_that_loses_everything_has_no_position_left() {
         let (out, pos) = remap_queue(&[(0, 0), (0, 1)], Some(1), |_| None);
-        assert!(out.is_empty());
+        assert_eq!(out, []);
         assert_eq!(pos, None);
     }
 

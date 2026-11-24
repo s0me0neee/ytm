@@ -3018,7 +3018,7 @@ impl App {
                 id: t.video_id.clone().unwrap_or_default(),
                 title: t.title.clone().unwrap_or_default(),
                 artists: t.artists.iter().map(|a| a.name.clone()).collect(),
-                album: t.album.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+                album: t.album.as_ref().map_or_default(|a| a.name.clone()),
                 // mpv's duration is the accurate one but arrives a beat late,
                 // so YouTube's stands in until it does.
                 length: if ast.total > 0.0 {
@@ -3033,8 +3033,7 @@ impl App {
                 art_url: t
                     .thumbnail
                     .as_deref()
-                    .map(|url| ytm_core::cover::at_size(url, MEDIA_COVER_PX))
-                    .unwrap_or_default(),
+                    .map_or_default(|url| ytm_core::cover::at_size(url, MEDIA_COVER_PX)),
             });
 
         // A queue restored from disk has a track but has never been handed to
@@ -5162,7 +5161,7 @@ impl App {
             .and_then(|t| t.title.as_deref())
             .unwrap_or("Unknown")
             .to_string();
-        let artists = track.map(Track::artist_names).unwrap_or_default();
+        let artists = track.map_or_default(Track::artist_names);
 
         let mut spans = vec![
             Span::styled(if playing { "♫ " } else { "  " }, theme::PLAYING),
@@ -6834,7 +6833,7 @@ mod tests {
             );
         }
 
-        assert!(fit_hints(&items, 0).is_empty());
+        assert_eq!(fit_hints(&items, 0), []);
     }
 
     /// Every hint list there is, including the one `I` only appears in.

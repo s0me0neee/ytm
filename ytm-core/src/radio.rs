@@ -132,8 +132,7 @@ fn parse_row(row: &Value) -> Option<SearchResult> {
     let album = detail
         .get(1)
         .filter(|p| !is_not_album(p))
-        .map(|p| (*p).to_string())
-        .unwrap_or_default();
+        .map_or_default(|p| (*p).to_string());
     let duration = text_of(row.get("lengthText")).unwrap_or_default();
     let video_type = first_str(row, "musicVideoType").unwrap_or_default();
     let (artists, album_id) = links(
@@ -651,7 +650,7 @@ mod tests {
             .expect("fetch");
         assert!(page.tracks.len() > 5, "{} tracks", page.tracks.len());
         // Most slots are wrapped as video + song; one of each is queued.
-        assert!(!page.alternates.is_empty());
+        assert_ne!(page.alternates, Vec::<String>::new());
         assert!(
             page.tracks
                 .iter()
