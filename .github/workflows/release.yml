@@ -130,7 +130,7 @@ jobs:
       - name: "Fetch libmpv (Windows)"
         if: "runner.os == 'Windows'"
         run: |
-          $url = 'https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260903/mpv-dev-x86_64-20260903-git-69e63f425a.7z'
+          $url = 'https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20261111/mpv-dev-x86_64-20261111-git-bcde6b93cc.7z'
           $dir = Join-Path $env:RUNNER_TEMP 'libmpv'
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           curl.exe --fail --location --silent --show-error --output "$dir\mpv-dev.7z" $url
