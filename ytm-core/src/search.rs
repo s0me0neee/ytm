@@ -563,20 +563,74 @@ pub async fn create_playlist(yt: &YTMusicClient, title: &str) -> Result<String> 
 
 // ── background work ──────────────────────────────────────────────────────────
 
-/// A finished search, or a finished add.
+impl SearchPage {
+    /// The artist and the album the query names, if it names one — what a results list puts first.
+    ///
+    /// The GUI's `topResults` applies the same rule.
+    #[must_use]
+    pub fn named(&self, query: &str) -> Vec<&Card> {
+        let q = normalise(query);
+        let mut out = Vec::new();
+        if let Some(artist) = self.artists.first() {
+            let name = normalise(&artist.title);
+            if q.chars().count() >= 3 && !name.is_empty() && (name.contains(&q) || q.contains(&name)) {
+                out.push(artist);
+            }
+        }
+        // Four letters at least, or every query containing "a" would name an album called "A".
+        if let Some(album) = self.albums.iter().find(|a| {
+            let title = normalise(&a.title);
+            title.chars().count() >= 4 && q.contains(&title)
+        }) {
+            out.push(album);
+        }
+        out
+    }
+}
+
+/// Lowercase letters and digits with single spaces, so "AC/DC" and "ac dc" compare equal.
+fn normalise(text: &str) -> String {
+    text.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A change to the user's library.
+#[derive(Debug, Clone)]
+pub enum Edit {
+    /// An empty `playlist_id` is Liked Music, which is the like button rather than a playlist.
+    Add { playlist_id: String, video_id: String },
+    Unlike { video_id: String },
+    Remove { playlist_id: String, track: Track },
+    /// A private playlist, with `video_id` in it when given.
+    Create { title: String, video_id: Option<String> },
+}
+
+/// One [`Edit`], with what the caller needs to act on its answer.
+pub struct EditRequest {
+    pub edit: Edit,
+    /// The library playlist the edit changes, so the answer says which one to fetch again.
+    pub playlist: Option<usize>,
+    /// The track's title and the playlist's, for what the answer has to say.
+    pub title: String,
+    pub where_to: String,
+}
+
+/// A finished search, or a finished edit.
 pub enum SearchMsg {
     Results {
         query: String,
-        result: std::result::Result<Vec<SearchResult>, String>,
+        result: std::result::Result<SearchPage, String>,
     },
-    /// An `a` that has landed. `where_to` is the playlist's display name, and
-    /// `playlist` its index in the library — the playlist now has a track the
-    /// app's copy of it does not, so the caller knows exactly what to refetch.
-    Added {
+    /// An edit that has landed or failed; `Ok(Some(id))` is a created playlist's id.
+    Edited {
+        edit: Edit,
+        playlist: Option<usize>,
         title: String,
         where_to: String,
-        playlist: usize,
-        result: std::result::Result<(), String>,
+        result: std::result::Result<Option<String>, String>,
     },
 }
 
@@ -587,50 +641,38 @@ pub fn spawn_search(
     tx: Sender<SearchMsg>,
 ) {
     handle.spawn(async move {
-        let result = search(&yt, &query).await.map_err(|e| e.to_string());
+        let result = search_page(&yt, &query).await.map_err(|e| e.to_string());
         let _ = tx.send(SearchMsg::Results { query, result });
     });
 }
 
-/// One `a`: a track, and the playlist it is going to.
-pub struct AddRequest {
-    /// Empty means Liked Music, which is its own endpoint rather than a
-    /// playlist you can add items to.
-    pub playlist_id: String,
-    /// Where that playlist sits in the library, carried through so the answer
-    /// says which one to fetch again.
-    pub playlist: usize,
-    pub video_id: String,
-    /// The track's title and the playlist's, for what the answer has to say.
-    pub title: String,
-    pub where_to: String,
+async fn run_edit(yt: &YTMusicClient, edit: &Edit) -> Result<Option<String>> {
+    match edit {
+        Edit::Add { playlist_id, video_id } if playlist_id.is_empty() => like(yt, video_id).await?,
+        Edit::Add { playlist_id, video_id } => add_to_playlist(yt, playlist_id, video_id).await?,
+        Edit::Unlike { video_id } => unlike(yt, video_id).await?,
+        Edit::Remove { playlist_id, track } => remove_from_playlist(yt, playlist_id, track).await?,
+        Edit::Create { title, video_id } => {
+            let id = create_playlist(yt, title).await?;
+            if let Some(video_id) = video_id {
+                add_to_playlist(yt, &id, video_id).await?;
+            }
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
-pub fn spawn_add(
+pub fn spawn_edit(
     handle: &tokio::runtime::Handle,
     yt: Arc<YTMusicClient>,
-    request: AddRequest,
+    request: EditRequest,
     tx: Sender<SearchMsg>,
 ) {
     handle.spawn(async move {
-        let AddRequest {
-            playlist_id,
-            playlist,
-            video_id,
-            title,
-            where_to,
-        } = request;
-        let result = if playlist_id.is_empty() {
-            like(&yt, &video_id).await
-        } else {
-            add_to_playlist(&yt, &playlist_id, &video_id).await
-        };
-        let _ = tx.send(SearchMsg::Added {
-            title,
-            where_to,
-            playlist,
-            result: result.map_err(|e| e.to_string()),
-        });
+        let EditRequest { edit, playlist, title, where_to } = request;
+        let result = run_edit(&yt, &edit).await.map_err(|e| e.to_string());
+        let _ = tx.send(SearchMsg::Edited { edit, playlist, title, where_to, result });
     });
 }
 
@@ -823,6 +865,45 @@ mod tests {
             50
         ]);
         assert_eq!(parse(&many, 20).len(), 20);
+    }
+
+    use crate::browse::CardKind;
+
+    fn card(kind: CardKind, title: &str) -> Card {
+        Card { kind, id: format!("id-{title}"), title: title.to_string(), subtitle: String::new(), thumbnail: None }
+    }
+
+    fn page(artists: &[&str], albums: &[&str]) -> SearchPage {
+        SearchPage {
+            artists: artists.iter().map(|t| card(CardKind::Artist, t)).collect(),
+            albums: albums.iter().map(|t| card(CardKind::Album, t)).collect(),
+            ..SearchPage::default()
+        }
+    }
+
+    fn titles(cards: &[&Card]) -> Vec<String> {
+        cards.iter().map(|c| c.title.clone()).collect()
+    }
+
+    #[test]
+    fn a_query_naming_the_top_artist_puts_it_first() {
+        let p = page(&["AC/DC"], &[]);
+        assert_eq!(titles(&p.named("ac dc")), ["AC/DC"]);
+        assert_eq!(titles(&p.named("acdc thunderstruck")), Vec::<String>::new());
+        assert_eq!(titles(&p.named("ac/dc thunderstruck")), ["AC/DC"]);
+    }
+
+    #[test]
+    fn a_short_query_names_no_artist() {
+        assert_eq!(titles(&page(&["Abba"], &[]).named("ab")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_album_is_named_only_by_a_title_the_query_contains_whole() {
+        let p = page(&[], &["A", "OK Computer", "Kid A"]);
+        assert_eq!(titles(&p.named("radiohead ok computer")), ["OK Computer"]);
+        // "A" is in every query with an "a" in it, and "Kid A" isn't in this one.
+        assert_eq!(titles(&p.named("a day in the life")), Vec::<String>::new());
     }
 
     /// Hits the real API with the user's session.

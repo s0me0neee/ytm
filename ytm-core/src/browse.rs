@@ -148,6 +148,10 @@ pub async fn artist(yt: &YTMusicClient, channel_id: &str) -> Result<ArtistPage> 
         && !songs.is_empty()
     {
         songs.truncate(MAX_TOP_SONGS);
+        // That playlist's album column is a play count ("2.4B plays"), which has no browse id.
+        for song in &mut songs {
+            song.album = song.album.take().filter(|a| a.id.is_some());
+        }
         page.songs = songs;
     }
     Ok(page)
@@ -263,6 +267,34 @@ pub(crate) fn list_card(item: &Value) -> Option<Card> {
         subtitle: parts.join(" • "),
         thumbnail: thumbnail(item),
     })
+}
+
+#[derive(Debug, Clone)]
+pub enum Page {
+    Album(AlbumPage),
+    Artist(ArtistPage),
+}
+
+/// A page fetched in the background, named by the browse id it was asked for under.
+pub struct PageMsg {
+    pub id: String,
+    pub result: std::result::Result<Page, String>,
+}
+
+pub fn spawn_page(
+    handle: &tokio::runtime::Handle,
+    yt: std::sync::Arc<YTMusicClient>,
+    kind: CardKind,
+    id: String,
+    tx: std::sync::mpsc::Sender<PageMsg>,
+) {
+    handle.spawn(async move {
+        let result = match kind {
+            CardKind::Album => album(&yt, &id).await.map(Page::Album),
+            CardKind::Artist => artist(&yt, &id).await.map(Page::Artist),
+        };
+        let _ = tx.send(PageMsg { id, result: result.map_err(|e| e.to_string()) });
+    });
 }
 
 fn card(item: &Value) -> Option<Card> {

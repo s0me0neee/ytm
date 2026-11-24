@@ -435,10 +435,8 @@ tools/           not a member and not shipped — see `macos-check` above
     loop with a zero timeout before it returns, so a media key costs at most one tick of
     latency and `App::run` does not move. A `MainThreadMarker` is held in the handle purely
     to make it un-`Send`, so that rule cannot be broken by accident.
-    **Unverified at runtime**: written and type-checked against the real bindings (see
-    `tools/macos-check`), never run. Whether a pumped run loop is enough for the handlers to
-    fire is the one open question; if it is not, the fallback is the `cliamp` shape, and
-    `App::run()` is a single call in `tui/src/main.rs`.
+    **Verified on a Mac**: the pumped run loop is enough for the handlers to fire, so the
+    `cliamp` shape was never needed. `tools/macos-check` still type-checks it from elsewhere.
   - **`media/stub.rs`** — the BSDs and anything else that builds. A log line and nothing.
 - **`search.rs`** — YouTube Music search, built on `YTMusicClient::send_request` since
   `ytmusicapi 0.4.2` has no search of its own: same cookies, same context, no second HTTP
@@ -465,10 +463,13 @@ tools/           not a member and not shipped — see `macos-check` above
   Each result also carries the artists and album its byline *links* (`artists` with channel
   ids, `album_id`), read from the runs' `browseEndpoint`s by `links`, which `radio.rs` shares;
   `to_track` keeps them, so a played result can still go to its album or artist.
-  `search` is the TUI's and stays songs-then-videos in one list. The GUI's results page uses
-  `search_page`, which adds **albums and artists** as two more filtered requests and sends all
-  four at once with `tokio::join!` — ~0.56s warm for the lot, where songs and videos alone
-  had gone one after the other. The filter blobs differ only in one protobuf field (1 songs,
+  Both frontends use `search_page` (`search`, songs-then-videos in one list, is left for the
+  probes and the live test), which adds **albums and artists** as two more filtered requests
+  and sends all four at once with `tokio::join!` — ~0.56s warm for the lot, where songs and
+  videos alone had gone one after the other. `SearchPage::named` is the "top results" rule
+  — the first artist when the query names it, an album whose whole title the query contains
+  (four letters at least, or every query with an "a" in it names an album called "A") — and
+  the GUI's `topResults` in `SearchPage.tsx` is the same rule in TypeScript; keep them in step. The filter blobs differ only in one protobuf field (1 songs,
   2 videos, 3 albums, 4 artists), which is how `ALBUMS_FILTER`/`ARTISTS_FILTER` were made from
   the songs one, then checked live. Their rows have no video id; `browse::list_card` reads
   them into the same `Card` the artist page's carousels use. One section failing costs only
@@ -479,14 +480,20 @@ tools/           not a member and not shipped — see `macos-check` above
   hence `suggested_song`. `Library::search` is the local half: every word of the query in a
   track's title, artists or album, one row per video id (Liked Music and a playlist often hold
   the same song), title matches first.
+  The library edits — add, like, unlike, remove, create — are `Edit`s, which `spawn_edit` runs
+  in the background for the TUI and answers as `SearchMsg::Edited`, carrying the library
+  index of the playlist to fetch again (or, for a created one, its new id). The GUI calls the
+  same `like`/`unlike`/`remove_from_playlist`/`create_playlist` from its own commands instead.
 - **`browse.rs`** — album and artist pages, which `ytmusicapi 0.5` lacks: one `browse`
   request each, walked for renderers. An album is its `musicResponsiveHeaderRenderer` (title,
   `Album · 2013`, the strapline's artist) and its shelf's rows, each a full `Track` with the
   album's cover. An artist is its header, the "Top songs" shelf — whose "more" link is a
   playlist `artist` then fetches, since the shelf holds five rows without durations — and its
   carousels reduced to album and artist `Card`s; playlist and video carousels are dropped,
-  there being no page to open them on. Fixture tests cover both shapes; the live one is
-  `#[ignore]`d.
+  there being no page to open them on. That playlist's album column is a *play count*
+  ("2.4B plays") with no browse id, so `artist` drops any album without one. Fixture tests
+  cover both shapes; the live one is `#[ignore]`d. `spawn_page` is the TUI's background
+  fetch, answering a `PageMsg` named by the browse id it was asked for.
 - **`radio.rs`** — a station: `R` in the TUI, "Start Radio" and `R` in the GUI. No
   `get_watch_playlist` exists in `ytmusicapi 0.5`, so this is `search.rs`'s move again: the
   web client's own `next` endpoint through `send_request`, asking for the seed's
@@ -721,18 +728,41 @@ tools/           not a member and not shipped — see `macos-check` above
     either way; only the AI ones outlive it, in `translations.json`. Pressing the same key
     twice is the retry after a failure; `r` fetches another, whichever translator made the
     one on screen, and the answer replaces what was saved when it arrives.
-  - **Search**: `s` opens it — a query line, then results. Songs are listed before videos and
-    each row is marked `♪ song` or `▶ video` with its length, because the two are genuinely
-    different things and the choice should be deliberate. `↵` plays (through
-    `place_search_result`, so it queues and gets lyrics like any other track), `a` queues it
-    as `a` does any song, `/` returns to the query line.
+  - **Search**: `s` opens it — a query line, then results in sections: Top results (what
+    `SearchPage::named` says the query names), Songs, Artists, Albums, Videos. Each row is
+    marked `♪ song`, `▶ video`, `● artist` or `◎ album`, because they are genuinely different
+    things and the choice should be deliberate. `↵` on a track plays it with the rest of its
+    section queued behind (`place_off_library` + `Player::play_list`, as the GUI's
+    `play_tracks`); on an artist or album it opens that page. `a`/`A` queue a track,
+    `Tab`/`Shift+Tab` jump a section, `/` returns to the query line.
+  - **Result lists** (`Items`) are what search and the pages share: `Item` is a heading, a
+    track or a card, and the cursor steps *over* headings (`step`, `jump_section`), so a
+    selected row is never a label. `section_tracks` is the run of tracks around the cursor —
+    an album, a page's top songs, search's songs — which is what `↵` queues.
+    `render_item_list` draws one, with the detail column beside it where covers can be
+    drawn; headings are separated by a row's `top_margin` rather than blank items, so
+    selection indices stay one-to-one with rows.
+  - **Album and artist pages**: `g`/`G` open the selected song's album or first linked
+    artist from any list (the same `selected_track` rule as `P` and `R`), and `↵` opens a
+    card. `pages` is a stack over the right column, above search, so `Esc` goes back through
+    them to whatever they were opened from; `o`, `H`, `y` and `s` close them all, since each
+    asks for a different column. `page_has_focus` mirrors `search_has_focus`. An album's
+    detail column is the album itself (its cover held once under its browse id, rather than
+    once per track) and its rows drop the album name they would all repeat.
   - **Add to playlist**: `P` opens a modal listing the user's own playlists, for whatever
     song is selected — a search result, a row in songs, queue or history, or the playing
     track in lyrics mode or from the playlists panel (`selected_song`, the same rule `R`
     follows). `AddPicker` takes the song when it opens, so it belongs to no panel and moving
-    the selection underneath changes nothing. It used to be `a` in search alone.
+    the selection underneath changes nothing. It used to be `a` in search alone. Its first
+    row, "New playlist…", asks for a name and creates a private playlist with the song in
+    it; the new playlist is appended to the library (`push_playlist`) and fetched.
     Liked Music is special-cased: its id is literally `LM` and it is the like button rather
-    than a playlist items can be added to.
+    than a playlist items can be added to. `L` likes the playing song, or unlikes it when it
+    is already in the session's copy of Liked Music.
+  - **Removing from a playlist**: `d` on a playlist's row, pressed twice within the toast's
+    two seconds (`pending_remove`), since it is a server-side change with no undo. It needs
+    the row's `set_video_id`; in Liked Music it is an unlike instead. The refetch afterwards
+    is the same `follow_tracks` path an add takes.
     An add that lands **refetches that playlist** (`refresh_playlist`), so the new track is
     playable in the session that added it rather than at the next start. The refetch is what
     makes `TrackRef`'s "position, not identity" nature dangerous — a like lands at the *top*
@@ -753,7 +783,8 @@ tools/           not a member and not shipped — see `macos-check` above
     the key dispatch, the hint bar and the header colour all read it, so they cannot disagree.
     Typing a query takes every key regardless of focus (as the `P` modal does, ahead of it) — `h` mid-word must
     type an `h` — but once there are results to move through, `h`/`l` are the ordinary panel
-    keys and focus returns to the playlists, exactly as in lyrics mode.
+    keys and focus returns to the playlists, exactly as in lyrics mode. Running a query moves
+    focus to the results, or a search started from the playlists panel would land there.
   - **Now playing card**: in lyrics mode the *playlists* column is given over to the playing
     track — cover centred, then title (Green, since green is what this app means by playing),
     artist, album, a short rule and the length. You are reading rather than browsing at that
@@ -1063,9 +1094,9 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `j` / `k` | Navigate down / up (scroll lyrics in lyrics mode) |
 | `PgUp` / `PgDn` | (in lyrics mode) Scroll lyrics five lines |
 | `h` / `l` | Switch panels (Playlists ↔ Songs) |
-| `Enter` | Open playlist / play song / play from queue |
+| `Enter` | Open playlist, album or artist / play song / play from queue |
 | `/` | Enter filter mode (songs or queue panel) |
-| `Esc` | Re-centre lyrics → close lyrics → clear filter → back to playlists → quit |
+| `Esc` | Back a page → re-centre lyrics → close lyrics → clear filter → back to playlists → quit |
 | `Space` | Pause / resume |
 | `p` / `n` | Previous / next in queue — `p` past 3 s into a track restarts it, at the start it goes back one. Since the restart leaves playback at zero, a run of presses walks back a track at a time, untimed (`Player::restart_or_previous`, shared with the OS's own previous-track key) |
 | `←` / `→` | Seek −5s / +5s |
@@ -1074,14 +1105,16 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `t` | Cycle play mode (Cycle → Single → Shuffle) |
 | `a` | Append selected song to queue |
 | `A` | Play the selected song next (also from `H`) |
-| `d` | Remove selected queue entry |
+| `d` | Remove selected queue entry; on a playlist's row, pressed twice, remove it from the playlist |
 | `D` | (in the queue) Clear the queue |
 | `o` | Toggle queue / songs view |
 | `H` | Recently played — `history.json`, shared with the GUI's home page |
-| `L` | Like the playing song |
+| `L` | Like the playing song, or unlike it if it is already liked |
 | `R` | Radio: replace the queue with a station seeded from the highlighted song (or the playing one in lyrics mode or the playlists panel), topped up as it plays |
-| `P` | Add the selected song (or the playing one in lyrics mode or the playlists panel) to one of your playlists |
-| `s` | Search YouTube Music (`↵` play, `a` queue, `P` add to a playlist, `/` edit query) |
+| `P` | Add the selected song (or the playing one in lyrics mode or the playlists panel) to one of your playlists, or to a new one |
+| `g` / `G` | Open the selected song's album / artist page (`Esc` goes back) |
+| `Tab` / `Shift+Tab` | (in search results or an artist page) Next / previous section |
+| `s` | Search YouTube Music (`↵` play or open, `a` queue, `P` add to a playlist, `/` edit query) |
 | `y` | Toggle lyrics panel |
 | `c` | (in lyrics mode) Choose a different lrclib record |
 | `i` | (in lyrics mode) Toggle the translation under each line, from the free endpoint |
@@ -1092,15 +1125,15 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 
 Each context's hint list names *every* key that works in it, and `fit_hints` drops
 whole hints from the end until what is left fits the terminal — so order is
-priority order, and a wider terminal is simply a longer bar. `?` sits sixth in
-every list rather than last, because it is the way to the bindings below it and
+priority order, and a wider terminal is simply a longer bar. `?` sits no later than sixth
+in every list rather than last, because it is the way to the bindings below it and
 must survive 80 columns; `the_way_to_the_full_keymap_survives_a_narrow_terminal`
 is the test that says so. `App::KEYMAP` is the `?` overlay, and
 `the_keymap_and_the_hint_bar_agree` fails if it grows a binding no hint bar names.
 `Self::TAIL` (seek, volume, mute, mode, panel, quit) is appended to `browse_hints` and
-`lyrics_hints`. `search_hints` builds its own list by hand instead and doesn't carry all of
-it — mode has no key while search has focus, and `↑`/`↓` are repurposed to move the result
-selection rather than volume.
+`lyrics_hints`. `search_hints` and `page_hints` build their own lists by hand instead and
+don't carry all of it — mode has no key while a result list has focus, and `↑`/`↓` are
+repurposed to move the selection rather than volume.
 
 Note: raw mode clears `ISIG`, so `Ctrl+C` never becomes a signal — `app.rs` matches it as a
 key event. The `ctrlc` handler in `main.rs` only covers SIGTERM/SIGHUP.
