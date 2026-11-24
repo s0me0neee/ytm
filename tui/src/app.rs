@@ -828,10 +828,12 @@ const DETAIL_COLS: u16 = 24;
 enum Item {
     /// A section label, which the cursor steps over.
     Heading(String),
-    /// `kind` is a search result's; a page's tracks have none and are numbered instead.
+    /// `kind` is a search result's; a page's tracks have none and are numbered
+    /// instead. `owned` is where a track the user already has sits in the library.
     Track {
         track: Track,
         kind: Option<ResultKind>,
+        owned: Option<(usize, usize)>,
     },
     /// An album or artist, which `↵` opens.
     Card(Card),
@@ -845,6 +847,13 @@ impl Item {
     const fn track(&self) -> Option<&Track> {
         match self {
             Self::Track { track, .. } => Some(track),
+            _ => None,
+        }
+    }
+
+    const fn owned(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Track { owned, .. } => *owned,
             _ => None,
         }
     }
@@ -988,16 +997,20 @@ impl SearchState {
     }
 }
 
-/// A search page as rows: what the query names first, then songs, artists,
-/// albums and videos.
-fn search_items(query: &str, page: &SearchPage) -> Vec<Item> {
-    let named = page.named(query);
-    let is_named = |card: &Card| named.iter().any(|n| n.id == card.id);
+/// Library tracks a search lists, ahead of what YouTube found — enough to say
+/// "you already have this" without pushing the songs off the screen.
+const MAX_LIBRARY_HITS: usize = 8;
+
+/// A search page as rows: what the query names first, then what the user
+/// already has, then songs, artists, albums and videos.
+fn search_items(page: &SearchPage, owned: Vec<((usize, usize), Track)>) -> Vec<Item> {
+    let is_named = |card: &Card| page.top.iter().any(|n| n.id == card.id);
     let hits = |list: &[search::SearchResult]| -> Vec<Item> {
         list.iter()
             .map(|r| Item::Track {
                 track: r.to_track(),
                 kind: Some(r.kind),
+                owned: None,
             })
             .collect()
     };
@@ -1012,7 +1025,16 @@ fn search_items(query: &str, page: &SearchPage) -> Vec<Item> {
     push_section(
         &mut out,
         "Top results",
-        named.iter().map(|&c| Item::Card(c.clone())),
+        page.top.iter().cloned().map(Item::Card),
+    );
+    push_section(
+        &mut out,
+        "In your library",
+        owned.into_iter().map(|(at, track)| Item::Track {
+            track,
+            kind: None,
+            owned: Some(at),
+        }),
     );
     push_section(&mut out, "Songs", hits(&page.songs));
     push_section(&mut out, "Artists", cards(&page.artists));
@@ -1036,6 +1058,7 @@ fn page_items(page: &Page) -> Vec<Item> {
     let track = |t: &Track| Item::Track {
         track: t.clone(),
         kind: None,
+        owned: None,
     };
     match page {
         Page::Album(album) => album.tracks.iter().map(track).collect(),
@@ -1078,6 +1101,9 @@ fn kind_marker(kind: ResultKind) -> (&'static str, Style) {
     }
 }
 
+/// A track already in one of the user's playlists.
+const SAVED_MARKER: (&str, Style) = ("✓ saved", theme::META);
+
 fn card_marker(kind: CardKind) -> (&'static str, Style) {
     match kind {
         CardKind::Album => ("◎ album", theme::META),
@@ -1100,7 +1126,7 @@ fn item_details(item: &Item) -> Vec<Line<'static>> {
     };
     let (marker, style, duration) = match item {
         Item::Heading(_) => return Vec::new(),
-        Item::Track { track, kind } => {
+        Item::Track { track, kind, owned } => {
             field(
                 track.title.as_deref().unwrap_or("Unknown"),
                 theme::PRIMARY,
@@ -1112,7 +1138,11 @@ fn item_details(item: &Item) -> Vec<Line<'static>> {
                 theme::DIM,
                 2,
             );
-            let (marker, style) = kind.map_or(("♪ song", theme::ACCENT), kind_marker);
+            let (marker, style) = match (owned, kind) {
+                (Some(_), _) => SAVED_MARKER,
+                (None, Some(kind)) => kind_marker(*kind),
+                (None, None) => ("♪ song", theme::ACCENT),
+            };
             (marker, style, track_duration(track).unwrap_or_default())
         }
         Item::Card(card) => {
@@ -1268,18 +1298,19 @@ fn render_item_list(
                 ])
                 .top_margin(u16::from(i > 0))
             }
-            Item::Track { track, kind } => {
+            Item::Track { track, kind, owned } => {
                 number = number.saturating_add(1);
                 let now = playing.is_some() && track.video_id.as_deref() == playing;
                 let (marker, marker_style) = if now {
                     ("♫".to_string(), theme::PLAYING)
                 } else {
-                    match kind {
-                        Some(kind) => {
+                    match (owned, kind) {
+                        (Some(_), _) => (SAVED_MARKER.0.to_string(), SAVED_MARKER.1),
+                        (None, Some(kind)) => {
                             let (m, s) = kind_marker(*kind);
                             (m.to_string(), s)
                         }
-                        None => (format!("{number:>3}"), theme::DIM),
+                        (None, None) => (format!("{number:>3}"), theme::DIM),
                     }
                 };
                 let album = track
@@ -1716,6 +1747,18 @@ impl App {
             self.open_page(card.kind, card.id, card.title);
             return;
         }
+        // One the user already has plays from its playlist, as that row would.
+        let owned = items
+            .selected()
+            .and_then(|i| Some((i.track()?.clone(), i.owned()?)));
+        if let Some((track, at)) = owned {
+            let (pl, song) = self.place_item_track(track, Some(at));
+            self.player.play(&self.library, pl, song);
+            self.sync_queue_view();
+            let title = self.library.track(pl, song).and_then(|t| t.title.clone());
+            self.notify(format!("Playing: {}", title.unwrap_or_default()));
+            return;
+        }
         let Some((tracks, start)) = items.section_tracks() else {
             return;
         };
@@ -1734,16 +1777,32 @@ impl App {
         let Some(item) = self.focused_items().and_then(Items::selected) else {
             return;
         };
+        let owned = item.owned();
         let Some(track) = item.track().cloned() else {
             self.notify("Open it with ↵ to queue its songs");
             return;
         };
-        let (pl, song) = self.library.place_search_result(track);
+        let (pl, song) = self.place_item_track(track, owned);
         if next {
             self.do_play_next(pl, song);
         } else {
             self.do_append_to_queue(pl, song);
         }
+    }
+
+    /// Where a result row's track plays from: its own place in the library,
+    /// while that still holds it — a refetch can move it — or the search
+    /// playlist otherwise.
+    fn place_item_track(&mut self, track: Track, owned: Option<(usize, usize)>) -> (usize, usize) {
+        if let Some((pl, song)) = owned
+            && self
+                .library
+                .track(pl, song)
+                .is_some_and(|t| t.video_id == track.video_id)
+        {
+            return (pl, song);
+        }
+        self.library.place_search_result(track)
     }
 
     /// The song `P`, `g` and `G` act on: the highlighted row where a list has
@@ -2117,6 +2176,14 @@ impl App {
         while let Ok(msg) = self.search_rx.try_recv() {
             match msg {
                 SearchMsg::Results { query, result } => {
+                    // Asked when the answer lands rather than when it was sent,
+                    // so playlists that loaded in between are searched too.
+                    let owned: Vec<_> = self
+                        .library
+                        .search(&query, MAX_LIBRARY_HITS)
+                        .into_iter()
+                        .filter_map(|at| Some((at, self.library.track(at.0, at.1)?.clone())))
+                        .collect();
                     let Some(search) = self.search.as_mut() else {
                         continue;
                     };
@@ -2128,7 +2195,7 @@ impl App {
                     search.loading = false;
                     match result {
                         Ok(page) => {
-                            search.items = Items::new(search_items(&query, &page));
+                            search.items = Items::new(search_items(&page, owned));
                             search.found = search
                                 .items
                                 .items
@@ -3069,7 +3136,7 @@ impl App {
             return;
         };
 
-        match persistence::try_restore(&self.library, &qs) {
+        match persistence::try_restore(&mut self.library, &qs) {
             RestoreOutcome::Pending => {}
             RestoreOutcome::Abandoned => {
                 self.pending_queue_restore = None;
@@ -3613,8 +3680,9 @@ impl App {
     /// one, the playing track otherwise.
     fn radio_seed(&mut self) -> Option<(usize, usize)> {
         if let Some(items) = self.focused_items() {
-            let track = items.selected()?.track()?.clone();
-            return Some(self.library.place_search_result(track));
+            let item = items.selected()?;
+            let (track, owned) = (item.track()?.clone(), item.owned());
+            return Some(self.place_item_track(track, owned));
         }
         if self.lyrics_mode || self.active_panel == Panel::Playlists {
             return self.player.playing();
@@ -6131,6 +6199,7 @@ mod tests {
                     set_video_id: None,
                 },
                 kind: None,
+                owned: None,
             }
         }
 
@@ -6240,20 +6309,49 @@ mod tests {
                 thumbnail: None,
             };
             let page = SearchPage {
+                top: vec![artist.clone()],
                 artists: vec![artist],
                 ..SearchPage::default()
             };
-            let items = search_items("radiohead", &page);
-            let shape: Vec<String> = items
+            let items = search_items(&page, Vec::new());
+            // Named once, at the top, rather than again under Artists.
+            assert_eq!(shape(&items), ["Top results", "Radiohead"]);
+        }
+
+        fn shape(items: &[Item]) -> Vec<String> {
+            items
                 .iter()
                 .map(|i| match i {
                     Item::Heading(t) => t.clone(),
                     Item::Card(c) => c.title.clone(),
+                    Item::Track { owned: Some(_), .. } => "mine".to_string(),
                     Item::Track { .. } => "track".to_string(),
                 })
-                .collect();
-            // Named once, at the top, rather than again under Artists.
-            assert_eq!(shape, ["Top results", "Radiohead"]);
+                .collect()
+        }
+
+        #[test]
+        fn what_the_user_already_has_comes_before_what_youtube_found() {
+            let song = track("a").track().cloned().unwrap();
+            let page = SearchPage {
+                songs: vec![search::SearchResult {
+                    video_id: "b".to_string(),
+                    title: "b".to_string(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration: String::new(),
+                    duration_seconds: None,
+                    kind: ResultKind::Song,
+                    video_type: String::new(),
+                    thumbnail: None,
+                    artists: Vec::new(),
+                    album_id: None,
+                }],
+                ..SearchPage::default()
+            };
+            let items = search_items(&page, vec![((0, 3), song)]);
+            assert_eq!(shape(&items), ["In your library", "mine", "Songs", "track"]);
+            assert_eq!(items.get(1).and_then(Item::owned), Some((0, 3)));
         }
     }
 

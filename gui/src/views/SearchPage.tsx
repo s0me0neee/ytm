@@ -17,21 +17,11 @@ const cache = new Map<string, Results>();
 // Two rows of three: enough to hold the obvious answer without becoming a second results list.
 const TOP = 6;
 
-// Case, spacing and punctuation aside, so "weeknd" finds "The Weeknd".
-const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
-
 type Top = { kind: "page"; card: Card } | { kind: "song"; index: number };
 
-/** The artist or album the query names, if it names one, then the best songs. */
-function topResults(query: string, r: Results): Top[] {
-  const q = norm(query);
-  const out: Top[] = [];
-  const artist = r.artists[0];
-  const name = artist ? norm(artist.title) : "";
-  if (artist && q.length >= 3 && name && (name.includes(q) || q.includes(name))) out.push({ kind: "page", card: artist });
-  // Four letters at least, or every query containing "a" would name an album called "A".
-  const album = r.albums.find((a) => norm(a.title).length >= 4 && q.includes(norm(a.title)));
-  if (album) out.push({ kind: "page", card: album });
+/** The artist or album the query names (`top`, decided by the backend, which the TUI shares), then the best songs. */
+function topResults(r: Results): Top[] {
+  const out: Top[] = r.top.map((card) => ({ kind: "page", card }));
   r.songs.slice(0, TOP - out.length).forEach((_, index) => out.push({ kind: "song", index }));
   return out;
 }
@@ -129,7 +119,7 @@ export const SearchPage = memo(function SearchPage({ query }: { query: string })
 
   const songs = useMemo(() => (results?.songs ?? []).map(resultTrack), [results]);
   const videos = useMemo(() => (results?.videos ?? []).map(resultTrack), [results]);
-  const top = useMemo(() => (results ? topResults(query, results) : []), [query, results]);
+  const top = useMemo(() => (results ? topResults(results) : []), [results]);
   const mine = useMemo(() => hits.map((h) => h.track), [hits]);
 
   const songTarget = useCallback((i: number): Target => ({ kind: "track", track: songs[i] }), [songs]);

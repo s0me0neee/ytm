@@ -112,7 +112,12 @@ is not enough. `ytm-core/build.rs` finds it in one of two ways:
   the same directory has to be on `PATH` at runtime so `libmpv-2.dll` can be loaded.
   A missing DLL shows up as a bare `STATUS_DLL_NOT_FOUND` exit, with no message.
 - **pkg-config** otherwise, which is what picks up Homebrew's libmpv on macOS
-  (`brew install mpv`) and the distro package on Linux (`libmpv-dev`).
+  (`brew install mpv`) and the distro package on Linux (`libmpv-dev`). On macOS that needs
+  one more directory: Homebrew's `mpv.pc` requires `libarchive`, which is keg-only, so
+  `pkg-config mpv` fails with "Package 'libarchive' … not found" and the link then fails
+  with `library 'mpv' not found` — while `cargo check`, which never links, passes. Add
+  `$(brew --prefix libarchive)/lib/pkgconfig` to `PKG_CONFIG_PATH`. `brew link mpv`
+  changes nothing; mpv is already linked.
 
 [mpv-win]: https://github.com/shinchiro/mpv-winbuild-cmake/releases
 
@@ -466,10 +471,12 @@ tools/           not a member and not shipped — see `macos-check` above
   Both frontends use `search_page` (`search`, songs-then-videos in one list, is left for the
   probes and the live test), which adds **albums and artists** as two more filtered requests
   and sends all four at once with `tokio::join!` — ~0.56s warm for the lot, where songs and
-  videos alone had gone one after the other. `SearchPage::named` is the "top results" rule
-  — the first artist when the query names it, an album whose whole title the query contains
-  (four letters at least, or every query with an "a" in it names an album called "A") — and
-  the GUI's `topResults` in `SearchPage.tsx` is the same rule in TypeScript; keep them in step. The filter blobs differ only in one protobuf field (1 songs,
+  videos alone had gone one after the other. `SearchPage::top` is the "top results" rule,
+  decided here once for both frontends: the first artist when the query names it, an album
+  whose whole title the query contains (four letters at least, or every query with an "a" in
+  it names an album called "A"), compared with case, spacing and punctuation stripped so
+  "weeknd" finds "The Weeknd". The GUI's `topResults` only adds songs to fill its six tiles.
+  The filter blobs differ only in one protobuf field (1 songs,
   2 videos, 3 albums, 4 artists), which is how `ALBUMS_FILTER`/`ARTISTS_FILTER` were made from
   the songs one, then checked live. Their rows have no video id; `browse::list_card` reads
   them into the same `Card` the artist page's carousels use. One section failing costs only
@@ -522,8 +529,9 @@ tools/           not a member and not shipped — see `macos-check` above
   repeats. A failure waits `RETRY_AFTER` and the third in a row ends the station. A page
   that lands is filed by `Library::place_off_library` and queued by `Player::append_many`,
   and an answer for a station since replaced is dropped by its seed. Radio tracks live in
-  the search playlist, so a radio queue is not restored at the next start, like any other
-  search track. Offline fixture tests cover the parse and the rules; the live one, which
+  the search playlist, and come back at the next start the way any search track does (see
+  `persistence.rs`) — the songs, not the station: what was queued plays, and no more is
+  fetched after it. Offline fixture tests cover the parse and the rules; the live one, which
   fetches a second page too, is `#[ignore]`d.
 - **`cover.rs`** — fetches a thumbnail and decodes it to RGB. `at_size` rewrites the CDN's
   own resize parameters (`=w120-h120-l90-rj`) to ask for a bigger copy than the 120px a
@@ -584,9 +592,14 @@ tools/           not a member and not shipped — see `macos-check` above
   record id, so one is paid for once). A queue's saved *position* is an index into the
   queue, so both halves of the round trip move it with the entries rather than carrying the
   number across: `build_queue_state` drops an entry with no video id and `try_restore` drops
-  one whose playlist is gone — the synthetic search playlist, every time — and
-  `follow_position` applies the same rule `Player::remap_refs` does, or the queue comes back
-  playing a song it wasn't on.
+  one whose playlist is gone, and `follow_position` applies the same rule
+  `Player::remap_refs` does, or the queue comes back playing a song it wasn't on.
+  An entry from the search playlist — search, radio, an album or artist page — carries its
+  whole `Track` (`QueueEntry::track`), since that playlist exists only for the session that
+  filled it and a video id alone has nothing to be looked up in next time. `try_restore`
+  files those back with `place_search_result`, which is why it takes the library mutably;
+  it does so only once the outcome is `Ready`, so a queue still waiting on a playlist files
+  nothing. An older `queue.json` has no `track` and its search entries still drop, as before.
 
   `translations.json` holds **one translation per lrclib record**, and the rules around it
   are all consequences of that. *Only the AI ones are in it*: the free endpoint costs
@@ -728,10 +741,14 @@ tools/           not a member and not shipped — see `macos-check` above
     either way; only the AI ones outlive it, in `translations.json`. Pressing the same key
     twice is the retry after a failure; `r` fetches another, whichever translator made the
     one on screen, and the answer replaces what was saved when it arrives.
-  - **Search**: `s` opens it — a query line, then results in sections: Top results (what
-    `SearchPage::named` says the query names), Songs, Artists, Albums, Videos. Each row is
-    marked `♪ song`, `▶ video`, `● artist` or `◎ album`, because they are genuinely different
-    things and the choice should be deliberate. `↵` on a track plays it with the rest of its
+  - **Search**: `s` opens it — a query line, then results in sections: Top results
+    (`SearchPage::top`), In your library, Songs, Artists, Albums, Videos. Each row is
+    marked `♪ song`, `▶ video`, `● artist`, `◎ album` or `✓ saved`, because they are genuinely
+    different things and the choice should be deliberate. "In your library" is
+    `Library::search`, asked when the answer lands so playlists that loaded meanwhile count;
+    those rows carry their library position (`Item::Track::owned`) and play from their own
+    playlist, as that row would, falling back to a loose copy if a refetch has moved them.
+    `↵` on a track plays it with the rest of its
     section queued behind (`place_off_library` + `Player::play_list`, as the GUI's
     `play_tracks`); on an artist or album it opens that page. `a`/`A` queue a track,
     `Tab`/`Shift+Tab` jump a section, `/` returns to the query line.

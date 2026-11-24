@@ -384,6 +384,8 @@ pub struct SearchPage {
     pub videos: Vec<SearchResult>,
     pub albums: Vec<Card>,
     pub artists: Vec<Card>,
+    /// The artist and album the query names, if any — what a results page puts first.
+    pub top: Vec<Card>,
 }
 
 async fn run_cards(yt: &YTMusicClient, query: &str, params: &str) -> Result<Vec<Card>> {
@@ -423,12 +425,14 @@ pub async fn search_page(yt: &YTMusicClient, query: &str) -> Result<SearchPage> 
         .chain(or_empty("video", videos))
         .filter(|r| seen.insert(r.video_id.clone()))
         .partition(|r| r.kind == ResultKind::Song);
-    let page = SearchPage {
+    let mut page = SearchPage {
         songs,
         videos,
         albums: or_empty("album", albums),
         artists: or_empty("artist", artists),
+        top: Vec::new(),
     };
+    page.top = page.named(query);
     log::info!(
         "search: {query:?} → {} songs, {} videos, {} albums, {} artists",
         page.songs.len(),
@@ -562,17 +566,14 @@ pub async fn create_playlist(yt: &YTMusicClient, title: &str) -> Result<String> 
 // ── background work ──────────────────────────────────────────────────────────
 
 impl SearchPage {
-    /// The artist and the album the query names, if it names one — what a results list puts first.
-    ///
-    /// The GUI's `topResults` applies the same rule.
-    #[must_use]
-    pub fn named(&self, query: &str) -> Vec<&Card> {
+    /// The artist and the album the query names, if it names one — what fills [`Self::top`].
+    fn named(&self, query: &str) -> Vec<Card> {
         let q = normalise(query);
         let mut out = Vec::new();
         if let Some(artist) = self.artists.first() {
             let name = normalise(&artist.title);
             if q.chars().count() >= 3 && !name.is_empty() && (name.contains(&q) || q.contains(&name)) {
-                out.push(artist);
+                out.push(artist.clone());
             }
         }
         // Four letters at least, or every query containing "a" would name an album called "A".
@@ -580,19 +581,15 @@ impl SearchPage {
             let title = normalise(&a.title);
             title.chars().count() >= 4 && q.contains(&title)
         }) {
-            out.push(album);
+            out.push(album.clone());
         }
         out
     }
 }
 
-/// Lowercase letters and digits with single spaces, so "AC/DC" and "ac dc" compare equal.
+/// Lowercase letters and digits alone, so "weeknd" finds "The Weeknd" and "acdc" finds "AC/DC".
 fn normalise(text: &str) -> String {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
+    text.to_lowercase().chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
 /// A change to the user's library.
@@ -879,16 +876,18 @@ mod tests {
         }
     }
 
-    fn titles(cards: &[&Card]) -> Vec<String> {
+    fn titles(cards: &[Card]) -> Vec<String> {
         cards.iter().map(|c| c.title.clone()).collect()
     }
 
     #[test]
     fn a_query_naming_the_top_artist_puts_it_first() {
+        // Punctuation and spacing aside, either way round.
         let p = page(&["AC/DC"], &[]);
         assert_eq!(titles(&p.named("ac dc")), ["AC/DC"]);
-        assert_eq!(titles(&p.named("acdc thunderstruck")), Vec::<String>::new());
-        assert_eq!(titles(&p.named("ac/dc thunderstruck")), ["AC/DC"]);
+        assert_eq!(titles(&p.named("acdc thunderstruck")), ["AC/DC"]);
+        assert_eq!(titles(&page(&["The Weeknd"], &[]).named("weeknd")), ["The Weeknd"]);
+        assert_eq!(titles(&p.named("thunderstruck")), Vec::<String>::new());
     }
 
     #[test]

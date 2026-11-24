@@ -47,6 +47,8 @@ export interface SearchPage {
   videos: SearchResult[];
   albums: Card[];
   artists: Card[];
+  /** The artist and album the query names, if any. */
+  top: Card[];
 }
 
 export interface Suggestions {
