@@ -53,6 +53,12 @@ file = '*'
 [dist.dependencies.homebrew]
 mpv = '*'
 
+# dist 0.32 builds Apple Silicon on `macos-14`, which GitHub has retired: the job
+# is cancelled a second in, before any step, with "The configuration
+# 'macos-14-arm64-us-default' is not supported".
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # The Windows zip ships `libmpv-2.dll` beside `ytm.exe`, because without it the
 # binary exits with a bare `STATUS_DLL_NOT_FOUND` and no message — libmpv is
 # linked, and there is no package that would put it on a user's machine.
