@@ -130,12 +130,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .ok()
     .and_then(|v| v["choices"].as_object().cloned())
-    .map(|m| {
+    .map_or_default(|m| {
         m.iter()
             .filter_map(|(k, v)| Some((k.clone(), v.as_u64()?)))
             .collect()
-    })
-    .unwrap_or_default();
+    });
     eprintln!("{} manual overrides", overrides.len());
 
     let session = Session::new()?;

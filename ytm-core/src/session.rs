@@ -669,7 +669,7 @@ mod tests {
     #[ignore = "reads this machine's real Chrome cookies"]
     fn chrome_cookies_can_actually_be_read() {
         let header = extract_cookies(Browser::Chrome).expect("read chrome cookies");
-        assert!(!header.is_empty());
+        assert_ne!(header, "");
         assert!(header.contains("SAPISID") || header.contains("HSID"));
     }
 

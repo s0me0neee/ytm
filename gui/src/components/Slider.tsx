@@ -8,15 +8,22 @@ interface SliderProps {
   onChange?: (value: number) => void;
   // Once, on release: a seek per pointer-move made mpv sound like it played at the wrong speed.
   onCommit?: (value: number) => void;
+  // The position the thumb is held at, or null once it follows `value` again, so a clock can follow the drag.
+  onScrub?: (value: number | null) => void;
   className?: string;
 }
 
 // Longest a released position is held if playback never reports reaching it.
 const HOLD_MS = 1500;
 
-export function Slider({ value, max, label, onChange, onCommit, className }: SliderProps) {
+export function Slider({ value, max, label, onChange, onCommit, onScrub, className }: SliderProps) {
   // The thumb's position while dragging, and after release until `value` catches up.
   const [held, setHeld] = useState<{ at: number; released: boolean } | null>(null);
+  const heldAt = held?.at ?? null;
+
+  useEffect(() => {
+    onScrub?.(heldAt);
+  }, [heldAt, onScrub]);
 
   useEffect(() => {
     if (held?.released && Math.abs(value - held.at) < 1.5) setHeld(null);

@@ -2398,7 +2398,7 @@ dependencies = [
  "flate2",
  "futures-util",
  "hdrhistogram",
- "hotpath-macros",
+ "hotpath-macros 0.23.2",
  "hotpath-meta",
  "libc",
  "object",
@@ -2414,10 +2414,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotpath"
+version = "0.28.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b163ee2a34ff2fd85fa07c0f7bdc9573b0d49701c749d74c54b1e5b65eb8c368"
+dependencies = [
+ "arc-swap",
+ "cfg-if",
+ "crossbeam-channel",
+ "flate2",
+ "futures-core",
+ "hdrhistogram",
+ "hotpath-drain",
+ "hotpath-macros 0.28.7",
+ "libc",
+ "object",
+ "pin-project-lite",
+ "quanta",
+ "regex-lite",
+ "rustc-demangle",
+ "serde",
+ "serde_json",
+ "time",
+ "tiny_http",
+]
+
+[[package]]
+name = "hotpath-drain"
+version = "0.28.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15e84a734a1107eca0ced726ca5bfea94c53427f6dbb1ab2b87e9566bb4ea790"
+
+[[package]]
 name = "hotpath-macros"
 version = "0.23.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "01bdc59bfc1a9984bee2ff5da63b2f6fccbaa57cd9a4119d709524632bddf341"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "hotpath-macros"
+version = "0.28.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23148960ea4f4f2d93970cbc865dc8adfd7e065de68b6a3bdda776d900541a09"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4945,6 +4988,12 @@ dependencies = [
  "memchr",
  "regex-syntax",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cab834c73d247e67f4fae452806d17d3c7501756d98c8808d7c9c7aa7d18f973"
 
 [[package]]
 name = "regex-syntax"
@@ -8119,7 +8168,7 @@ version = "1.1.2"
 dependencies = [
  "anyhow",
  "ctrlc",
- "hotpath",
+ "hotpath 0.28.7",
  "log",
  "ratatui",
  "simplelog",
@@ -8135,7 +8184,7 @@ version = "1.1.2"
 dependencies = [
  "block2",
  "dirs 6.0.0",
- "hotpath",
+ "hotpath 0.23.2",
  "inquire",
  "jpeg-decoder",
  "libc",

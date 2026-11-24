@@ -31,11 +31,11 @@ cargo run -p ytm-core --example cover_audit        # whole library
 cargo run -p ytm-core --example cover_audit 300    # first 300 tracks
 
 # gui/ — the Tauri desktop frontend, in progress (see Architecture below).
-# pnpm drives the frontend half; cargo alone builds gui/src-tauri but won't
-# produce a running app without pnpm's build having populated frontendDist.
-cd gui && pnpm install
-cd gui && pnpm tauri dev     # dev build, opens a window
-cd gui && pnpm tauri build   # release bundle
+# bun drives the frontend half; cargo alone builds gui/src-tauri but won't
+# produce a running app without bun's build having populated frontendDist.
+cd gui && bun install
+cd gui && bun tauri dev     # dev build, opens a window
+cd gui && bun tauri build   # release bundle
 
 # Releases are cut by `dist` (cargo-dist) from a pushed tag: `v1.0.0` builds both
 # binaries for five targets and publishes one GitHub Release. Nothing is released
@@ -53,8 +53,8 @@ dist generate             # rewrite .github/workflows/release.yml from the confi
 #   * devtools are gated on `debug_assertions`, so `tauri dev --release`
 #     produces a webview Safari's inspector cannot see at all. Profile from a
 #     debug build, or add tauri's `devtools` feature.
-cd gui && pnpm devtools       # the profiler UI, listens on 8097
-cd gui && pnpm dev:profile    # the app, with the backend script injected
+cd gui && bun devtools       # the profiler UI, listens on 8097
+cd gui && bun dev:profile    # the app, with the backend script injected
 # `YTM_PROFILE=1` is what injects <script src="localhost:8097"> ahead of the
 # module script (the `reactDevtools` plugin in vite.config.ts) — React has to
 # be hooked before it loads. Never in `index.html` itself: that would ship a
@@ -62,9 +62,10 @@ cd gui && pnpm dev:profile    # the app, with the backend script injected
 #
 # `react-devtools` drags in Electron, and getting it to run took two fixes
 # that both fail *silently*:
-#   * pnpm 11 blocks postinstall scripts. `pnpm-workspace.yaml`'s `allowBuilds`
-#     is where electron is approved; without it the wrapper installs and the
-#     binary does not.
+#   * bun runs no dependency's postinstall unless it is trusted. `package.json`'s
+#     `trustedDependencies` is where electron is approved; without it the
+#     wrapper installs and the binary does not. Setting that list replaces
+#     bun's built-in one, so anything else needing a script has to be named too.
 #   * electron's own `install.js` then extracts the zip to 252K instead of
 #     208M and still prints "Done", leaving no `Electron Framework.framework`
 #     and no `path.txt`. The cached zip in `~/Library/Caches/electron/` is
@@ -111,7 +112,12 @@ is not enough. `ytm-core/build.rs` finds it in one of two ways:
   the same directory has to be on `PATH` at runtime so `libmpv-2.dll` can be loaded.
   A missing DLL shows up as a bare `STATUS_DLL_NOT_FOUND` exit, with no message.
 - **pkg-config** otherwise, which is what picks up Homebrew's libmpv on macOS
-  (`brew install mpv`) and the distro package on Linux (`libmpv-dev`).
+  (`brew install mpv`) and the distro package on Linux (`libmpv-dev`). On macOS that needs
+  one more directory: Homebrew's `mpv.pc` requires `libarchive`, which is keg-only, so
+  `pkg-config mpv` fails with "Package 'libarchive' … not found" and the link then fails
+  with `library 'mpv' not found` — while `cargo check`, which never links, passes. Add
+  `$(brew --prefix libarchive)/lib/pkgconfig` to `PKG_CONFIG_PATH`. `brew link mpv`
+  changes nothing; mpv is already linked.
 
 [mpv-win]: https://github.com/shinchiro/mpv-winbuild-cmake/releases
 
@@ -140,10 +146,11 @@ beside the workflows rather than in them because GitHub parses anything under
   generated there.
 - **The GUI's frontend.** `tauri::generate_context!()` embeds `frontendDist` at *compile*
   time, and `beforeBuildCommand` is run by the tauri CLI — which dist is not, it builds with
-  plain cargo. So `pnpm build` has to have run before `dist build`, on every runner, or
+  plain cargo. So `bun run build` has to have run before `dist build`, on every runner, or
   `ytm-gui` compiles against a `gui/dist` that does not exist. `--ignore-scripts` on the
   install is deliberate: `react-devtools` drags in electron, whose postinstall downloads
-  ~100MB and fails silently (above), and nothing in `pnpm build` touches it.
+  ~100MB and fails silently (above), and nothing in `bun run build` touches it. Node is
+  still set up beside bun: `vite` and `tsc` carry a `node` shebang, which `bun run` honours.
 
 Everything else is `[dist.dependencies]`: `libmpv-dev` plus Tauri's WebKitGTK set on apt,
 `mpv` on Homebrew. Every target has a native runner, so none of this is cross-compiled. Any
@@ -433,10 +440,8 @@ tools/           not a member and not shipped — see `macos-check` above
     loop with a zero timeout before it returns, so a media key costs at most one tick of
     latency and `App::run` does not move. A `MainThreadMarker` is held in the handle purely
     to make it un-`Send`, so that rule cannot be broken by accident.
-    **Unverified at runtime**: written and type-checked against the real bindings (see
-    `tools/macos-check`), never run. Whether a pumped run loop is enough for the handlers to
-    fire is the one open question; if it is not, the fallback is the `cliamp` shape, and
-    `App::run()` is a single call in `tui/src/main.rs`.
+    **Verified on a Mac**: the pumped run loop is enough for the handlers to fire, so the
+    `cliamp` shape was never needed. `tools/macos-check` still type-checks it from elsewhere.
   - **`media/stub.rs`** — the BSDs and anything else that builds. A log line and nothing.
 - **`search.rs`** — YouTube Music search, built on `YTMusicClient::send_request` since
   `ytmusicapi 0.4.2` has no search of its own: same cookies, same context, no second HTTP
@@ -463,14 +468,39 @@ tools/           not a member and not shipped — see `macos-check` above
   Each result also carries the artists and album its byline *links* (`artists` with channel
   ids, `album_id`), read from the runs' `browseEndpoint`s by `links`, which `radio.rs` shares;
   `to_track` keeps them, so a played result can still go to its album or artist.
+  Both frontends use `search_page` (`search`, songs-then-videos in one list, is left for the
+  probes and the live test), which adds **albums and artists** as two more filtered requests
+  and sends all four at once with `tokio::join!` — ~0.56s warm for the lot, where songs and
+  videos alone had gone one after the other. `SearchPage::top` is the "top results" rule,
+  decided here once for both frontends: the first artist when the query names it, an album
+  whose whole title the query contains (four letters at least, or every query with an "a" in
+  it names an album called "A"), compared with case, spacing and punctuation stripped so
+  "weeknd" finds "The Weeknd". The GUI's `topResults` only adds songs to fill its six tiles.
+  The filter blobs differ only in one protobuf field (1 songs,
+  2 videos, 3 albums, 4 artists), which is how `ALBUMS_FILTER`/`ARTISTS_FILTER` were made from
+  the songs one, then checked live. Their rows have no video id; `browse::list_card` reads
+  them into the same `Card` the artist page's carousels use. One section failing costs only
+  that section; all four failing is an error. `suggestions` is the search box's dropdown,
+  from the `music/get_search_suggestions` endpoint: completions, then artist/album rows, then
+  songs. A suggested song's byline is `Song • artist • plays` with the album in a *third*
+  column, so `parse`'s reading of the second column would have named the artist "Song" —
+  hence `suggested_song`. `Library::search` is the local half: every word of the query in a
+  track's title, artists or album, one row per video id (Liked Music and a playlist often hold
+  the same song), title matches first.
+  The library edits — add, like, unlike, remove, create — are `Edit`s, which `spawn_edit` runs
+  in the background for the TUI and answers as `SearchMsg::Edited`, carrying the library
+  index of the playlist to fetch again (or, for a created one, its new id). The GUI calls the
+  same `like`/`unlike`/`remove_from_playlist`/`create_playlist` from its own commands instead.
 - **`browse.rs`** — album and artist pages, which `ytmusicapi 0.5` lacks: one `browse`
   request each, walked for renderers. An album is its `musicResponsiveHeaderRenderer` (title,
   `Album · 2013`, the strapline's artist) and its shelf's rows, each a full `Track` with the
   album's cover. An artist is its header, the "Top songs" shelf — whose "more" link is a
   playlist `artist` then fetches, since the shelf holds five rows without durations — and its
   carousels reduced to album and artist `Card`s; playlist and video carousels are dropped,
-  there being no page to open them on. Fixture tests cover both shapes; the live one is
-  `#[ignore]`d.
+  there being no page to open them on. That playlist's album column is a *play count*
+  ("2.4B plays") with no browse id, so `artist` drops any album without one. Fixture tests
+  cover both shapes; the live one is `#[ignore]`d. `spawn_page` is the TUI's background
+  fetch, answering a `PageMsg` named by the browse id it was asked for.
 - **`radio.rs`** — a station: `R` in the TUI, "Start Radio" and `R` in the GUI. No
   `get_watch_playlist` exists in `ytmusicapi 0.5`, so this is `search.rs`'s move again: the
   web client's own `next` endpoint through `send_request`, asking for the seed's
@@ -499,8 +529,9 @@ tools/           not a member and not shipped — see `macos-check` above
   repeats. A failure waits `RETRY_AFTER` and the third in a row ends the station. A page
   that lands is filed by `Library::place_off_library` and queued by `Player::append_many`,
   and an answer for a station since replaced is dropped by its seed. Radio tracks live in
-  the search playlist, so a radio queue is not restored at the next start, like any other
-  search track. Offline fixture tests cover the parse and the rules; the live one, which
+  the search playlist, and come back at the next start the way any search track does (see
+  `persistence.rs`) — the songs, not the station: what was queued plays, and no more is
+  fetched after it. Offline fixture tests cover the parse and the rules; the live one, which
   fetches a second page too, is `#[ignore]`d.
 - **`cover.rs`** — fetches a thumbnail and decodes it to RGB. `at_size` rewrites the CDN's
   own resize parameters (`=w120-h120-l90-rj`) to ask for a bigger copy than the 120px a
@@ -561,9 +592,14 @@ tools/           not a member and not shipped — see `macos-check` above
   record id, so one is paid for once). A queue's saved *position* is an index into the
   queue, so both halves of the round trip move it with the entries rather than carrying the
   number across: `build_queue_state` drops an entry with no video id and `try_restore` drops
-  one whose playlist is gone — the synthetic search playlist, every time — and
-  `follow_position` applies the same rule `Player::remap_refs` does, or the queue comes back
-  playing a song it wasn't on.
+  one whose playlist is gone, and `follow_position` applies the same rule
+  `Player::remap_refs` does, or the queue comes back playing a song it wasn't on.
+  An entry from the search playlist — search, radio, an album or artist page — carries its
+  whole `Track` (`QueueEntry::track`), since that playlist exists only for the session that
+  filled it and a video id alone has nothing to be looked up in next time. `try_restore`
+  files those back with `place_search_result`, which is why it takes the library mutably;
+  it does so only once the outcome is `Ready`, so a queue still waiting on a playlist files
+  nothing. An older `queue.json` has no `track` and its search entries still drop, as before.
 
   `translations.json` holds **one translation per lrclib record**, and the rules around it
   are all consequences of that. *Only the AI ones are in it*: the free endpoint costs
@@ -705,18 +741,45 @@ tools/           not a member and not shipped — see `macos-check` above
     either way; only the AI ones outlive it, in `translations.json`. Pressing the same key
     twice is the retry after a failure; `r` fetches another, whichever translator made the
     one on screen, and the answer replaces what was saved when it arrives.
-  - **Search**: `s` opens it — a query line, then results. Songs are listed before videos and
-    each row is marked `♪ song` or `▶ video` with its length, because the two are genuinely
-    different things and the choice should be deliberate. `↵` plays (through
-    `place_search_result`, so it queues and gets lyrics like any other track), `a` queues it
-    as `a` does any song, `/` returns to the query line.
+  - **Search**: `s` opens it — a query line, then results in sections: Top results
+    (`SearchPage::top`), In your library, Songs, Artists, Albums, Videos. Each row is
+    marked `♪ song`, `▶ video`, `● artist`, `◎ album` or `✓ saved`, because they are genuinely
+    different things and the choice should be deliberate. "In your library" is
+    `Library::search`, asked when the answer lands so playlists that loaded meanwhile count;
+    those rows carry their library position (`Item::Track::owned`) and play from their own
+    playlist, as that row would, falling back to a loose copy if a refetch has moved them.
+    `↵` on a track plays it with the rest of its
+    section queued behind (`place_off_library` + `Player::play_list`, as the GUI's
+    `play_tracks`); on an artist or album it opens that page. `a`/`A` queue a track,
+    `Tab`/`Shift+Tab` jump a section, `/` returns to the query line.
+  - **Result lists** (`Items`) are what search and the pages share: `Item` is a heading, a
+    track or a card, and the cursor steps *over* headings (`step`, `jump_section`), so a
+    selected row is never a label. `section_tracks` is the run of tracks around the cursor —
+    an album, a page's top songs, search's songs — which is what `↵` queues.
+    `render_item_list` draws one, with the detail column beside it where covers can be
+    drawn; headings are separated by a row's `top_margin` rather than blank items, so
+    selection indices stay one-to-one with rows.
+  - **Album and artist pages**: `g`/`G` open the selected song's album or first linked
+    artist from any list (the same `selected_track` rule as `P` and `R`), and `↵` opens a
+    card. `pages` is a stack over the right column, above search, so `Esc` goes back through
+    them to whatever they were opened from; `o`, `H`, `y` and `s` close them all, since each
+    asks for a different column. `page_has_focus` mirrors `search_has_focus`. An album's
+    detail column is the album itself (its cover held once under its browse id, rather than
+    once per track) and its rows drop the album name they would all repeat.
   - **Add to playlist**: `P` opens a modal listing the user's own playlists, for whatever
     song is selected — a search result, a row in songs, queue or history, or the playing
     track in lyrics mode or from the playlists panel (`selected_song`, the same rule `R`
     follows). `AddPicker` takes the song when it opens, so it belongs to no panel and moving
-    the selection underneath changes nothing. It used to be `a` in search alone.
+    the selection underneath changes nothing. It used to be `a` in search alone. Its first
+    row, "New playlist…", asks for a name and creates a private playlist with the song in
+    it; the new playlist is appended to the library (`push_playlist`) and fetched.
     Liked Music is special-cased: its id is literally `LM` and it is the like button rather
-    than a playlist items can be added to.
+    than a playlist items can be added to. `L` likes the playing song, or unlikes it when it
+    is already in the session's copy of Liked Music.
+  - **Removing from a playlist**: `d` on a playlist's row, pressed twice within the toast's
+    two seconds (`pending_remove`), since it is a server-side change with no undo. It needs
+    the row's `set_video_id`; in Liked Music it is an unlike instead. The refetch afterwards
+    is the same `follow_tracks` path an add takes.
     An add that lands **refetches that playlist** (`refresh_playlist`), so the new track is
     playable in the session that added it rather than at the next start. The refetch is what
     makes `TrackRef`'s "position, not identity" nature dangerous — a like lands at the *top*
@@ -737,7 +800,8 @@ tools/           not a member and not shipped — see `macos-check` above
     the key dispatch, the hint bar and the header colour all read it, so they cannot disagree.
     Typing a query takes every key regardless of focus (as the `P` modal does, ahead of it) — `h` mid-word must
     type an `h` — but once there are results to move through, `h`/`l` are the ordinary panel
-    keys and focus returns to the playlists, exactly as in lyrics mode.
+    keys and focus returns to the playlists, exactly as in lyrics mode. Running a query moves
+    focus to the results, or a search started from the playlists panel would land there.
   - **Now playing card**: in lyrics mode the *playlists* column is given over to the playing
     track — cover centred, then title (Green, since green is what this app means by playing),
     artist, album, a short rule and the length. You are reading rather than browsing at that
@@ -806,7 +870,7 @@ The frontend is laid out by what it is: `App.tsx` holds state, navigation and th
 builders; `views/` is one file per page (`HomeView`, `PlaylistPage`, `SearchPage`,
 `AlbumView`, `ArtistView`, `NowPlayingView` with `LyricsPanel`/`LyricsPicker`);
 `components/` the shared pieces (`TrackList`, `PlayerBar`, `Transport`, `PlaylistNav`,
-`QueuePanel`, `Menu`, `Modal`, `Tip`, …); `types.ts` mirrors the backend's views; `api.ts`'s
+`QueuePanel`, `SearchBox`, `Shelf`, `SongGrid`, `CardActions`, `Menu`, `Modal`, `Tip`, …); `types.ts` mirrors the backend's views; `api.ts`'s
 `call` is `invoke` with a toast on failure, which is how every error reaches the user — there is
 no error box. `context.ts` is two contexts: `ActionsContext` (`navigate`, `toggleLike`, the
 menu builders — never changes) and `StateContext` (playlists, the liked set, the playing track,
@@ -831,7 +895,31 @@ forward in the header and `⌘[`/`⌘]`. Album and artist pages come from `ytm_c
 (the web client's `browse` endpoint, walked the way `search.rs` walks its response); an
 artist's "Top songs" follows the shelf's own "more" playlist for durations and the rest of
 the list. Search, album and artist answers are cached per session in their views, so going
-back is instant.
+back is instant. The header's search field follows the route, so Back through two searches
+shows the query whose results are on screen.
+
+**Search** is laid out after Apple Music's. `SearchBox` is the header field and its dropdown:
+recent searches when it's empty (`recent.ts`, the webview's own `localStorage` — a per-device
+convenience nothing else reads, so not a file in the config directory), and while typing,
+`search_suggestions` debounced 150ms and cached per input, so backspacing asks for nothing
+twice. ↑/↓ move through it, wrapping through the field itself; Enter takes the highlighted
+line or searches what was typed; the first Esc closes the list and only the second leaves
+the field. The list is the field's *sibling*, not its child: a `backdrop-filter` ancestor
+makes itself the backdrop root, and a nested blur would see only the field. `SearchPage`
+shows Top Results (the artist the query names, an album it names, then the best songs —
+`topResults`, compared with case and punctuation stripped), In Your Library
+(`search_library`, local and instant, so it is asked again as playlists finish loading and
+plays from the playlist rather than as a loose track), Artists, Albums, then Songs and Videos
+as `SongGrid`s.
+
+Sideways rows go through `Shelf`: arrows on the row's edges, shown while the shelf is
+hovered, paging by whole items — the one cut off at the edge becomes the first in view —
+since a hidden scrollbar is no way across without a horizontal wheel. `SongGrid` is Apple's
+compact song grid, four rows deep and paged sideways, its columns sized to tile the row
+exactly at each container width so a page never ends mid-column; the artist page's Top songs
+and the search sections use it. `CardActions` lays play and "…" over a card's artwork as a
+*sibling* of the card's button (a button can't hold another), with the menu on the card's
+wrapper so the "…"'s synthetic `contextmenu` bubbles to it.
 
 **The right-click menu** is one Radix `ContextMenu` for the whole window (`MenuProvider`). A
 row's `onContextMenu` calls `menu.show(e, items)`, which fills the menu in the same event the
@@ -902,8 +990,8 @@ playlist opens with ~24 requests, not 170 — `hdLadder` stops at the smallest f
 the size asked for, and the blurred backdrops use the advertised URL (`backdropUrl`), which
 always exists and is already cached.
 
-Commands that wait on the network — search, like, add-to-playlist, the three lyrics commands and
-translation — are `async` and run their body through `state::off_main` (`spawn_blocking`). A sync
+Commands that wait on the network — search and its suggestions, like, add-to-playlist, the three
+lyrics commands and translation — are `async` and run their body through `state::off_main` (`spawn_blocking`). A sync
 `#[tauri::command]` runs on the main thread, which on Linux also delivers every input event to the
 webview, so a lyrics lookup there froze the whole window for the ~2s lrclib took on every track
 change. `spawn_blocking` rather than `.await` for the reason `library::bootstrap` gives. A command
@@ -1007,8 +1095,8 @@ its own auth, playback and media backends.
 
 Its own crate (`ytm-gui`) rather than folded into `tui`, since the two frontends share
 nothing but `ytm-core` and Tauri's build artifacts have no reason to touch the ratatui
-binary. `pnpm` drives the frontend half; `cargo` alone builds `gui/src-tauri` but won't
-produce a running app without a `pnpm` build behind it (`tauri.conf.json`'s `frontendDist`).
+binary. `bun` drives the frontend half; `cargo` alone builds `gui/src-tauri` but won't
+produce a running app without a `bun` build behind it (`tauri.conf.json`'s `frontendDist`).
 
 ### Event loop cadence
 
@@ -1023,9 +1111,9 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `j` / `k` | Navigate down / up (scroll lyrics in lyrics mode) |
 | `PgUp` / `PgDn` | (in lyrics mode) Scroll lyrics five lines |
 | `h` / `l` | Switch panels (Playlists ↔ Songs) |
-| `Enter` | Open playlist / play song / play from queue |
+| `Enter` | Open playlist, album or artist / play song / play from queue |
 | `/` | Enter filter mode (songs or queue panel) |
-| `Esc` | Re-centre lyrics → close lyrics → clear filter → back to playlists → quit |
+| `Esc` | Back a page → re-centre lyrics → close lyrics → clear filter → back to playlists → quit |
 | `Space` | Pause / resume |
 | `p` / `n` | Previous / next in queue — `p` past 3 s into a track restarts it, at the start it goes back one. Since the restart leaves playback at zero, a run of presses walks back a track at a time, untimed (`Player::restart_or_previous`, shared with the OS's own previous-track key) |
 | `←` / `→` | Seek −5s / +5s |
@@ -1034,14 +1122,16 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 | `t` | Cycle play mode (Cycle → Single → Shuffle) |
 | `a` | Append selected song to queue |
 | `A` | Play the selected song next (also from `H`) |
-| `d` | Remove selected queue entry |
+| `d` | Remove selected queue entry; on a playlist's row, pressed twice, remove it from the playlist |
 | `D` | (in the queue) Clear the queue |
 | `o` | Toggle queue / songs view |
 | `H` | Recently played — `history.json`, shared with the GUI's home page |
-| `L` | Like the playing song |
+| `L` | Like the playing song, or unlike it if it is already liked |
 | `R` | Radio: replace the queue with a station seeded from the highlighted song (or the playing one in lyrics mode or the playlists panel), topped up as it plays |
-| `P` | Add the selected song (or the playing one in lyrics mode or the playlists panel) to one of your playlists |
-| `s` | Search YouTube Music (`↵` play, `a` queue, `P` add to a playlist, `/` edit query) |
+| `P` | Add the selected song (or the playing one in lyrics mode or the playlists panel) to one of your playlists, or to a new one |
+| `g` / `G` | Open the selected song's album / artist page (`Esc` goes back) |
+| `Tab` / `Shift+Tab` | (in search results or an artist page) Next / previous section |
+| `s` | Search YouTube Music (`↵` play or open, `a` queue, `P` add to a playlist, `/` edit query) |
 | `y` | Toggle lyrics panel |
 | `c` | (in lyrics mode) Choose a different lrclib record |
 | `i` | (in lyrics mode) Toggle the translation under each line, from the free endpoint |
@@ -1052,15 +1142,15 @@ Lyrics mode off ⇒ unchanged 200 ms, so there is no idle cost.
 
 Each context's hint list names *every* key that works in it, and `fit_hints` drops
 whole hints from the end until what is left fits the terminal — so order is
-priority order, and a wider terminal is simply a longer bar. `?` sits sixth in
-every list rather than last, because it is the way to the bindings below it and
+priority order, and a wider terminal is simply a longer bar. `?` sits no later than sixth
+in every list rather than last, because it is the way to the bindings below it and
 must survive 80 columns; `the_way_to_the_full_keymap_survives_a_narrow_terminal`
 is the test that says so. `App::KEYMAP` is the `?` overlay, and
 `the_keymap_and_the_hint_bar_agree` fails if it grows a binding no hint bar names.
 `Self::TAIL` (seek, volume, mute, mode, panel, quit) is appended to `browse_hints` and
-`lyrics_hints`. `search_hints` builds its own list by hand instead and doesn't carry all of
-it — mode has no key while search has focus, and `↑`/`↓` are repurposed to move the result
-selection rather than volume.
+`lyrics_hints`. `search_hints` and `page_hints` build their own lists by hand instead and
+don't carry all of it — mode has no key while a result list has focus, and `↑`/`↓` are
+repurposed to move the selection rather than volume.
 
 Note: raw mode clears `ISIG`, so `Ctrl+C` never becomes a signal — `app.rs` matches it as a
 key event. The `ctrlc` handler in `main.rs` only covers SIGTERM/SIGHUP.
@@ -1141,6 +1231,9 @@ own — its `reqwest 0.12.4` resolves to the 0.12 `ytmusicapi` pulls in, which i
 0.12 is in the graph whatever this workspace's own crates ask for. It does ask for tokio's
 `full` feature set, which unifies across the workspace; that costs build time, nothing at
 runtime. See `ytm-core/src/translate.rs` for what it gets wrong and how that is handled.
+`ytm-core` names tokio's `macros` itself all the same, for `search_page`'s `join!`: the
+unification is an accident of this crate's dependencies, and the split into separate repos
+would end it.
 
 The AI path in `translate/llm.rs` calls the Anthropic Messages API over the workspace's own
 `reqwest` — no SDK, since there is no official Rust one, and no new HTTP stack. DeepSeek

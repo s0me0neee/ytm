@@ -39,10 +39,10 @@ pub fn try_restore_queue(app: &AppHandle, state: &AppState) {
     let Some(saved) = saved else { return };
 
     // Library then player, matching every command and the ticker.
-    let (Ok(library), Ok(mut player)) = (state.library.lock(), state.player.lock()) else {
+    let (Ok(mut library), Ok(mut player)) = (state.library.lock(), state.player.lock()) else {
         return;
     };
-    let outcome = persistence::try_restore(&library, &saved);
+    let outcome = persistence::try_restore(&mut library, &saved);
     let restored = match outcome {
         RestoreOutcome::Pending => return,
         RestoreOutcome::Abandoned => {

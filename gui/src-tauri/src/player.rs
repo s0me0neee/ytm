@@ -423,7 +423,7 @@ pub fn get_queue(state: State<'_, AppState>) -> Vec<QueueEntryView> {
                 title: track
                     .and_then(|t| t.title.clone())
                     .unwrap_or_else(|| "Untitled".to_string()),
-                artist: track.map(Track::artist_names).unwrap_or_default(),
+                artist: track.map_or_default(Track::artist_names),
                 duration: track.and_then(|t| t.duration.clone()).unwrap_or_default(),
                 thumbnail: track.and_then(|t| t.thumbnail.clone()),
                 video_id: track.and_then(|t| t.video_id.clone()),

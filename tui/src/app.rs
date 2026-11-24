@@ -16,14 +16,15 @@ use ratatui::{
 };
 use throbber_widgets_tui::{Throbber, ThrobberState};
 
+use ytm_core::browse::{self, AlbumPage, Card, CardKind, Page, PageMsg};
 use ytm_core::library::{LibraryFetcher, SongBatch, moved_indices};
 use ytm_core::lyrics::{self, LyricsMsg, LyricsQuery, LyricsService, TrackLyrics};
 use ytm_core::persistence::{self, LyricsOverrides, QueueState, RestoreOutcome};
 use ytm_core::radio::{self, RadioMsg, Station};
-use ytm_core::search::{self, ResultKind, SearchMsg, SearchResult};
+use ytm_core::search::{self, Edit, EditRequest, ResultKind, SearchMsg, SearchPage};
 use ytm_core::{
     AppendOutcome, AudioState, Cover, CoverMsg, Library, MediaCmd, MediaControls, NowPlaying,
-    PlayState, Player, RemoveOutcome, Track, TrackInfo, TranslateMsg,
+    PlayState, Player, Playlist, RemoveOutcome, Track, TrackInfo, TranslateMsg,
 };
 
 use crate::kitty;
@@ -814,8 +815,157 @@ const MAX_COVERS: usize = 32;
 /// nothing is held at a size no panel can put on screen.
 const MAX_COVER_COLS: u16 = 32;
 
-/// The search panel: a query line, a result list, and optionally the "add to"
-/// popup over the top of it.
+/// Liked Music's playlist id, which is also the like button.
+const LIKED: &str = "LM";
+
+/// Album and artist pages held for `Esc` to go back through.
+const MAX_PAGES: usize = 16;
+
+/// Cells the detail column beside a result list is drawn in.
+const DETAIL_COLS: u16 = 24;
+
+/// One row of a search result list or an album or artist page.
+enum Item {
+    /// A section label, which the cursor steps over.
+    Heading(String),
+    /// `kind` is a search result's; a page's tracks have none and are numbered
+    /// instead. `owned` is where a track the user already has sits in the library.
+    Track {
+        track: Track,
+        kind: Option<ResultKind>,
+        owned: Option<(usize, usize)>,
+    },
+    /// An album or artist, which `↵` opens.
+    Card(Card),
+}
+
+impl Item {
+    const fn is_heading(&self) -> bool {
+        matches!(self, Self::Heading(_))
+    }
+
+    const fn track(&self) -> Option<&Track> {
+        match self {
+            Self::Track { track, .. } => Some(track),
+            _ => None,
+        }
+    }
+
+    const fn owned(&self) -> Option<(usize, usize)> {
+        match self {
+            Self::Track { owned, .. } => *owned,
+            _ => None,
+        }
+    }
+
+    /// The id a cover is held under, and where to fetch it.
+    fn cover(&self) -> Option<(String, String)> {
+        match self {
+            Self::Track { track, .. } => Some((track.video_id.clone()?, track.thumbnail.clone()?)),
+            Self::Card(card) => Some((card.id.clone(), card.thumbnail.clone()?)),
+            Self::Heading(_) => None,
+        }
+    }
+}
+
+/// Appends a section: a heading and its rows, or nothing if there are no rows.
+fn push_section(out: &mut Vec<Item>, title: &str, rows: impl IntoIterator<Item = Item>) {
+    let start = out.len();
+    out.extend(rows);
+    if out.len() > start {
+        out.insert(start, Item::Heading(title.to_string()));
+    }
+}
+
+/// A list of [`Item`]s whose cursor never rests on a heading.
+#[derive(Default)]
+struct Items {
+    items: Vec<Item>,
+    state: TableState,
+}
+
+impl Items {
+    fn new(items: Vec<Item>) -> Self {
+        let mut state = TableState::default();
+        state.select(items.iter().position(|i| !i.is_heading()));
+        Self { items, state }
+    }
+
+    fn selected(&self) -> Option<&Item> {
+        self.items.get(self.state.selected()?)
+    }
+
+    /// Moves to the next row that isn't a heading, stopping at either end.
+    fn step(&mut self, forward: bool) {
+        let Some(at) = self.state.selected() else {
+            return;
+        };
+        let next = if forward {
+            self.items
+                .iter()
+                .enumerate()
+                .skip(at.saturating_add(1))
+                .find(|(_, i)| !i.is_heading())
+                .map(|(n, _)| n)
+        } else {
+            self.items.iter().take(at).rposition(|i| !i.is_heading())
+        };
+        if next.is_some() {
+            self.state.select(next);
+        }
+    }
+
+    /// Jumps to the first row of the next or the previous section.
+    fn jump_section(&mut self, forward: bool) {
+        let at = self.state.selected().unwrap_or(0);
+        let heads: Vec<usize> = (0..self.items.len())
+            .filter(|&n| self.items.get(n).is_some_and(Item::is_heading))
+            .collect();
+        let head = if forward {
+            heads.iter().find(|&&h| h > at).copied()
+        } else {
+            // The last heading before the cursor is this section's own.
+            heads.iter().rev().filter(|&&h| h < at).nth(1).copied()
+        };
+        let from = head.map_or(0, |h| h.saturating_add(1));
+        if let Some(first) = self
+            .items
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find(|(_, i)| !i.is_heading())
+            .map(|(n, _)| n)
+            && (head.is_some() || !forward)
+        {
+            self.state.select(Some(first));
+            // The section opens at the top of the list rather than its bottom edge.
+            *self.state.offset_mut() = head.unwrap_or(0);
+        }
+    }
+
+    /// The run of tracks the selected one belongs to, and where it sits in it —
+    /// what `↵` queues, so an album plays on from the track chosen.
+    fn section_tracks(&self) -> Option<(Vec<Track>, usize)> {
+        let at = self.state.selected()?;
+        self.items.get(at)?.track()?;
+        let start = self
+            .items
+            .iter()
+            .take(at)
+            .rposition(|i| i.track().is_none())
+            .map_or(0, |n| n.saturating_add(1));
+        let run: Vec<Track> = self
+            .items
+            .iter()
+            .skip(start)
+            .map_while(Item::track)
+            .cloned()
+            .collect();
+        Some((run, at.saturating_sub(start)))
+    }
+}
+
+/// The search panel: a query line and what it found.
 struct SearchState {
     /// What the user has typed.
     query: String,
@@ -826,18 +976,11 @@ struct SearchState {
     /// The query the results below actually belong to, so a stale response for
     /// a query since retyped can be recognised and dropped.
     ran: String,
-    results: Vec<SearchResult>,
-    state: TableState,
+    items: Items,
+    /// Rows found, headings aside.
+    found: usize,
     loading: bool,
     error: Option<String>,
-}
-
-/// The `P` popup: which of the user's playlists to add a song to. The song is
-/// taken when it opens, so moving the selection behind it changes nothing.
-struct AddPicker {
-    video_id: String,
-    title: String,
-    state: TableState,
 }
 
 impl SearchState {
@@ -846,16 +989,103 @@ impl SearchState {
             query: String::new(),
             typing: true,
             ran: String::new(),
-            results: Vec::new(),
-            state: TableState::default(),
+            items: Items::default(),
+            found: 0,
             loading: false,
             error: None,
         }
     }
+}
 
-    fn selected(&self) -> Option<&SearchResult> {
-        self.results.get(self.state.selected()?)
+/// Library tracks a search lists, ahead of what YouTube found — enough to say
+/// "you already have this" without pushing the songs off the screen.
+const MAX_LIBRARY_HITS: usize = 8;
+
+/// A search page as rows: what the query names first, then what the user
+/// already has, then songs, artists, albums and videos.
+fn search_items(page: &SearchPage, owned: Vec<((usize, usize), Track)>) -> Vec<Item> {
+    let is_named = |card: &Card| page.top.iter().any(|n| n.id == card.id);
+    let hits = |list: &[search::SearchResult]| -> Vec<Item> {
+        list.iter()
+            .map(|r| Item::Track {
+                track: r.to_track(),
+                kind: Some(r.kind),
+                owned: None,
+            })
+            .collect()
+    };
+    let cards = |list: &[Card]| -> Vec<Item> {
+        list.iter()
+            .filter(|c| !is_named(c))
+            .cloned()
+            .map(Item::Card)
+            .collect()
+    };
+    let mut out = Vec::new();
+    push_section(
+        &mut out,
+        "Top results",
+        page.top.iter().cloned().map(Item::Card),
+    );
+    push_section(
+        &mut out,
+        "In your library",
+        owned.into_iter().map(|(at, track)| Item::Track {
+            track,
+            kind: None,
+            owned: Some(at),
+        }),
+    );
+    push_section(&mut out, "Songs", hits(&page.songs));
+    push_section(&mut out, "Artists", cards(&page.artists));
+    push_section(&mut out, "Albums", cards(&page.albums));
+    push_section(&mut out, "Videos", hits(&page.videos));
+    out
+}
+
+/// An album or artist page, open in the right column.
+struct PageView {
+    kind: CardKind,
+    id: String,
+    /// What to call it before it arrives.
+    title: String,
+    /// `None` while it is being fetched.
+    page: Option<Result<Page, String>>,
+    items: Items,
+}
+
+fn page_items(page: &Page) -> Vec<Item> {
+    let track = |t: &Track| Item::Track {
+        track: t.clone(),
+        kind: None,
+        owned: None,
+    };
+    match page {
+        Page::Album(album) => album.tracks.iter().map(track).collect(),
+        Page::Artist(artist) => {
+            let mut out = Vec::new();
+            push_section(&mut out, "Top songs", artist.songs.iter().map(track));
+            for shelf in &artist.shelves {
+                push_section(
+                    &mut out,
+                    &shelf.title,
+                    shelf.cards.iter().cloned().map(Item::Card),
+                );
+            }
+            out
+        }
     }
+}
+
+/// The `P` popup: which of the user's playlists to add a song to. The song is
+/// taken when it opens, so moving the selection behind it changes nothing.
+struct AddPicker {
+    video_id: String,
+    title: String,
+    /// Row 0 is "New playlist…"; the user's playlists follow it.
+    state: TableState,
+    /// The new playlist's name, while it is being typed.
+    naming: Option<String>,
 }
 
 /// The marker and colour for a result's kind.
@@ -866,9 +1096,283 @@ impl SearchState {
 /// rather than hidden, but marked clearly enough that the choice is deliberate.
 fn kind_marker(kind: ResultKind) -> (&'static str, Style) {
     match kind {
-        ResultKind::Song => ("♪ song ", theme::ACCENT),
+        ResultKind::Song => ("♪ song", theme::ACCENT),
         ResultKind::Video => ("▶ video", theme::WARN),
     }
+}
+
+/// A track already in one of the user's playlists.
+const SAVED_MARKER: (&str, Style) = ("✓ saved", theme::META);
+
+fn card_marker(kind: CardKind) -> (&'static str, Style) {
+    match kind {
+        CardKind::Album => ("◎ album", theme::META),
+        CardKind::Artist => ("● artist", theme::META),
+    }
+}
+
+/// The lines under a cover in the detail column, for one row.
+fn item_details(item: &Item) -> Vec<Line<'static>> {
+    let width = usize::from(DETAIL_COLS);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut field = |text: &str, style: Style, max: usize| {
+        if !text.is_empty() {
+            lines.extend(
+                wrap_words(text, width, max)
+                    .into_iter()
+                    .map(|piece| Line::styled(piece, style).centered()),
+            );
+        }
+    };
+    let (marker, style, duration) = match item {
+        Item::Heading(_) => return Vec::new(),
+        Item::Track { track, kind, owned } => {
+            field(
+                track.title.as_deref().unwrap_or("Unknown"),
+                theme::PRIMARY,
+                3,
+            );
+            field(&track.artist_names(), theme::META, 2);
+            field(
+                track.album.as_ref().map_or("", |a| a.name.as_str()),
+                theme::DIM,
+                2,
+            );
+            let (marker, style) = match (owned, kind) {
+                (Some(_), _) => SAVED_MARKER,
+                (None, Some(kind)) => kind_marker(*kind),
+                (None, None) => ("♪ song", theme::ACCENT),
+            };
+            (marker, style, track_duration(track).unwrap_or_default())
+        }
+        Item::Card(card) => {
+            field(&card.title, theme::PRIMARY, 3);
+            field(&card.subtitle, theme::META, 2);
+            let (marker, style) = card_marker(card.kind);
+            (marker, style, String::new())
+        }
+    };
+    lines.push(Line::from(""));
+    let mut tail = vec![Span::styled(marker.to_string(), style)];
+    if !duration.is_empty() {
+        tail.push(Span::styled(format!("{SEP}{duration}"), theme::DIM));
+    }
+    lines.push(Line::from(tail).centered());
+    // Only when it isn't obvious from the marker: an art track is
+    // the catalogue audio, which is not what "video" promises.
+    if matches!(
+        item,
+        Item::Track {
+            kind: Some(ResultKind::Video),
+            ..
+        }
+    ) {
+        lines.push(Line::styled("audio only", theme::DIM).centered());
+    }
+    lines
+}
+
+/// The lines under an album's cover: what it is, by whom, and how long.
+fn album_details(album: &AlbumPage) -> Vec<Line<'static>> {
+    let width = usize::from(DETAIL_COLS);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let artists = album
+        .artists
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (text, style, max) in [
+        (album.title.as_str(), theme::PRIMARY, 3),
+        (artists.as_str(), theme::META, 2),
+    ] {
+        lines.extend(
+            wrap_words(text, width, max)
+                .into_iter()
+                .map(|piece| Line::styled(piece, style).centered()),
+        );
+    }
+    let kind = [Some(album.kind.clone()), album.year.clone()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(SEP);
+    lines.push(Line::from(""));
+    lines.push(Line::styled(kind, theme::DIM).centered());
+    let secs: u64 = album
+        .tracks
+        .iter()
+        .map(|t| u64::from(t.duration_seconds.unwrap_or(0)))
+        .sum();
+    let songs = match album.tracks.len() {
+        1 => "1 song".to_string(),
+        n => format!("{n} songs"),
+    };
+    let length = if secs > 0 {
+        format!("{songs}{SEP}{}", fmt_duration(secs))
+    } else {
+        songs
+    };
+    lines.push(Line::styled(length, theme::DIM).centered());
+    lines
+}
+
+/// What the column beside a result list shows: a cover, then text under it.
+struct Detail {
+    /// The cover's id and its shape.
+    cover: Option<(String, (u32, u32))>,
+    lines: Vec<Line<'static>>,
+}
+
+/// Draws a result list, with its detail column where there is one, and answers
+/// where the cover should be drawn.
+fn render_item_list(
+    frame: &mut Frame,
+    body: Rect,
+    items: &mut Items,
+    focused: bool,
+    playing: Option<&str>,
+    detail: Option<Detail>,
+    show_album: bool,
+) -> Option<(String, Rect)> {
+    // A detail column only where there is room — below this the list is
+    // worth more than the picture.
+    let detail = detail.filter(|_| body.width > DETAIL_COLS + 30 && body.height >= 12);
+    let (list_area, column) = if detail.is_some() {
+        let [list, _gap, column] = body.layout(&Layout::horizontal([
+            Constraint::Fill(1),
+            Constraint::Length(2),
+            Constraint::Length(DETAIL_COLS),
+        ]));
+        (list, Some(column))
+    } else {
+        (body, None)
+    };
+
+    let mut target = None;
+    if let (Some(column), Some(detail)) = (column, detail) {
+        // The picture's own shape, and centred in its column since it will
+        // usually be narrower than one. Eight rows are held back for the
+        // details underneath, which are the reason the column exists.
+        let cover = detail.cover.and_then(|(id, aspect)| {
+            let (w, h) = kitty::fit_cells(DETAIL_COLS, column.height.saturating_sub(8), aspect);
+            (w > 0 && h > 0).then(|| {
+                let rect = Rect {
+                    x: column.x + column.width.saturating_sub(w) / 2,
+                    width: w,
+                    height: h,
+                    ..column
+                };
+                (id, rect)
+            })
+        });
+        let used = cover
+            .as_ref()
+            .map_or(0, |(_, r)| r.height.saturating_add(1));
+        let below = Rect {
+            y: column.y.saturating_add(used),
+            height: column.height.saturating_sub(used),
+            ..column
+        };
+        // Wrapped rather than cut, because this column *is* the detail view —
+        // the list beside it already shows a truncated title.
+        frame.render_widget(Paragraph::new(detail.lines), below);
+        target = cover;
+    }
+
+    // Cursor gutter, two column gaps, the marker and the duration.
+    let n = items.items.len();
+    let text_w = (list_body(list_area, n).width as usize).saturating_sub(2 + 8 + 1 + 7 + 1);
+    let mut number = 0usize;
+    let rows: Vec<Row> = items
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| match item {
+            Item::Heading(title) => {
+                number = 0;
+                Row::new(vec![
+                    Cell::from(""),
+                    Cell::from(Line::styled(title.to_uppercase(), theme::HEADER_BLUR)),
+                    Cell::from(""),
+                ])
+                .top_margin(u16::from(i > 0))
+            }
+            Item::Track { track, kind, owned } => {
+                number = number.saturating_add(1);
+                let now = playing.is_some() && track.video_id.as_deref() == playing;
+                let (marker, marker_style) = if now {
+                    ("♫".to_string(), theme::PLAYING)
+                } else {
+                    match (owned, kind) {
+                        (Some(_), _) => (SAVED_MARKER.0.to_string(), SAVED_MARKER.1),
+                        (None, Some(kind)) => {
+                            let (m, s) = kind_marker(*kind);
+                            (m.to_string(), s)
+                        }
+                        (None, None) => (format!("{number:>3}"), theme::DIM),
+                    }
+                };
+                let album = track
+                    .album
+                    .as_ref()
+                    .filter(|_| show_album)
+                    .map_or_default(|a| a.name.clone());
+                let spans = fit_meta(
+                    track.title.as_deref().unwrap_or("Unknown"),
+                    if now { theme::PLAYING } else { theme::PRIMARY },
+                    &[(track.artist_names(), theme::META), (album, theme::DIM)],
+                    text_w,
+                );
+                Row::new(vec![
+                    Cell::from(Line::styled(marker, marker_style)),
+                    Cell::from(Line::from(spans)),
+                    Cell::from(
+                        Line::styled(track_duration(track).unwrap_or_default(), theme::DIM)
+                            .right_aligned(),
+                    ),
+                ])
+            }
+            Item::Card(card) => {
+                let (marker, style) = card_marker(card.kind);
+                Row::new(vec![
+                    Cell::from(Line::styled(marker, style)),
+                    Cell::from(Line::from(fit_meta(
+                        &card.title,
+                        theme::PRIMARY,
+                        &[(card.subtitle.clone(), theme::DIM)],
+                        text_w,
+                    ))),
+                    Cell::from(""),
+                ])
+            }
+        })
+        .collect();
+
+    frame.render_stateful_widget(
+        Table::new(
+            rows,
+            [
+                Constraint::Length(8),
+                Constraint::Fill(1),
+                // Seven, not six: the video results routinely include an
+                // hour-long upload, and `1:03:04` does not fit in six.
+                Constraint::Length(7),
+            ],
+        )
+        .row_highlight_style(if focused {
+            theme::SELECTED
+        } else {
+            theme::SELECTED_BLUR
+        })
+        .highlight_symbol("▸ ")
+        .highlight_spacing(HighlightSpacing::Always)
+        .column_spacing(1),
+        list_body(list_area, n),
+        &mut items.state,
+    );
+    render_scrollbar(frame, list_area, n, items.state.selected());
+    target
 }
 
 // ── app ───────────────────────────────────────────────────────────────────────
@@ -983,6 +1487,14 @@ pub struct App {
     search_rx: std::sync::mpsc::Receiver<SearchMsg>,
     /// The `P` popup, while it is open.
     add_picker: Option<AddPicker>,
+    /// The first `d` on a playlist row, which a second within the toast's
+    /// lifetime confirms — removing is on the server and has no undo.
+    pending_remove: Option<((usize, usize), Instant)>,
+    // album and artist pages
+    /// Opened pages, the one on screen last; `Esc` goes back through them.
+    pages: Vec<PageView>,
+    page_tx: std::sync::mpsc::Sender<PageMsg>,
+    page_rx: std::sync::mpsc::Receiver<PageMsg>,
     // radio
     /// The station `R` started, while what it queued is still playing.
     station: Option<Station>,
@@ -1037,6 +1549,7 @@ impl App {
         let (search_tx, search_rx) = std::sync::mpsc::channel();
         let (cover_tx, cover_rx) = std::sync::mpsc::channel();
         let (radio_tx, radio_rx) = std::sync::mpsc::channel();
+        let (page_tx, page_rx) = std::sync::mpsc::channel();
 
         // Decided once: it depends on the terminal the app was launched in,
         // which cannot change under it.
@@ -1105,6 +1618,10 @@ impl App {
             search_tx,
             search_rx,
             add_picker: None,
+            pending_remove: None,
+            pages: Vec::new(),
+            page_tx,
+            page_rx,
             station: None,
             radio_tx,
             radio_rx,
@@ -1129,13 +1646,58 @@ impl App {
     /// the ordinary `h`/`l` business, so moving focus to the playlists gives
     /// the normal bindings back, exactly as it does in lyrics mode.
     fn search_has_focus(&self) -> bool {
-        self.search
-            .as_ref()
-            .is_some_and(|s| s.typing || self.active_panel == Panel::Songs)
+        self.pages.is_empty()
+            && self
+                .search
+                .as_ref()
+                .is_some_and(|s| s.typing || self.active_panel == Panel::Songs)
     }
 
-    /// `s` — opens the search panel, or closes it if it is already open.
+    /// Whether an album or artist page owns the keyboard — the same rule as
+    /// search, which a page covers while it is open.
+    fn page_has_focus(&self) -> bool {
+        !self.pages.is_empty() && self.active_panel == Panel::Songs
+    }
+
+    /// The result list the keyboard is moving through, if one has it.
+    fn focused_items(&self) -> Option<&Items> {
+        if self.page_has_focus() {
+            return self.pages.last().map(|p| &p.items);
+        }
+        self.search
+            .as_ref()
+            .filter(|_| self.search_has_focus())
+            .map(|s| &s.items)
+    }
+
+    /// The result list in the right column, focused or not.
+    fn shown_items_mut(&mut self) -> Option<&mut Items> {
+        match self.pages.last_mut() {
+            Some(view) => Some(&mut view.items),
+            None => self.search.as_mut().map(|s| &mut s.items),
+        }
+    }
+
+    fn focused_items_mut(&mut self) -> Option<&mut Items> {
+        if self.page_has_focus() {
+            return self.pages.last_mut().map(|p| &mut p.items);
+        }
+        if self.search_has_focus() {
+            return self.search.as_mut().map(|s| &mut s.items);
+        }
+        None
+    }
+
+    /// `s` — opens the search panel, or closes it if it is already open. Over
+    /// a page it goes back to the query line instead, since the search under
+    /// the page is not what is on screen.
     fn toggle_search(&mut self) {
+        if !self.pages.is_empty() {
+            self.pages.clear();
+            self.active_panel = Panel::Songs;
+            self.search.get_or_insert_with(SearchState::new).typing = true;
+            return;
+        }
         if self.search.take().is_some() {
             self.canvas.clear();
             self.cover_target = None;
@@ -1157,6 +1719,8 @@ impl App {
             return;
         }
         search.typing = false;
+        // Otherwise a search started from the playlists panel lands there.
+        self.active_panel = Panel::Songs;
         search.loading = true;
         search.error = None;
         search.ran = query.clone();
@@ -1168,49 +1732,84 @@ impl App {
         );
     }
 
-    /// Plays the highlighted result.
+    /// `↵` on a result row: a track plays with the rest of its section queued
+    /// behind it — an album plays on from the track chosen — and an album or
+    /// artist opens.
     ///
-    /// A search hit has no place in the library, and everything downstream
+    /// A track from here has no place in the library, and everything downstream
     /// addresses a track by its position in one — so it is given a place first.
-    fn play_search_result(&mut self) {
-        let Some(hit) = self
-            .search
-            .as_ref()
-            .and_then(SearchState::selected)
-            .cloned()
-        else {
+    fn activate_item(&mut self) {
+        let Some(items) = self.focused_items() else {
             return;
         };
-        let (pl, song) = self.library.place_search_result(hit.to_track());
-        self.player.play(&self.library, pl, song);
-        self.sync_queue_view();
-        self.notify(format!("Playing: {}", hit.title));
-    }
-
-    /// `a` on a search result — queues it, as `a` does on any other song.
-    fn queue_search_result(&mut self) {
-        let Some(hit) = self
-            .search
-            .as_ref()
-            .and_then(SearchState::selected)
-            .cloned()
-        else {
+        if let Some(Item::Card(card)) = items.selected() {
+            let card = card.clone();
+            self.open_page(card.kind, card.id, card.title);
             return;
-        };
-        let (pl, song) = self.library.place_search_result(hit.to_track());
-        self.do_append_to_queue(pl, song);
-    }
-
-    /// The song `P` and `R` act on: the highlighted row where a list has one,
-    /// the playing track otherwise — as `(video id, title)`, since a search
-    /// result has no place in the library until it is played.
-    fn selected_song(&mut self) -> Option<(String, String)> {
-        fn named(t: &Track) -> Option<(String, String)> {
-            Some((t.video_id.clone()?, t.title.clone().unwrap_or_default()))
         }
-        if self.search_has_focus() {
-            let hit = self.search.as_ref().and_then(SearchState::selected)?;
-            return Some((hit.video_id.clone(), hit.title.clone()));
+        // One the user already has plays from its playlist, as that row would.
+        let owned = items
+            .selected()
+            .and_then(|i| Some((i.track()?.clone(), i.owned()?)));
+        if let Some((track, at)) = owned {
+            let (pl, song) = self.place_item_track(track, Some(at));
+            self.player.play(&self.library, pl, song);
+            self.sync_queue_view();
+            let title = self.library.track(pl, song).and_then(|t| t.title.clone());
+            self.notify(format!("Playing: {}", title.unwrap_or_default()));
+            return;
+        }
+        let Some((tracks, start)) = items.section_tracks() else {
+            return;
+        };
+        let title = tracks
+            .get(start)
+            .and_then(|t| t.title.clone())
+            .unwrap_or_default();
+        let refs = self.library.place_off_library(tracks);
+        self.player.play_list(&self.library, refs, start);
+        self.sync_queue_view();
+        self.notify(format!("Playing: {title}"));
+    }
+
+    /// `a` / `A` on a result row — queues it, as on any other song.
+    fn queue_item(&mut self, next: bool) {
+        let Some(item) = self.focused_items().and_then(Items::selected) else {
+            return;
+        };
+        let owned = item.owned();
+        let Some(track) = item.track().cloned() else {
+            self.notify("Open it with ↵ to queue its songs");
+            return;
+        };
+        let (pl, song) = self.place_item_track(track, owned);
+        if next {
+            self.do_play_next(pl, song);
+        } else {
+            self.do_append_to_queue(pl, song);
+        }
+    }
+
+    /// Where a result row's track plays from: its own place in the library,
+    /// while that still holds it — a refetch can move it — or the search
+    /// playlist otherwise.
+    fn place_item_track(&mut self, track: Track, owned: Option<(usize, usize)>) -> (usize, usize) {
+        if let Some((pl, song)) = owned
+            && self
+                .library
+                .track(pl, song)
+                .is_some_and(|t| t.video_id == track.video_id)
+        {
+            return (pl, song);
+        }
+        self.library.place_search_result(track)
+    }
+
+    /// The song `P`, `g` and `G` act on: the highlighted row where a list has
+    /// one, the playing track otherwise.
+    fn selected_track(&mut self) -> Option<Track> {
+        if let Some(items) = self.focused_items() {
+            return items.selected()?.track().cloned();
         }
         let at = if self.lyrics_mode || self.active_panel == Panel::Playlists {
             self.player.playing()?
@@ -1218,7 +1817,7 @@ impl App {
             match self.listing() {
                 Listing::History => {
                     let entry = self.history.tracks().get(self.history_state.selected()?)?;
-                    return named(&entry.track);
+                    return Some(entry.track.clone());
                 }
                 Listing::Queue => {
                     let shown = self.queue_view_state.selected()?;
@@ -1232,41 +1831,105 @@ impl App {
                 }
             }
         };
-        named(self.library.track(at.0, at.1)?)
+        self.library.track(at.0, at.1).cloned()
+    }
+
+    /// [`Self::selected_track`] as `(video id, title)`.
+    fn selected_song(&mut self) -> Option<(String, String)> {
+        let track = self.selected_track()?;
+        Some((track.video_id?, track.title.unwrap_or_default()))
     }
 
     /// `P` — opens the "add to" popup for the selected song.
     fn open_add_picker(&mut self) {
-        if self.add_targets().is_empty() {
-            self.notify("No playlists to add to");
-            return;
-        }
         let Some((video_id, title)) = self.selected_song() else {
             self.notify("No song selected");
             return;
         };
         let mut state = TableState::default();
-        state.select(Some(0));
+        // On the first playlist rather than "New playlist…", where there is one.
+        state.select(Some(usize::from(!self.add_targets().is_empty())));
         self.add_picker = Some(AddPicker {
             video_id,
             title,
             state,
+            naming: None,
         });
     }
 
     /// The modal keys of the `P` popup.
     fn handle_add_picker_key(&mut self, code: KeyCode) {
-        let n = self.add_targets().len();
+        let n = self.add_targets().len().saturating_add(1);
         let Some(picker) = self.add_picker.as_mut() else {
             return;
         };
+        // Naming a new playlist takes every key, or `j` could not be typed.
+        if let Some(name) = picker.naming.as_mut() {
+            match code {
+                KeyCode::Esc => picker.naming = None,
+                KeyCode::Enter => self.commit_create(),
+                KeyCode::Backspace => {
+                    name.pop();
+                }
+                KeyCode::Char(c) => name.push(c),
+                _ => {}
+            }
+            return;
+        }
         match code {
             KeyCode::Esc | KeyCode::Char('P') => self.add_picker = None,
+            KeyCode::Enter if picker.state.selected() == Some(0) => {
+                picker.naming = Some(String::new());
+            }
             KeyCode::Enter => self.commit_add(),
             KeyCode::Char('j') | KeyCode::Down => select_next_bounded(&mut picker.state, n),
             KeyCode::Char('k') | KeyCode::Up => select_prev_bounded(&mut picker.state, n),
             _ => {}
         }
+    }
+
+    /// Creates the playlist being named in the `P` popup, with its song in it.
+    fn commit_create(&mut self) {
+        let Some(picker) = self.add_picker.as_mut() else {
+            return;
+        };
+        let name = picker
+            .naming
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if name.is_empty() {
+            self.notify("A playlist needs a name");
+            return;
+        }
+        let Some(picker) = self.add_picker.take() else {
+            return;
+        };
+        self.notify(format!("Creating {name}…"));
+        self.spawn_edit(
+            Edit::Create {
+                title: name.clone(),
+                video_id: Some(picker.video_id),
+            },
+            None,
+            picker.title,
+            name,
+        );
+    }
+
+    fn spawn_edit(&self, edit: Edit, playlist: Option<usize>, title: String, where_to: String) {
+        search::spawn_edit(
+            &self.lyrics_handle,
+            std::sync::Arc::clone(&self.yt),
+            EditRequest {
+                edit,
+                playlist,
+                title,
+                where_to,
+            },
+            self.search_tx.clone(),
+        );
     }
 
     /// The playlists offered by the `P` popup — the user's own, never the
@@ -1298,34 +1961,190 @@ impl App {
         let Some(picker) = self.add_picker.take() else {
             return;
         };
+        // Row 0 is "New playlist…".
         let Some((playlist, playlist_id, title)) = picker
             .state
             .selected()
-            .and_then(|row| targets.get(row).cloned())
+            .and_then(|row| targets.get(row.checked_sub(1)?).cloned())
         else {
             return;
         };
 
         // Liked Music is not a playlist you can add items to — it is the
         // like button, under a different name.
-        let playlist_id = if playlist_id.eq_ignore_ascii_case("LM") {
+        let playlist_id = if playlist_id.eq_ignore_ascii_case(LIKED) {
             String::new()
         } else {
             playlist_id
         };
         self.notify(format!("Adding to {title}…"));
-        search::spawn_add(
+        self.spawn_edit(
+            Edit::Add {
+                playlist_id,
+                video_id: picker.video_id,
+            },
+            Some(playlist),
+            picker.title,
+            title,
+        );
+    }
+
+    // ── album and artist pages ────────────────────────────────────────────────
+
+    /// Opens an album or artist page over the right column.
+    fn open_page(&mut self, kind: CardKind, id: String, title: String) {
+        if self.pages.last().is_some_and(|p| p.id == id) {
+            self.active_panel = Panel::Songs;
+            return;
+        }
+        // Lyrics take the same column, and two panels cannot both have it.
+        self.lyrics_mode = false;
+        self.lyrics_picker = None;
+        self.active_panel = Panel::Songs;
+        if self.pages.len() >= MAX_PAGES {
+            self.pages.remove(0);
+        }
+        self.pages.push(PageView {
+            kind,
+            id: id.clone(),
+            title,
+            page: None,
+            items: Items::default(),
+        });
+        browse::spawn_page(
             &self.lyrics_handle,
             std::sync::Arc::clone(&self.yt),
-            search::AddRequest {
-                playlist_id,
-                playlist,
-                video_id: picker.video_id,
-                title: picker.title,
-                where_to: title,
-            },
-            self.search_tx.clone(),
+            kind,
+            id,
+            self.page_tx.clone(),
         );
+    }
+
+    /// `g` / `G` — the selected song's album or first linked artist.
+    fn go_to(&mut self, kind: CardKind) {
+        let Some(track) = self.selected_track() else {
+            self.notify("No song selected");
+            return;
+        };
+        let target = match kind {
+            CardKind::Album => track
+                .album
+                .and_then(|a| Some((a.id?, a.name)))
+                .filter(|(id, _)| id.starts_with("MPRE")),
+            CardKind::Artist => track
+                .artists
+                .into_iter()
+                .find_map(|a| Some((a.id?, a.name)))
+                .filter(|(id, _)| id.starts_with("UC")),
+        };
+        match target {
+            Some((id, title)) => self.open_page(kind, id, title),
+            None => self.notify(match kind {
+                CardKind::Album => "That song has no album to go to",
+                CardKind::Artist => "That song has no artist to go to",
+            }),
+        }
+    }
+
+    /// `r` on a page that failed to load.
+    fn retry_page(&mut self) {
+        let Some(view) = self
+            .pages
+            .last_mut()
+            .filter(|p| matches!(p.page, Some(Err(_))))
+        else {
+            return;
+        };
+        view.page = None;
+        let (kind, id) = (view.kind, view.id.clone());
+        browse::spawn_page(
+            &self.lyrics_handle,
+            std::sync::Arc::clone(&self.yt),
+            kind,
+            id,
+            self.page_tx.clone(),
+        );
+    }
+
+    fn drain_pages(&mut self) {
+        while let Ok(PageMsg { id, result }) = self.page_rx.try_recv() {
+            if let Err(e) = &result {
+                log::warn!("browse: {id} failed: {e}");
+            }
+            // Every copy still waiting, since the same page can be in the stack twice.
+            for view in self
+                .pages
+                .iter_mut()
+                .filter(|p| p.id == id && p.page.is_none())
+            {
+                view.items = Items::new(result.as_ref().map_or_default(page_items));
+                view.page = Some(result.clone());
+            }
+        }
+    }
+
+    /// Keys while a result list — search results or a page — has focus.
+    /// `true` means quit.
+    fn handle_items_key(&mut self, code: KeyCode) -> bool {
+        let on_page = self.page_has_focus();
+        match code {
+            KeyCode::Char('q') => return true,
+            // A page goes back to whatever it was opened over; search goes back
+            // to the query line, so a refinement doesn't need the panel closed
+            // and reopened, and a second Esc closes it.
+            KeyCode::Esc if on_page => {
+                self.pages.pop();
+            }
+            KeyCode::Esc | KeyCode::Char('/') => {
+                if let Some(s) = self.search.as_mut() {
+                    s.typing = true;
+                }
+            }
+            KeyCode::Char('s') => self.toggle_search(),
+            // Panel movement, as everywhere else: the list keeps its place,
+            // focus goes to the playlists, `l` comes back.
+            KeyCode::Char('h') => self.active_panel = Panel::Playlists,
+            KeyCode::Char('l') => self.active_panel = Panel::Songs,
+            KeyCode::Enter => self.activate_item(),
+            KeyCode::Char(c @ ('a' | 'A')) => self.queue_item(c == 'A'),
+            KeyCode::Char('P') => self.open_add_picker(),
+            KeyCode::Char('R') => self.start_radio(),
+            KeyCode::Char('g') => self.go_to(CardKind::Album),
+            KeyCode::Char('G') => self.go_to(CardKind::Artist),
+            KeyCode::Char('L') => self.like_playing(),
+            KeyCode::Char('r') if on_page => self.retry_page(),
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(items) = self.focused_items_mut() {
+                    items.step(true);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(items) = self.focused_items_mut() {
+                    items.step(false);
+                }
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(items) = self.focused_items_mut() {
+                    items.jump_section(code == KeyCode::Tab);
+                }
+            }
+            KeyCode::Char(' ') => self.player.play_pause(&self.library),
+            KeyCode::Char('n') => {
+                self.player.next(&self.library);
+                self.sync_queue_view();
+            }
+            KeyCode::Char('p') => {
+                if self.player.restart_or_previous(&self.library) {
+                    self.sync_queue_view();
+                }
+            }
+            KeyCode::Left => self.player.seek(-5.0),
+            KeyCode::Right => self.player.seek(5.0),
+            KeyCode::Char('m') => self.player.toggle_mute(),
+            KeyCode::Char('?') => self.show_keymap = true,
+            _ => {}
+        }
+        false
     }
 
     /// Keys while the search panel has focus. `true` means quit.
@@ -1349,68 +2168,22 @@ impl App {
             }
             return false;
         }
-
-        match code {
-            KeyCode::Char('q') => return true,
-            // Back to the query line, so a refinement doesn't need the panel
-            // closed and reopened. A second Esc closes it.
-            KeyCode::Esc => {
-                if let Some(s) = self.search.as_mut() {
-                    s.typing = true;
-                } else {
-                    self.toggle_search();
-                }
-            }
-            KeyCode::Char('/') => {
-                if let Some(s) = self.search.as_mut() {
-                    s.typing = true;
-                }
-            }
-            KeyCode::Char('s') => self.toggle_search(),
-            // Panel movement, as everywhere else: the search panel keeps its
-            // results, focus goes to the playlists, `l` comes back.
-            KeyCode::Char('h') => self.active_panel = Panel::Playlists,
-            KeyCode::Char('l') => self.active_panel = Panel::Songs,
-            KeyCode::Enter => self.play_search_result(),
-            KeyCode::Char('a') => self.queue_search_result(),
-            KeyCode::Char('P') => self.open_add_picker(),
-            KeyCode::Char('R') => self.start_radio(),
-            KeyCode::Char('j') | KeyCode::Down => {
-                if let Some(s) = self.search.as_mut() {
-                    let n = s.results.len();
-                    select_next_bounded(&mut s.state, n);
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                if let Some(s) = self.search.as_mut() {
-                    let n = s.results.len();
-                    select_prev_bounded(&mut s.state, n);
-                }
-            }
-            KeyCode::Char(' ') => self.player.play_pause(&self.library),
-            KeyCode::Char('n') => {
-                self.player.next(&self.library);
-                self.sync_queue_view();
-            }
-            KeyCode::Char('p') => {
-                if self.player.restart_or_previous(&self.library) {
-                    self.sync_queue_view();
-                }
-            }
-            KeyCode::Left => self.player.seek(-5.0),
-            KeyCode::Right => self.player.seek(5.0),
-            KeyCode::Char('m') => self.player.toggle_mute(),
-            KeyCode::Char('?') => self.show_keymap = true,
-            _ => {}
-        }
-        false
+        self.handle_items_key(code)
     }
 
-    /// Drain finished searches and adds.
+    /// Drain finished searches and edits.
     fn drain_search(&mut self) {
         while let Ok(msg) = self.search_rx.try_recv() {
             match msg {
                 SearchMsg::Results { query, result } => {
+                    // Asked when the answer lands rather than when it was sent,
+                    // so playlists that loaded in between are searched too.
+                    let owned: Vec<_> = self
+                        .library
+                        .search(&query, MAX_LIBRARY_HITS)
+                        .into_iter()
+                        .filter_map(|at| Some((at, self.library.track(at.0, at.1)?.clone())))
+                        .collect();
                     let Some(search) = self.search.as_mut() else {
                         continue;
                     };
@@ -1421,52 +2194,101 @@ impl App {
                     }
                     search.loading = false;
                     match result {
-                        Ok(results) => {
-                            search.state.select((!results.is_empty()).then_some(0));
-                            search.results = results;
+                        Ok(page) => {
+                            search.items = Items::new(search_items(&page, owned));
+                            search.found = search
+                                .items
+                                .items
+                                .iter()
+                                .filter(|i| !i.is_heading())
+                                .count();
                             search.error = None;
                         }
                         Err(e) => {
                             log::warn!("search: {query:?} failed: {e}");
-                            search.results.clear();
+                            search.items = Items::default();
+                            search.found = 0;
                             search.error = Some(e);
                         }
                     }
                 }
-                SearchMsg::Added {
+                SearchMsg::Edited {
+                    edit,
+                    playlist,
                     title,
                     where_to,
-                    playlist,
                     result,
-                } => match result {
-                    Ok(()) => {
-                        log::info!("search: added {title:?} to {where_to:?}");
-                        self.notify(format!("Added {title} to {where_to}"));
-                        // The playlist on the server now has a track this copy
-                        // of it does not. Fetching it again is the only way to
-                        // find out where the track landed — appended for a
-                        // playlist, at the *top* for Liked Music — and it is
-                        // what makes the new song playable without a restart.
-                        self.refresh_playlist(playlist);
-                    }
-                    Err(e) => {
-                        log::warn!("search: adding {title:?} to {where_to:?} failed: {e}");
-                        self.notify(format!("Couldn't add to {where_to}: {e}"));
-                    }
-                },
+                } => self.edit_landed(&edit, playlist, &title, where_to, result),
             }
+        }
+    }
+
+    fn edit_landed(
+        &mut self,
+        edit: &Edit,
+        playlist: Option<usize>,
+        title: &str,
+        where_to: String,
+        result: Result<Option<String>, String>,
+    ) {
+        let created = match result {
+            Ok(created) => created,
+            Err(e) => {
+                let what = match edit {
+                    Edit::Add { .. } => format!("add to {where_to}"),
+                    Edit::Unlike { .. } => format!("unlike {title}"),
+                    Edit::Remove { .. } => format!("remove from {where_to}"),
+                    Edit::Create { .. } => format!("create {where_to}"),
+                };
+                log::warn!("edit: couldn't {what}: {e}");
+                self.notify(format!("Couldn't {what}: {e}"));
+                return;
+            }
+        };
+        let done = match edit {
+            Edit::Add { .. } => format!("Added {title} to {where_to}"),
+            Edit::Unlike { .. } => format!("Unliked {title}"),
+            Edit::Remove { .. } => format!("Removed {title} from {where_to}"),
+            Edit::Create { .. } => format!("Created {where_to} with {title}"),
+        };
+        log::info!("edit: {done}");
+        self.notify(done);
+        if let Some(id) = created {
+            // Appended, since every playlist index is a position.
+            let pl = self.library.push_playlist(Playlist {
+                playlist_id: id.clone(),
+                title: where_to,
+                count: Some(1),
+            });
+            self.fetcher.fetch(pl, &id);
+        } else if let Some(pl) = playlist {
+            // The playlist on the server no longer matches this copy of it.
+            // Fetching it again is the only way to find out where a track
+            // landed — appended for a playlist, at the *top* for Liked Music —
+            // and it is what makes a new song playable without a restart.
+            self.refresh_playlist(pl);
         }
     }
 
     // ── cover art ─────────────────────────────────────────────────────────────
 
-    /// The cover that wants showing: the highlighted search result, or — in
-    /// lyrics mode, where the left column is given over to it — the track
-    /// that is playing.
+    /// The cover that wants showing: the open page's, the highlighted search
+    /// result's, or — in lyrics mode, where the left column is given over to
+    /// it — the track that is playing.
     fn wanted_cover(&self) -> Option<(String, String)> {
+        if let Some(view) = self.pages.last() {
+            return match view.page.as_ref()?.as_ref().ok()? {
+                // An album's tracks all carry its cover, so it is held once, by the album's id.
+                Page::Album(album) => Some((album.browse_id.clone(), album.thumbnail.clone()?)),
+                Page::Artist(artist) => view
+                    .items
+                    .selected()
+                    .and_then(Item::cover)
+                    .or_else(|| Some((artist.channel_id.clone(), artist.thumbnail.clone()?))),
+            };
+        }
         if let Some(search) = self.search.as_ref() {
-            let hit = search.selected()?;
-            return Some((hit.video_id.clone(), hit.thumbnail.clone()?));
+            return search.items.selected()?.cover();
         }
         if self.lyrics_mode {
             let (pl, song) = self.player.playing()?;
@@ -1886,6 +2708,7 @@ impl App {
     }
 
     fn toggle_lyrics_mode(&mut self) {
+        self.pages.clear();
         self.lyrics_mode = !self.lyrics_mode;
         if self.search.take().is_some() {
             self.canvas.clear();
@@ -2262,7 +3085,7 @@ impl App {
                 id: t.video_id.clone().unwrap_or_default(),
                 title: t.title.clone().unwrap_or_default(),
                 artists: t.artists.iter().map(|a| a.name.clone()).collect(),
-                album: t.album.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+                album: t.album.as_ref().map_or_default(|a| a.name.clone()),
                 // mpv's duration is the accurate one but arrives a beat late,
                 // so YouTube's stands in until it does.
                 length: if ast.total > 0.0 {
@@ -2277,8 +3100,7 @@ impl App {
                 art_url: t
                     .thumbnail
                     .as_deref()
-                    .map(|url| ytm_core::cover::at_size(url, MEDIA_COVER_PX))
-                    .unwrap_or_default(),
+                    .map_or_default(|url| ytm_core::cover::at_size(url, MEDIA_COVER_PX)),
             });
 
         // A queue restored from disk has a track but has never been handed to
@@ -2314,7 +3136,7 @@ impl App {
             return;
         };
 
-        match persistence::try_restore(&self.library, &qs) {
+        match persistence::try_restore(&mut self.library, &qs) {
             RestoreOutcome::Pending => {}
             RestoreOutcome::Abandoned => {
                 self.pending_queue_restore = None;
@@ -2412,6 +3234,7 @@ impl App {
             self.drain_translations();
             self.drain_media();
             self.drain_search();
+            self.drain_pages();
             self.drain_radio();
             self.drain_covers();
             self.ensure_cover();
@@ -2473,6 +3296,13 @@ impl App {
                             }
 
                             _ if self.add_picker.is_some() => self.handle_add_picker_key(key.code),
+
+                            // ── an album or artist page, while it has focus ───────────
+                            _ if self.page_has_focus() => {
+                                if self.handle_items_key(key.code) {
+                                    break Ok(());
+                                }
+                            }
 
                             // ── so does the search panel, while it has focus ──────────
                             // Not unconditionally: with focus moved to the
@@ -2646,10 +3476,19 @@ impl App {
                                 self.queue_view_state.select(None);
                                 self.notify("Queue cleared");
                             }
+                            KeyCode::Char('d')
+                                if self.active_panel == Panel::Songs
+                                    && self.listing() == Listing::Songs
+                                    && !self.lyrics_mode =>
+                            {
+                                self.remove_from_playlist();
+                            }
                             KeyCode::Char('H') => self.toggle_history(),
                             KeyCode::Char('L') => self.like_playing(),
                             KeyCode::Char('R') => self.start_radio(),
                             KeyCode::Char('P') => self.open_add_picker(),
+                            KeyCode::Char('g') => self.go_to(CardKind::Album),
+                            KeyCode::Char('G') => self.go_to(CardKind::Artist),
                             KeyCode::Char('d')
                                 if self.active_panel == Panel::Songs && self.show_queue =>
                             {
@@ -2662,6 +3501,7 @@ impl App {
                                 }
                             }
                             KeyCode::Char('o') => {
+                                self.pages.clear();
                                 self.show_history = false;
                                 self.show_queue = !self.show_queue;
                                 self.filter.clear();
@@ -2740,7 +3580,9 @@ impl App {
                     self.filter.clear();
                     self.filter_mode = false;
                 } else if self.songs_area.contains(pos) {
-                    if self.lyrics_mode {
+                    if let Some(items) = self.shown_items_mut() {
+                        items.step(true);
+                    } else if self.lyrics_mode {
                         self.scroll_lyrics(1);
                     } else if self.show_history {
                         let n = self.history.tracks().len();
@@ -2763,7 +3605,9 @@ impl App {
                     self.filter.clear();
                     self.filter_mode = false;
                 } else if self.songs_area.contains(pos) {
-                    if self.lyrics_mode {
+                    if let Some(items) = self.shown_items_mut() {
+                        items.step(false);
+                    } else if self.lyrics_mode {
                         self.scroll_lyrics(-1);
                     } else if self.show_history {
                         let n = self.history.tracks().len();
@@ -2835,13 +3679,10 @@ impl App {
     /// What `R` seeds a station from: the highlighted row where a list has
     /// one, the playing track otherwise.
     fn radio_seed(&mut self) -> Option<(usize, usize)> {
-        if self.search_has_focus() {
-            let hit = self
-                .search
-                .as_ref()
-                .and_then(SearchState::selected)
-                .cloned()?;
-            return Some(self.library.place_search_result(hit.to_track()));
+        if let Some(items) = self.focused_items() {
+            let item = items.selected()?;
+            let (track, owned) = (item.track()?.clone(), item.owned());
+            return Some(self.place_item_track(track, owned));
         }
         if self.lyrics_mode || self.active_panel == Panel::Playlists {
             return self.player.playing();
@@ -2999,6 +3840,7 @@ impl App {
     }
 
     fn toggle_history(&mut self) {
+        self.pages.clear();
         self.show_history = !self.show_history;
         if self.show_history {
             self.show_queue = false;
@@ -3038,7 +3880,15 @@ impl App {
         }
     }
 
-    /// `L`: likes whatever is playing — the GUI's heart button.
+    /// Whether `video_id` is in the session's copy of Liked Music.
+    fn is_liked(&self, video_id: &str) -> bool {
+        self.library
+            .find_playlist_index(LIKED)
+            .is_some_and(|pl| self.library.find_song_index(pl, video_id).is_some())
+    }
+
+    /// `L`: likes whatever is playing, or takes the like back — the GUI's
+    /// heart button.
     fn like_playing(&mut self) {
         let Some((video_id, title)) = self
             .player
@@ -3049,22 +3899,74 @@ impl App {
             self.notify("Nothing playing to like");
             return;
         };
-        // Refetched when the like lands, so the song is in the session's copy
-        // of Liked Music — the same path `a` → Liked Music takes from search.
-        let playlist = self.library.find_playlist_index("LM").unwrap_or(usize::MAX);
-        self.notify(format!("Liking {title}…"));
-        search::spawn_add(
-            &self.lyrics_handle,
-            std::sync::Arc::clone(&self.yt),
-            search::AddRequest {
+        // Refetched when the answer lands, so the session's copy of Liked
+        // Music says what the server's does.
+        let playlist = self.library.find_playlist_index(LIKED);
+        let edit = if self.is_liked(&video_id) {
+            self.notify(format!("Unliking {title}…"));
+            Edit::Unlike { video_id }
+        } else {
+            self.notify(format!("Liking {title}…"));
+            Edit::Add {
                 playlist_id: String::new(),
-                playlist,
                 video_id,
-                title,
-                where_to: "Liked Music".to_string(),
-            },
-            self.search_tx.clone(),
-        );
+            }
+        };
+        self.spawn_edit(edit, playlist, title, "Liked Music".to_string());
+    }
+
+    /// `d` on a playlist row: removes it from the playlist, on a second press.
+    /// In Liked Music that is taking the like back.
+    fn remove_from_playlist(&mut self) {
+        let Some(pl) = self.list_state.selected() else {
+            return;
+        };
+        let Some(song) = self
+            .songs_state
+            .selected()
+            .and_then(|shown| self.filtered_songs(pl).get(shown).copied())
+        else {
+            return;
+        };
+        if self.library.is_search_playlist(pl) {
+            self.notify("Search results aren't a playlist to remove from");
+            return;
+        }
+        let (Some(track), Some(playlist)) = (
+            self.library.track(pl, song).cloned(),
+            self.library.playlist(pl).cloned(),
+        ) else {
+            return;
+        };
+        let title = track.title.clone().unwrap_or_else(|| "song".to_string());
+        let confirmed = self
+            .pending_remove
+            .take()
+            .is_some_and(|(at, when)| at == (pl, song) && when.elapsed() < NOTIFICATION_TTL);
+        if !confirmed {
+            self.pending_remove = Some(((pl, song), Instant::now()));
+            self.notify(format!(
+                "Press d again to remove {title} from {}",
+                playlist.title
+            ));
+            return;
+        }
+        let edit = if playlist.playlist_id == LIKED {
+            let Some(video_id) = track.video_id else {
+                return;
+            };
+            Edit::Unlike { video_id }
+        } else if track.set_video_id.is_none() {
+            self.notify("That row has no id to remove it by");
+            return;
+        } else {
+            Edit::Remove {
+                playlist_id: playlist.playlist_id,
+                track,
+            }
+        };
+        self.notify(format!("Removing {title}…"));
+        self.spawn_edit(edit, Some(pl), title, playlist.title);
     }
 
     fn do_remove_from_queue(&mut self, q_pos: usize) {
@@ -3395,6 +4297,8 @@ impl App {
             ("?", "keys"),
             ("R", "radio"),
             ("P", "+playlist"),
+            ("g", "album"),
+            ("G", "artist"),
             ("j/k", "scroll"),
             ("PgUp/PgDn", "page"),
             ("Esc", "re-centre"),
@@ -3418,15 +4322,19 @@ impl App {
                 ("spc", "pause"),
             ];
         }
-        let mut keys = vec![
-            ("↵", "play"),
+        vec![
+            ("↵", "play/open"),
             ("a", "+queue"),
             ("/", "edit query"),
             ("s", "close"),
-            ("Esc", "back"),
             ("?", "keys"),
+            ("Tab", "section"),
+            ("g", "album"),
+            ("G", "artist"),
+            ("A", "play next"),
             ("P", "+playlist"),
             ("R", "radio"),
+            ("Esc", "back"),
             ("j/k", "select"),
             ("h/l", "panel"),
             ("spc", "pause"),
@@ -3434,9 +4342,32 @@ impl App {
             ("←/→", "seek"),
             ("m", "mute"),
             ("q", "quit"),
-        ];
-        keys.dedup();
-        keys
+        ]
+    }
+
+    /// An album or artist page: the result list's keys, with `Esc` going back.
+    fn page_hints() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("↵", "play/open"),
+            ("Esc", "back"),
+            ("a", "+queue"),
+            ("g", "album"),
+            ("?", "keys"),
+            ("A", "play next"),
+            ("G", "artist"),
+            ("Tab", "section"),
+            ("P", "+playlist"),
+            ("R", "radio"),
+            ("r", "retry"),
+            ("s", "search"),
+            ("j/k", "select"),
+            ("h/l", "panel"),
+            ("spc", "pause"),
+            ("p/n", "skip"),
+            ("←/→", "seek"),
+            ("m", "mute"),
+            ("q", "quit"),
+        ]
     }
 
     fn browse_hints(panel: Panel, listing: Listing) -> Vec<(&'static str, &'static str)> {
@@ -3463,6 +4394,9 @@ impl App {
                 ("A", "play next"),
                 ("R", "radio"),
                 ("P", "+playlist"),
+                ("g", "album"),
+                ("G", "artist"),
+                ("d", "remove"),
                 ("y", "lyrics"),
                 ("s", "search"),
                 ("H", "recent"),
@@ -3481,6 +4415,8 @@ impl App {
                 ("D", "clear"),
                 ("R", "radio"),
                 ("P", "+playlist"),
+                ("g", "album"),
+                ("G", "artist"),
                 ("s", "search"),
                 ("H", "recent"),
                 ("L", "like"),
@@ -3499,6 +4435,8 @@ impl App {
                 ("A", "play next"),
                 ("R", "radio"),
                 ("P", "+playlist"),
+                ("g", "album"),
+                ("G", "artist"),
                 ("y", "lyrics"),
                 ("s", "search"),
                 ("L", "like"),
@@ -3518,6 +4456,8 @@ impl App {
     fn hints(&self) -> Vec<(&'static str, &'static str)> {
         if self.lyrics_picker.is_some() {
             Self::picker_hints()
+        } else if self.page_has_focus() {
+            Self::page_hints()
         } else if self.search_has_focus() {
             Self::search_hints(self.search.as_ref().is_some_and(|s| s.typing))
         } else if self.lyrics_mode {
@@ -3561,7 +4501,7 @@ impl App {
         ("j / k", "Move down / up · scroll lyrics"),
         ("PgUp / PgDn", "Scroll lyrics by five"),
         ("h / l", "Switch panel"),
-        ("↵", "Open playlist · play song"),
+        ("↵", "Open playlist, album, artist · play"),
         ("/", "Filter by title or artist"),
         ("Esc", "Clear filter · back · close"),
         ("", ""),
@@ -3575,15 +4515,18 @@ impl App {
         ("", ""),
         ("a", "Add selected song to queue"),
         ("A", "Play selected song next"),
-        ("d", "Remove selected queue entry"),
+        ("d", "Remove from queue · playlist (twice)"),
         ("D", "Clear the queue (in queue)"),
         ("o", "Toggle queue / songs"),
         ("H", "Recently played"),
-        ("L", "Like the playing song"),
+        ("L", "Like / unlike the playing song"),
         ("R", "Radio from the selected song"),
-        ("P", "Add the selected song to a playlist"),
+        ("P", "Add to a playlist · or a new one"),
         ("", ""),
         ("s", "Search YouTube Music"),
+        ("g", "Go to the selected song's album"),
+        ("G", "Go to the selected song's artist"),
+        ("Tab", "Next section (results, artist)"),
         ("", ""),
         ("y", "Toggle lyrics"),
         ("c", "Choose lyrics source (in lyrics)"),
@@ -3932,11 +4875,11 @@ impl App {
         if search.typing {
             query.push(Span::styled("█", theme::WARN));
         }
-        if !search.results.is_empty() {
+        if search.found > 0 {
             // `  ·  ` like every other section status, rather than a bare gap.
             query.push(Span::styled(SEP, theme::DIM));
             query.push(Span::styled(
-                format!("{} results", search.results.len()),
+                format!("{} results", search.found),
                 theme::DIM,
             ));
         }
@@ -3974,14 +4917,14 @@ impl App {
             return;
         }
 
-        if search.results.is_empty() {
+        if search.found == 0 {
             self.cover_target = None;
             let msg = if search.ran.is_empty() {
                 vec![
                     Line::styled("Type a query, then press ↵", theme::DIM),
                     Line::from(""),
                     Line::styled(
-                        "Songs and videos both — some tracks only exist as a video.",
+                        "Songs, videos, artists and albums — some tracks only exist as a video.",
                         theme::DIM,
                     ),
                 ]
@@ -3995,157 +4938,137 @@ impl App {
             return;
         }
 
-        // A cover column only where there is a terminal to draw into and room
-        // to do it — below this the list is worth more than the picture.
-        const COVER_COLS: u16 = 24;
-        let show_cover = self.covers_enabled && body.width > COVER_COLS + 30 && body.height >= 12;
-        let (list_area, column) = if show_cover {
-            let [list, gap, cover] = body.layout(&Layout::horizontal([
-                Constraint::Fill(1),
-                Constraint::Length(2),
-                Constraint::Length(COVER_COLS),
-            ]));
-            let _ = gap;
-            (list, Some(cover))
-        } else {
-            (body, None)
-        };
-        // The picture's own shape, and centred in its column since it will
-        // usually be narrower than one. Eight rows are held back for the
-        // details underneath, which are the reason the column exists.
-        let aspect = self.cover_aspect(search.selected().map(|hit| hit.video_id.as_str()));
-        let cover_area = column.and_then(|column| {
-            let (w, h) = kitty::fit_cells(COVER_COLS, column.height.saturating_sub(8), aspect);
-            (w > 0 && h > 0).then(|| Rect {
-                x: column.x + column.width.saturating_sub(w) / 2,
-                width: w,
-                height: h,
-                ..column
-            })
-        });
-        self.cover_target =
-            cover_area.and_then(|rect| Some((search.selected()?.video_id.clone(), rect)));
-
-        // The details under the cover, which the image must not overlap. Full
-        // column width, whatever the picture above them came to.
-        if let (Some(column), Some(cover), Some(hit)) = (column, cover_area, search.selected()) {
-            let below = Rect {
-                y: cover.y + cover.height + 1,
-                height: body.height.saturating_sub(cover.height + 1),
-                ..column
-            };
-            if below.height > 0 {
-                // Centred under the cover, as the now-playing card is: the art
-                // is the only thing here with a shape, so the words sit with it.
-                //
-                // Wrapped rather than cut, because this column *is* the detail
-                // view — a search list already shows a truncated title, and a
-                // panel whose whole job is to say more about the highlighted
-                // row saying the same amount less is no use. The caps keep the
-                // kind and length below from being pushed off a short panel by
-                // a long title; each is what the field is ever plausibly worth.
-                let width = below.width as usize;
-                let mut lines: Vec<Line> = Vec::new();
-                for (text, style, max) in [
-                    (hit.title.as_str(), theme::PRIMARY, 3),
-                    (hit.artist.as_str(), theme::META, 2),
-                    (hit.album.as_str(), theme::DIM, 2),
-                ] {
-                    if text.is_empty() {
-                        continue;
-                    }
-                    lines.extend(
-                        wrap_words(text, width, max)
-                            .into_iter()
-                            .map(|piece| Line::styled(piece, style).centered()),
-                    );
-                }
-                let (marker, style) = kind_marker(hit.kind);
-                lines.push(Line::from(""));
-                lines.push(
-                    Line::from(vec![
-                        Span::styled(marker.trim().to_string(), style),
-                        Span::styled(
-                            if hit.duration.is_empty() {
-                                String::new()
-                            } else {
-                                format!("{SEP}{}", hit.duration)
-                            },
-                            theme::DIM,
-                        ),
-                    ])
-                    .centered(),
-                );
-                // Only when it isn't obvious from the marker: an art track is
-                // the catalogue audio, which is not what "video" promises.
-                if hit.kind == ResultKind::Video {
-                    lines.push(Line::styled("audio only", theme::DIM).centered());
-                }
-                frame.render_widget(Paragraph::new(lines), below);
-            }
-        }
-
-        // Cursor gutter, two column gaps, the kind marker and the duration.
-        let text_w = (list_body(list_area, search.results.len()).width as usize)
-            .saturating_sub(2 + 7 + 1 + 7 + 1);
-        let rows: Vec<Row> = search
-            .results
-            .iter()
-            .map(|hit| {
-                let (marker, marker_style) = kind_marker(hit.kind);
-                let spans = fit_meta(
-                    &hit.title,
-                    theme::PRIMARY,
-                    &[
-                        (hit.artist.clone(), theme::META),
-                        (hit.album.clone(), theme::DIM),
-                    ],
-                    text_w,
-                );
-                Row::new(vec![
-                    Cell::from(Line::styled(marker, marker_style)),
-                    Cell::from(Line::from(spans)),
-                    Cell::from(Line::styled(hit.duration.clone(), theme::DIM).right_aligned()),
-                ])
-            })
-            .collect();
-
-        let n = rows.len();
-        // The shared borrow taken at the top of this function is dead by
-        // here -- every row above owns its own text -- so the table's state
-        // can simply be taken mutably. It used to be re-fetched with an
-        // `expect("checked above")`, which the borrow checker wanted only
-        // because that shared borrow was still notionally live.
-        let Some(state) = self.search.as_mut().map(|s| &mut s.state) else {
+        let detail = self.item_detail(search.items.selected());
+        let playing = self.current_video_id();
+        let Some(search) = self.search.as_mut() else {
             return;
         };
-        frame.render_stateful_widget(
-            Table::new(
-                rows,
-                [
-                    Constraint::Length(7),
-                    Constraint::Fill(1),
-                    // Seven, not six: the video results routinely include an
-                    // hour-long upload, and `1:03:04` does not fit in six.
-                    Constraint::Length(7),
-                ],
-            )
-            .row_highlight_style(if focused {
-                theme::SELECTED
-            } else {
-                theme::SELECTED_BLUR
-            })
-            .highlight_symbol("▸ ")
-            .highlight_spacing(HighlightSpacing::Always)
-            .column_spacing(1),
-            list_body(list_area, n),
-            state,
-        );
-        render_scrollbar(
+        self.cover_target = render_item_list(
             frame,
-            list_area,
-            n,
-            self.search.as_ref().and_then(|s| s.state.selected()),
+            body,
+            &mut search.items,
+            focused,
+            playing.as_deref(),
+            detail,
+            true,
+        );
+    }
+
+    /// The detail column for a result row: its cover, where the terminal can
+    /// draw one, and what it is. `None` where there is no cover to show,
+    /// since the column exists for the picture.
+    fn item_detail(&self, item: Option<&Item>) -> Option<Detail> {
+        if !self.covers_enabled {
+            return None;
+        }
+        let item = item?;
+        Some(Detail {
+            cover: item.cover().map(|(id, _)| {
+                let aspect = self.cover_aspect(Some(&id));
+                (id, aspect)
+            }),
+            lines: item_details(item),
+        })
+    }
+
+    /// An album or artist page: its rows, under a header that names it.
+    fn render_page(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.page_has_focus();
+        let Some(view) = self.pages.last() else {
+            return;
+        };
+        let loaded = view.page.as_ref().and_then(|p| p.as_ref().ok());
+        let label = match (loaded, view.kind) {
+            (Some(Page::Album(album)), _) => album.kind.clone(),
+            (_, CardKind::Album) => "Album".to_string(),
+            (_, CardKind::Artist) => "Artist".to_string(),
+        };
+        // The header names the page, so the list keeps every row.
+        let mut status = vec![Span::styled(truncate_line(&view.title, 40), theme::PRIMARY)];
+        if let Some(Page::Album(album)) = loaded {
+            let by = album
+                .artists
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            for (text, style) in [
+                (by, theme::META),
+                (album.year.clone().unwrap_or_default(), theme::DIM),
+            ] {
+                if !text.is_empty() {
+                    status.push(Span::styled(SEP, theme::DIM));
+                    status.push(Span::styled(truncate_line(&text, 30), style));
+                }
+            }
+        }
+        let body = section(frame, area, &label, Some(Line::from(status)), focused);
+        if body.height == 0 || body.width == 0 {
+            return;
+        }
+
+        match &view.page {
+            None => {
+                let label = format!(" Loading {}…", view.title);
+                frame.render_stateful_widget(
+                    Throbber::default()
+                        .label(label)
+                        .throbber_style(theme::ACCENT),
+                    body,
+                    &mut self.throbber_state,
+                );
+                return;
+            }
+            Some(Err(err)) => {
+                centered_message(
+                    frame,
+                    body,
+                    vec![
+                        Line::styled("Couldn't load this page", theme::ERROR),
+                        Line::from(""),
+                        Line::styled(truncate_line(err, body.width as usize), theme::ERROR_BODY),
+                        Line::from(""),
+                        Line::from([hint("r", "try again"), hint("Esc", "back")].concat()),
+                    ],
+                );
+                return;
+            }
+            Some(Ok(_)) if view.items.items.is_empty() => {
+                centered_message(
+                    frame,
+                    body,
+                    vec![Line::styled("Nothing on this page", theme::DIM)],
+                );
+                return;
+            }
+            Some(Ok(_)) => {}
+        }
+
+        // An album's column is the album itself; an artist's follows the row.
+        let detail = match loaded {
+            Some(Page::Album(album)) if self.covers_enabled => Some(Detail {
+                cover: album.thumbnail.as_ref().map(|_| {
+                    let aspect = self.cover_aspect(Some(&album.browse_id));
+                    (album.browse_id.clone(), aspect)
+                }),
+                lines: album_details(album),
+            }),
+            _ => self.item_detail(view.items.selected()),
+        };
+        // Every row of an album would only repeat its name.
+        let show_album = !matches!(loaded, Some(Page::Album(_)));
+        let playing = self.current_video_id();
+        let Some(view) = self.pages.last_mut() else {
+            return;
+        };
+        self.cover_target = render_item_list(
+            frame,
+            body,
+            &mut view.items,
+            focused,
+            playing.as_deref(),
+            detail,
+            show_album,
         );
     }
 
@@ -4165,12 +5088,26 @@ impl App {
             return;
         };
         let title = picker.title.clone();
+        let naming = picker.naming.clone();
         let state = &mut picker.state;
 
+        // Borders and padding round one line of name, or round the list.
+        let height = if naming.is_some() {
+            5
+        } else {
+            (targets.len().saturating_add(1) as u16)
+                .saturating_add(4)
+                .clamp(6, area.height.saturating_sub(2))
+        };
         let modal = area.centered(
             Constraint::Length(area.width.saturating_sub(4).clamp(30, 54)),
-            Constraint::Length((targets.len() as u16 + 4).clamp(6, area.height.saturating_sub(2))),
+            Constraint::Length(height),
         );
+        let hints: &[(&str, &str)] = if naming.is_some() {
+            &[("↵", "create"), ("Esc", "back")]
+        } else {
+            &[("j/k", "select"), ("↵", "add"), ("Esc", "cancel")]
+        };
         let block = Block::bordered()
             .title(Line::from(vec![
                 Span::styled(" Add ", theme::HEADER),
@@ -4178,24 +5115,36 @@ impl App {
                 Span::styled(" to ", theme::HEADER),
             ]))
             .title_bottom(Line::from(fit_hints(
-                &[("j/k", "select"), ("↵", "add"), ("Esc", "cancel")],
+                hints,
                 modal.width.saturating_sub(4) as usize,
             )))
             .border_style(theme::RULE)
-            .padding(Padding::horizontal(1));
+            .padding(Padding::symmetric(1, u16::from(naming.is_some())));
 
         // Without this the list underneath bleeds through the modal.
         frame.render_widget(Clear, modal);
 
-        let rows: Vec<Row> = targets
-            .iter()
-            .zip(&counts)
-            .map(|(name, count)| {
+        if let Some(name) = naming {
+            let line = Line::from(vec![
+                Span::styled("New playlist: ", theme::DIM),
+                Span::styled(name, theme::WARN),
+                Span::styled("█", theme::WARN),
+            ]);
+            frame.render_widget(Paragraph::new(line).block(block), modal);
+            return;
+        }
+
+        let new_row = Row::new(vec![
+            Cell::from(Line::styled("+ New playlist…", theme::ACCENT)),
+            Cell::from(""),
+        ]);
+        let rows: Vec<Row> = std::iter::once(new_row)
+            .chain(targets.iter().zip(&counts).map(|(name, count)| {
                 Row::new(vec![
                     Cell::from(Line::styled(name.clone(), theme::PRIMARY)),
                     Cell::from(Line::styled(count.to_string(), theme::DIM).right_aligned()),
                 ])
-            })
+            }))
             .collect();
 
         frame.render_stateful_widget(
@@ -4217,6 +5166,11 @@ impl App {
     }
 
     fn render_right_body(&mut self, frame: &mut Frame, area: Rect) {
+        // A page sits over whatever it was opened from, search included.
+        if !self.pages.is_empty() {
+            self.render_page(frame, area);
+            return;
+        }
         // Search takes the whole right column, like lyrics do. The cover is
         // drawn onto it afterwards, outside ratatui — see `draw_cover`.
         if self.search.is_some() {
@@ -4275,7 +5229,7 @@ impl App {
             .and_then(|t| t.title.as_deref())
             .unwrap_or("Unknown")
             .to_string();
-        let artists = track.map(Track::artist_names).unwrap_or_default();
+        let artists = track.map_or_default(Track::artist_names);
 
         let mut spans = vec![
             Span::styled(if playing { "♫ " } else { "  " }, theme::PLAYING),
@@ -4810,8 +5764,8 @@ impl App {
     fn render_history(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.active_panel == Panel::Songs;
         let tracks = self.history.tracks();
-        let status = (!tracks.is_empty())
-            .then(|| Line::styled(format!("{}", tracks.len()), theme::DIM));
+        let status =
+            (!tracks.is_empty()).then(|| Line::styled(format!("{}", tracks.len()), theme::DIM));
         let body = section(frame, area, "Recently played", status, focused);
 
         if tracks.is_empty() {
@@ -4838,8 +5792,7 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let is_playing =
-                    playing.is_some() && p.track.video_id.as_deref() == playing;
+                let is_playing = playing.is_some() && p.track.video_id.as_deref() == playing;
                 self.track_row(Some(&p.track), i + 1, num_w, is_playing, width)
             })
             .collect();
@@ -4975,12 +5928,13 @@ impl App {
                 ),
             ])
         } else {
+            // The action space would take, as a player's button shows it.
             let icon = if ast.loading {
                 "⋯ "
             } else if ast.paused {
-                "⏸ "
+                "▶ "
             } else if ast.total > 0.0 {
-                "♫ "
+                "⏸ "
             } else {
                 "  "
             };
@@ -5229,6 +6183,178 @@ mod tests {
 
     /// Following a queue across a playlist that was fetched again — what makes
     /// `a` safe to act on the library rather than only the copy of it here.
+    mod items {
+        use super::super::*;
+
+        fn track(id: &str) -> Item {
+            Item::Track {
+                track: Track {
+                    video_id: Some(id.to_string()),
+                    title: Some(id.to_string()),
+                    artists: Vec::new(),
+                    album: None,
+                    duration: None,
+                    duration_seconds: None,
+                    thumbnail: None,
+                    set_video_id: None,
+                },
+                kind: None,
+                owned: None,
+            }
+        }
+
+        fn card(id: &str) -> Item {
+            Item::Card(Card {
+                kind: CardKind::Album,
+                id: id.to_string(),
+                title: id.to_string(),
+                subtitle: String::new(),
+                thumbnail: None,
+            })
+        }
+
+        fn heading(t: &str) -> Item {
+            Item::Heading(t.to_string())
+        }
+
+        /// Songs a, b; Albums x; Videos c, d.
+        fn list() -> Items {
+            Items::new(vec![
+                heading("Songs"),
+                track("a"),
+                track("b"),
+                heading("Albums"),
+                card("x"),
+                heading("Videos"),
+                track("c"),
+                track("d"),
+            ])
+        }
+
+        fn at(items: &Items) -> Option<usize> {
+            items.state.selected()
+        }
+
+        #[test]
+        fn the_cursor_starts_past_the_first_heading() {
+            assert_eq!(at(&list()), Some(1));
+            assert_eq!(at(&Items::new(vec![heading("Songs")])), None);
+        }
+
+        #[test]
+        fn stepping_skips_headings_and_stops_at_the_ends() {
+            let mut items = list();
+            items.step(false);
+            assert_eq!(at(&items), Some(1), "nothing above the first row");
+            items.step(true);
+            items.step(true);
+            assert_eq!(at(&items), Some(4), "over the Albums heading");
+            for _ in 0..5 {
+                items.step(true);
+            }
+            assert_eq!(at(&items), Some(7));
+            items.step(false);
+            items.step(false);
+            assert_eq!(at(&items), Some(4), "over the Videos heading");
+        }
+
+        #[test]
+        fn tab_lands_on_each_sections_first_row() {
+            let mut items = list();
+            items.jump_section(true);
+            assert_eq!(at(&items), Some(4));
+            items.jump_section(true);
+            assert_eq!(at(&items), Some(6));
+            items.jump_section(true);
+            assert_eq!(at(&items), Some(6), "no section after the last");
+            items.state.select(Some(7));
+            items.jump_section(false);
+            assert_eq!(at(&items), Some(4));
+            items.jump_section(false);
+            assert_eq!(at(&items), Some(1));
+            items.jump_section(false);
+            assert_eq!(at(&items), Some(1));
+        }
+
+        #[test]
+        fn enter_queues_the_section_the_track_is_in() {
+            let mut items = list();
+            items.state.select(Some(7));
+            let (tracks, start) = items.section_tracks().unwrap();
+            let ids: Vec<_> = tracks.iter().filter_map(|t| t.video_id.clone()).collect();
+            assert_eq!(ids, ["c", "d"]);
+            assert_eq!(start, 1);
+            items.state.select(Some(4));
+            assert!(
+                items.section_tracks().is_none(),
+                "a card is opened, not played"
+            );
+        }
+
+        #[test]
+        fn an_album_with_no_headings_is_one_run() {
+            let mut items = Items::new(vec![track("a"), track("b"), track("c")]);
+            items.state.select(Some(2));
+            let (tracks, start) = items.section_tracks().unwrap();
+            assert_eq!((tracks.len(), start), (3, 2));
+        }
+
+        #[test]
+        fn search_results_lead_with_what_the_query_names_and_drop_empty_sections() {
+            let artist = Card {
+                kind: CardKind::Artist,
+                id: "UCx".to_string(),
+                title: "Radiohead".to_string(),
+                subtitle: String::new(),
+                thumbnail: None,
+            };
+            let page = SearchPage {
+                top: vec![artist.clone()],
+                artists: vec![artist],
+                ..SearchPage::default()
+            };
+            let items = search_items(&page, Vec::new());
+            // Named once, at the top, rather than again under Artists.
+            assert_eq!(shape(&items), ["Top results", "Radiohead"]);
+        }
+
+        fn shape(items: &[Item]) -> Vec<String> {
+            items
+                .iter()
+                .map(|i| match i {
+                    Item::Heading(t) => t.clone(),
+                    Item::Card(c) => c.title.clone(),
+                    Item::Track { owned: Some(_), .. } => "mine".to_string(),
+                    Item::Track { .. } => "track".to_string(),
+                })
+                .collect()
+        }
+
+        #[test]
+        fn what_the_user_already_has_comes_before_what_youtube_found() {
+            let song = track("a").track().cloned().unwrap();
+            let page = SearchPage {
+                songs: vec![search::SearchResult {
+                    video_id: "b".to_string(),
+                    title: "b".to_string(),
+                    artist: String::new(),
+                    album: String::new(),
+                    duration: String::new(),
+                    duration_seconds: None,
+                    kind: ResultKind::Song,
+                    video_type: String::new(),
+                    thumbnail: None,
+                    artists: Vec::new(),
+                    album_id: None,
+                }],
+                ..SearchPage::default()
+            };
+            let items = search_items(&page, vec![((0, 3), song)]);
+            assert_eq!(shape(&items), ["In your library", "mine", "Songs", "track"]);
+            assert_eq!(items.get(1).and_then(Item::owned), Some((0, 3)));
+        }
+    }
+
     mod refetch {
         use super::*;
 
@@ -5805,12 +6931,13 @@ mod tests {
             );
         }
 
-        assert!(fit_hints(&items, 0).is_empty());
+        assert_eq!(fit_hints(&items, 0), []);
     }
 
     /// Every hint list there is, including the one `I` only appears in.
     fn all_hints() -> Vec<(&'static str, &'static str)> {
         let mut all = App::picker_hints();
+        all.extend(App::page_hints());
         all.extend(App::search_hints(true));
         all.extend(App::search_hints(false));
         all.extend(App::lyrics_hints(true));
@@ -5865,6 +6992,7 @@ mod tests {
     fn no_hint_bar_names_a_key_twice() {
         for context in [
             App::picker_hints(),
+            App::page_hints(),
             App::search_hints(false),
             App::lyrics_hints(true),
             App::browse_hints(Panel::Songs, Listing::Songs),
@@ -5885,6 +7013,7 @@ mod tests {
         // to land inside 80 columns or a narrow terminal shows no way to the
         // rest of the bindings.
         for context in [
+            App::page_hints(),
             App::search_hints(false),
             App::lyrics_hints(true),
             App::browse_hints(Panel::Songs, Listing::Songs),

@@ -60,8 +60,11 @@ pub struct Card {
 }
 
 fn text(v: Option<&Value>) -> String {
-    v.and_then(|v| v.get("runs"))
-        .and_then(Value::as_array)
+    runs_text(v.and_then(|v| v.get("runs")))
+}
+
+fn runs_text(runs: Option<&Value>) -> String {
+    runs.and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|r| r.get("text").and_then(Value::as_str))
@@ -145,6 +148,10 @@ pub async fn artist(yt: &YTMusicClient, channel_id: &str) -> Result<ArtistPage> 
         && !songs.is_empty()
     {
         songs.truncate(MAX_TOP_SONGS);
+        // That playlist's album column is a play count ("2.4B plays"), which has no browse id.
+        for song in &mut songs {
+            song.album = song.album.take().filter(|a| a.id.is_some());
+        }
         page.songs = songs;
     }
     Ok(page)
@@ -229,16 +236,71 @@ fn top_song(row: &Value) -> Option<Track> {
     })
 }
 
+fn card_kind(id: &str) -> Option<CardKind> {
+    if id.starts_with("MPRE") {
+        Some(CardKind::Album)
+    } else if id.starts_with("UC") {
+        Some(CardKind::Artist)
+    } else {
+        None
+    }
+}
+
+/// A search or suggestion row that opens an album or artist page rather than playing anything.
+pub(crate) fn list_card(item: &Value) -> Option<Card> {
+    let id = item.get("navigationEndpoint")?.get("browseEndpoint")?.get("browseId")?.as_str()?.to_string();
+    let kind = card_kind(&id)?;
+    let title = runs_text(column_runs(item, 0));
+    if title.is_empty() {
+        return None;
+    }
+    let detail = runs_text(column_runs(item, 1));
+    let mut parts: Vec<&str> = detail.split('•').map(str::trim).filter(|p| !p.is_empty()).collect();
+    // `Artist • 238M monthly audience`: every artist row opens with the same word, so it says nothing.
+    if kind == CardKind::Artist && parts.len() > 1 {
+        parts.remove(0);
+    }
+    Some(Card {
+        kind,
+        id,
+        title,
+        subtitle: parts.join(" • "),
+        thumbnail: thumbnail(item),
+    })
+}
+
+#[derive(Debug, Clone)]
+pub enum Page {
+    Album(AlbumPage),
+    Artist(ArtistPage),
+}
+
+/// A page fetched in the background, named by the browse id it was asked for under.
+pub struct PageMsg {
+    pub id: String,
+    pub result: std::result::Result<Page, String>,
+}
+
+pub fn spawn_page(
+    handle: &tokio::runtime::Handle,
+    yt: std::sync::Arc<YTMusicClient>,
+    kind: CardKind,
+    id: String,
+    tx: std::sync::mpsc::Sender<PageMsg>,
+) {
+    handle.spawn(async move {
+        let result = match kind {
+            CardKind::Album => album(&yt, &id).await.map(Page::Album),
+            CardKind::Artist => artist(&yt, &id).await.map(Page::Artist),
+        };
+        let _ = tx.send(PageMsg { id, result: result.map_err(|e| e.to_string()) });
+    });
+}
+
 fn card(item: &Value) -> Option<Card> {
     let endpoint = item.get("navigationEndpoint")?.get("browseEndpoint")?;
     let id = endpoint.get("browseId")?.as_str()?.to_string();
-    let kind = if id.starts_with("MPRE") {
-        CardKind::Album
-    } else if id.starts_with("UC") {
-        CardKind::Artist
-    } else {
-        return None;
-    };
+    let kind = card_kind(&id)?;
     Some(Card {
         kind,
         id,

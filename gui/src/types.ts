@@ -42,6 +42,28 @@ export interface SearchResult {
   album_id: string | null;
 }
 
+export interface SearchPage {
+  songs: SearchResult[];
+  videos: SearchResult[];
+  albums: Card[];
+  artists: Card[];
+  /** The artist and album the query names, if any. */
+  top: Card[];
+}
+
+export interface Suggestions {
+  queries: string[];
+  cards: Card[];
+  songs: SearchResult[];
+}
+
+/** A library track a search matched, at its place in its playlist. */
+export interface LibraryHit {
+  playlist: number;
+  song: number;
+  track: Track;
+}
+
 export interface PlaybackStateView {
   elapsed: number;
   total: number;

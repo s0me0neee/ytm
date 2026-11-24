@@ -156,6 +156,8 @@ pub fn run() -> tauri::Result<()> {
             player::get_up_next,
             player::clear_queue,
             search::search,
+            search::search_suggestions,
+            search::search_library,
             search::add_to_playlist,
             actions::play_target,
             actions::play_tracks,

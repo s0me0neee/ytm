@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::library::Library;
+use crate::library::{Library, Track};
 use crate::player::TrackRef;
 use crate::session::{
     history_path, lyrics_path, queue_path, settings_path, translations_path, write_private,
@@ -15,6 +15,11 @@ use crate::session::{
 pub struct QueueEntry {
     pub playlist_id: Option<String>,
     pub video_id: String,
+    /// The whole track, for an entry from the search playlist — search, radio,
+    /// an album page — which exists only for the session that filled it, so
+    /// there is nothing to look the video id up in at the next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track: Option<Track>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,7 +409,8 @@ pub fn build_queue_state(
         .iter()
         .enumerate()
         .filter_map(|(i, &(pl_idx, song_idx))| {
-            let video_id = library.track(pl_idx, song_idx)?.video_id.clone()?;
+            let track = library.track(pl_idx, song_idx)?;
+            let video_id = track.video_id.clone()?;
             if video_id.is_empty() {
                 return None;
             }
@@ -413,6 +419,7 @@ pub fn build_queue_state(
             Some(QueueEntry {
                 playlist_id,
                 video_id,
+                track: library.is_search_playlist(pl_idx).then(|| track.clone()),
             })
         })
         .collect();
@@ -443,8 +450,16 @@ pub enum RestoreOutcome {
 /// Attempts to resolve `saved` against `library`. Call this again (with the
 /// same `saved`) each time a new song batch is applied to `library`, until
 /// it stops returning `Pending`.
-pub fn try_restore(library: &Library, saved: &QueueState) -> RestoreOutcome {
+///
+/// Mutable because an entry that carries its own track is filed back under
+/// the search playlist — but only once the outcome is `Ready`, so waiting
+/// files nothing.
+pub fn try_restore(library: &mut Library, saved: &QueueState) -> RestoreOutcome {
     for entry in &saved.entries {
+        // Needs no playlist to arrive: it is filed from the copy it carries.
+        if entry.track.is_some() {
+            continue;
+        }
         let Some(pl_id) = entry.playlist_id.as_deref() else {
             continue;
         };
@@ -462,18 +477,21 @@ pub fn try_restore(library: &Library, saved: &QueueState) -> RestoreOutcome {
     }
 
     let mut kept: Vec<usize> = Vec::with_capacity(saved.entries.len());
-    let queue: Vec<TrackRef> = saved
-        .entries
-        .iter()
-        .enumerate()
-        .filter_map(|(i, entry)| {
-            let pl_id = entry.playlist_id.as_deref()?;
-            let pl_idx = library.find_playlist_index(pl_id)?;
-            let song_idx = library.find_song_index(pl_idx, &entry.video_id)?;
-            kept.push(i);
-            Some((pl_idx, song_idx))
-        })
-        .collect();
+    let mut queue: Vec<TrackRef> = Vec::with_capacity(saved.entries.len());
+    for (i, entry) in saved.entries.iter().enumerate() {
+        let found = entry
+            .playlist_id
+            .as_deref()
+            .and_then(|id| library.find_playlist_index(id))
+            .and_then(|pl| Some((pl, library.find_song_index(pl, &entry.video_id)?)));
+        let at = match (found, &entry.track) {
+            (Some(at), _) => at,
+            (None, Some(track)) => library.place_search_result(track.clone()),
+            (None, None) => continue,
+        };
+        kept.push(i);
+        queue.push(at);
+    }
 
     if queue.is_empty() {
         return RestoreOutcome::Abandoned;
@@ -519,6 +537,7 @@ mod tests {
             entries: vec![QueueEntry {
                 playlist_id: Some("PL1".to_string()),
                 video_id: "aaa".to_string(),
+                track: None,
             }],
             position: Some(0),
         }
@@ -526,9 +545,9 @@ mod tests {
 
     #[test]
     fn a_queue_waits_for_the_playlist_it_names() {
-        let lib = library();
+        let mut lib = library();
         assert!(matches!(
-            try_restore(&lib, &saved()),
+            try_restore(&mut lib,&saved()),
             RestoreOutcome::Pending
         ));
     }
@@ -542,12 +561,12 @@ mod tests {
         let mut lib = library();
         lib.apply_song_batch(0, None);
         assert!(matches!(
-            try_restore(&lib, &saved()),
+            try_restore(&mut lib,&saved()),
             RestoreOutcome::Pending
         ));
 
         lib.apply_song_batch(0, Some(vec![track("aaa")]));
-        let RestoreOutcome::Ready { queue, position } = try_restore(&lib, &saved()) else {
+        let RestoreOutcome::Ready { queue, position } = try_restore(&mut lib,&saved()) else {
             panic!("the retry should have restored it");
         };
         assert_eq!(queue, [(0, 0)]);
@@ -560,16 +579,16 @@ mod tests {
         let mut lib = library();
         lib.apply_song_batch(0, Some(Vec::new()));
         assert!(matches!(
-            try_restore(&lib, &saved()),
+            try_restore(&mut lib,&saved()),
             RestoreOutcome::Abandoned
         ));
     }
 
     #[test]
     fn a_queue_naming_a_playlist_that_is_gone_is_abandoned() {
-        let lib = Library::new(Vec::new());
+        let mut lib = Library::new(Vec::new());
         assert!(matches!(
-            try_restore(&lib, &saved()),
+            try_restore(&mut lib,&saved()),
             RestoreOutcome::Abandoned
         ));
     }
@@ -586,15 +605,17 @@ mod tests {
                 QueueEntry {
                     playlist_id: Some("__search__".to_string()),
                     video_id: "zzz".to_string(),
+                    track: None,
                 },
                 QueueEntry {
                     playlist_id: Some("PL1".to_string()),
                     video_id: "bbb".to_string(),
+                    track: None,
                 },
             ],
             position: Some(1),
         };
-        let RestoreOutcome::Ready { queue, position } = try_restore(&lib, &saved) else {
+        let RestoreOutcome::Ready { queue, position } = try_restore(&mut lib,&saved) else {
             panic!("the resolvable entry should have survived");
         };
         assert_eq!(queue, [(0, 1)], "only the track that still exists");
@@ -615,23 +636,83 @@ mod tests {
                 QueueEntry {
                     playlist_id: Some("__search__".to_string()),
                     video_id: "zzz".to_string(),
+                    track: None,
                 },
                 QueueEntry {
                     playlist_id: Some("PL1".to_string()),
                     video_id: "aaa".to_string(),
+                    track: None,
                 },
                 QueueEntry {
                     playlist_id: Some("PL1".to_string()),
                     video_id: "bbb".to_string(),
+                    track: None,
                 },
             ],
             position: Some(2),
         };
-        let RestoreOutcome::Ready { queue, position } = try_restore(&lib, &saved) else {
+        let RestoreOutcome::Ready { queue, position } = try_restore(&mut lib,&saved) else {
             panic!("the resolvable entries should have survived");
         };
         assert_eq!(queue, [(0, 0), (0, 1)]);
         assert_eq!(position, Some(1), "still `bbb`");
+    }
+
+    #[test]
+    fn a_queue_from_search_or_radio_comes_back_at_the_next_start() {
+        // This session: one library track, then two filed under search (a
+        // radio station, say), playing the second of those.
+        let mut before = library();
+        before.apply_song_batch(0, Some(vec![track("aaa")]));
+        let radio = before.place_off_library(vec![track("r1"), track("r2")]);
+        let queue = [(0, 0), radio[0], radio[1]];
+        let state = build_queue_state(&before, &queue, Some(2)).expect("something to save");
+        assert!(state.entries[0].track.is_none(), "a library entry is looked up, not copied");
+        assert!(state.entries[1].track.is_some());
+        let json = serde_json::to_string(&state).unwrap();
+
+        // Next start: the search playlist doesn't exist until something files into it.
+        let mut after = library();
+        after.apply_song_batch(0, Some(vec![track("aaa")]));
+        let saved: QueueState = serde_json::from_str(&json).unwrap();
+        let RestoreOutcome::Ready { queue, position } = try_restore(&mut after, &saved) else {
+            panic!("the whole queue should come back");
+        };
+        let ids: Vec<_> = queue
+            .iter()
+            .filter_map(|&(pl, song)| after.track(pl, song)?.video_id.clone())
+            .collect();
+        assert_eq!(ids, ["aaa", "r1", "r2"]);
+        assert_eq!(position, Some(2), "still `r2`");
+    }
+
+    #[test]
+    fn a_queue_of_search_tracks_alone_files_nothing_while_it_waits() {
+        // Nothing to wait for, so it is ready at once — but a library entry
+        // beside it still waits, and waiting must not file the search ones twice.
+        let mut lib = library();
+        let saved = QueueState {
+            entries: vec![
+                QueueEntry {
+                    playlist_id: Some("PL1".to_string()),
+                    video_id: "aaa".to_string(),
+                    track: None,
+                },
+                QueueEntry {
+                    playlist_id: Some(Library::SEARCH_PLAYLIST_ID.to_string()),
+                    video_id: "r1".to_string(),
+                    track: Some(track("r1")),
+                },
+            ],
+            position: Some(1),
+        };
+        assert!(matches!(try_restore(&mut lib, &saved), RestoreOutcome::Pending));
+        assert_eq!(lib.find_playlist_index(Library::SEARCH_PLAYLIST_ID), None);
+        lib.apply_song_batch(0, Some(vec![track("aaa")]));
+        let RestoreOutcome::Ready { queue, .. } = try_restore(&mut lib, &saved) else {
+            panic!("ready once the playlist arrived");
+        };
+        assert_eq!(queue.len(), 2);
     }
 
     #[test]

@@ -160,8 +160,7 @@ pub fn liked_ids(state: State<'_, AppState>) -> Vec<String> {
     let Ok(library) = state.library.lock() else { return Vec::new() };
     library
         .find_playlist_index(LIKED)
-        .map(|i| library.songs(i).iter().filter_map(|t| t.video_id.clone()).collect())
-        .unwrap_or_default()
+        .map_or_default(|i| library.songs(i).iter().filter_map(|t| t.video_id.clone()).collect())
 }
 
 /// Likes or unlikes a track, then refetches Liked Music to match.

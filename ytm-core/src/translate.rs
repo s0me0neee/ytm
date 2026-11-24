@@ -820,7 +820,7 @@ mod tests {
 
     #[test]
     fn nothing_to_translate_makes_no_chunks() {
-        assert!(chunk_lines(&[]).is_empty());
+        assert_eq!(chunk_lines(&[]), Vec::<Vec<String>>::new());
     }
 
     // ── assembling the result ─────────────────────────────────────────────

@@ -1,7 +1,9 @@
 import { memo, useCallback, useMemo } from "react";
 import { Play } from "lucide-react";
+import { call, send } from "../api";
+import { CardActions } from "../components/CardActions";
 import { useMenu } from "../components/Menu";
-import { PlayingIndicator } from "../components/PlayingIndicator";
+import { Shelf } from "../components/Shelf";
 import { Thumbnail } from "../components/Thumbnail";
 import { TrackList } from "../components/TrackList";
 import { useActions, useAppState } from "../context";
@@ -47,16 +49,24 @@ export const HomeView = memo(function HomeView({
       {tiles.length > 0 && (
         <div className="mb-8 grid grid-cols-[repeat(auto-fill,minmax(14rem,1fr))] gap-2 px-3">
           {tiles.map(({ p, i }) => (
-            <button
-              key={p.playlist_id}
-              onClick={() => navigate({ kind: "playlist", index: i })}
-              onContextMenu={(e) => menu.show(e, menus.playlist(i))}
-              className="group flex min-w-0 items-center gap-3 overflow-hidden rounded-xl bg-surface pr-3 text-left hover:bg-surface-2"
-            >
-              <Thumbnail srcs={[p.thumbnail]} className="h-12 w-12 flex-shrink-0" />
-              <span className="min-w-0 flex-1 truncate text-body font-medium text-ink">{p.title}</span>
-              <Play size={14} fill="currentColor" className="flex-shrink-0 text-ink opacity-0 group-hover:opacity-100" />
-            </button>
+            <div key={p.playlist_id} className="group relative min-w-0" onContextMenu={(e) => menu.show(e, menus.playlist(i))}>
+              <button
+                onClick={() => navigate({ kind: "playlist", index: i })}
+                className="flex w-full min-w-0 items-center gap-3 overflow-hidden rounded-xl bg-surface pr-12 text-left group-hover:bg-surface-2"
+              >
+                <Thumbnail srcs={[p.thumbnail]} className="h-12 w-12 flex-shrink-0" />
+                <span className="min-w-0 flex-1 truncate text-body font-medium text-ink">{p.title}</span>
+              </button>
+              {p.loaded && (p.count ?? 0) > 0 && (
+                <button
+                  onClick={() => void call("play_target", { target: { kind: "library", playlist: i, song: 0 } })}
+                  aria-label={`Play ${p.title}`}
+                  className="absolute top-1/2 right-2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full bg-accent text-white opacity-0 group-hover:opacity-100 hover:bg-accent-2 focus-visible:opacity-100"
+                >
+                  <Play size={13} fill="currentColor" />
+                </button>
+              )}
+            </div>
           ))}
         </div>
       )}
@@ -69,34 +79,33 @@ export const HomeView = memo(function HomeView({
       )}
 
       {shelf.length > 0 && (
-        <section>
-          <h2 className="section-heading">Recently played</h2>
-          <div className="no-scrollbar flex gap-2 overflow-x-auto px-1 pb-6">
-            {shelf.map((p, i) => {
-              const t = p.track;
-              const isPlaying = Boolean(t.video_id) && t.video_id === currentTrackId;
-              return (
-                <button
-                  key={`${t.video_id ?? "card"}-${i}`}
-                  onClick={() => onPlayHistory(i)}
-                  onContextMenu={(e) => menu.show(e, menus.track(t, historyTarget(i)))}
-                  className="card w-44 flex-shrink-0 rounded-2xl p-2 text-left"
-                >
-                  <div className="relative mb-2">
-                    <Thumbnail srcs={t.thumbnail ? coverCandidates(t.thumbnail, 320) : []} className="aspect-square w-full rounded-xl" />
-                    {isPlaying && (
-                      <span className="absolute right-1.5 bottom-1.5 flex h-6 w-6 items-center justify-center rounded-full bg-black/55">
-                        <PlayingIndicator paused={paused} />
-                      </span>
-                    )}
-                  </div>
+        <Shelf title="Recently played" rowClassName="flex gap-2 px-1 pb-6">
+          {shelf.map((p, i) => {
+            const t = p.track;
+            const isPlaying = Boolean(t.video_id) && t.video_id === currentTrackId;
+            return (
+              <div
+                key={`${t.video_id ?? "card"}-${i}`}
+                className="group relative w-44 flex-shrink-0"
+                onContextMenu={(e) => menu.show(e, menus.track(t, historyTarget(i)))}
+              >
+                <button onClick={() => onPlayHistory(i)} className="card w-full rounded-2xl p-2 text-left group-hover:bg-surface">
+                  <Thumbnail
+                    srcs={t.thumbnail ? coverCandidates(t.thumbnail, 320) : []}
+                    className="mb-2 aspect-square w-full rounded-xl"
+                  />
                   <p className={`truncate text-body ${isPlaying ? "text-accent" : "text-ink"}`}>{t.title ?? "Untitled"}</p>
                   <p className="truncate text-meta text-ink-dim">{artistNames(t)}</p>
                 </button>
-              );
-            })}
-          </div>
-        </section>
+                <CardActions
+                  label={t.title ?? "track"}
+                  onPlay={() => (isPlaying ? send("play_pause") : onPlayHistory(i))}
+                  playing={isPlaying ? { paused } : null}
+                />
+              </div>
+            );
+          })}
+        </Shelf>
       )}
 
       {rest.length > 0 && (

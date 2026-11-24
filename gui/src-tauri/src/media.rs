@@ -240,7 +240,7 @@ fn now_playing(state: &AppState) -> Option<NowPlaying> {
             id: t.video_id.clone().unwrap_or_default(),
             title: t.title.clone().unwrap_or_default(),
             artists: t.artists.iter().map(|a| a.name.clone()).collect(),
-            album: t.album.as_ref().map(|a| a.name.clone()).unwrap_or_default(),
+            album: t.album.as_ref().map_or_default(|a| a.name.clone()),
             // mpv's duration is the accurate one but arrives a beat late, so
             // YouTube's rounded figure stands in until it does.
             length: if audio.total > 0.0 {
@@ -251,8 +251,7 @@ fn now_playing(state: &AppState) -> Option<NowPlaying> {
             art_url: t
                 .thumbnail
                 .as_deref()
-                .map(|url| ytm_core::cover::at_size(url, MEDIA_COVER_PX))
-                .unwrap_or_default(),
+                .map_or_default(|url| ytm_core::cover::at_size(url, MEDIA_COVER_PX)),
         });
 
     // A queue restored from disk has a track but has never been handed to mpv,

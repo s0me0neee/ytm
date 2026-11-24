@@ -349,11 +349,7 @@ impl LyricsQuery {
         Some(Self {
             title: track.title.clone()?,
             artist: track.artist_names(),
-            album: track
-                .album
-                .as_ref()
-                .map(|a| a.name.clone())
-                .unwrap_or_default(),
+            album: track.album.as_ref().map_or_default(|a| a.name.clone()),
             duration: track.duration_seconds.map(f64::from),
         })
     }
